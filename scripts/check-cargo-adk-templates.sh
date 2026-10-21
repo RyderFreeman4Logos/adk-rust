@@ -2,11 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMPDIR="$(mktemp -d)"
-CHECK_TARGET_DIR="$TMPDIR/target"
-trap 'rm -rf "$TMPDIR"' EXIT
+ADK_GATE_ROOT="$ROOT"
+source "$ROOT/scripts/local-env.sh"
+TEMPLATE_ROOT="$(mktemp -d "$TMPDIR/adk-templates.XXXXXX")"
+trap 'rm -rf "$TEMPLATE_ROOT"' EXIT
 
-# The generated projects are checked from TMPDIR, outside the repository where
+# The generated projects are checked from TEMPLATE_ROOT, outside the repository where
 # rustup would otherwise stop seeing rust-toolchain.toml and use a global
 # default. Keep this gate on the same pinned compiler as the workspace.
 if command -v rustup >/dev/null 2>&1; then
@@ -51,8 +52,8 @@ for entry in "${templates[@]}"; do
   fi
 
   (
-    cd "$TMPDIR"
-    cargo run --manifest-path "$ROOT/Cargo.toml" -p cargo-adk -- "${args[@]}"
+    cd "$TEMPLATE_ROOT"
+    just --justfile "$ROOT/justfile" --working-directory "$TEMPLATE_ROOT" cargo run --manifest-path "$ROOT/Cargo.toml" -p cargo-adk -- "${args[@]}"
 
     cat >> "$name/Cargo.toml" <<PATCH
 
@@ -71,6 +72,6 @@ adk-anthropic = { path = "$ROOT/adk-anthropic" }
 adk-rust-macros = { path = "$ROOT/adk-rust-macros" }
 PATCH
 
-    CARGO_TARGET_DIR="$CHECK_TARGET_DIR" cargo check --manifest-path "$name/Cargo.toml"
+    just --justfile "$ROOT/justfile" --working-directory "$TEMPLATE_ROOT" cargo check --manifest-path "$name/Cargo.toml"
   )
 done

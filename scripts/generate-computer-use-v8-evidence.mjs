@@ -13,8 +13,8 @@ const valueFlag = name => { const index = process.argv.indexOf(name); return ind
 const subjectVersion = valueFlag('--subject-version')
 if (!subjectVersion) throw new TypeError('--subject-version is required and must match computer-use-mcp')
 const commands = [
-  ['cargo', ['test', '-p', 'adk-computer-use']],
-  ['cargo', ['test', '-p', 'adk-tool', '--features', 'mcp', '--lib', 'mcp_result_preserves_structured_text_and_image_content']],
+  ['just', ['cargo', 'test', '-p', 'adk-computer-use']],
+  ['just', ['cargo', 'test', '-p', 'adk-tool', '--features', 'mcp', '--lib', 'mcp_result_preserves_structured_text_and_image_content']],
 ]
 let output = ''
 for (const [command, args] of commands) {

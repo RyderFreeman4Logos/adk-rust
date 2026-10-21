@@ -73,6 +73,10 @@ cargo nextest run --workspace                            # Test (parallel, ~10x 
 - Address review feedback with additional commits (don't force-push during review)
 - Squash or merge commit at maintainer discretion
 
+### Linux fork gates
+
+This fork uses `just pre-commit-fast`, then `just quality-gates` on a clean feature branch, followed by independent review of `origin/main...HEAD` before pushing. `just pre-push` validates the exact outgoing commit against quality and review receipts under `$HOME/tmp/adk-rust-local-gates/`; hosted Actions remain disabled. Cargo commands enter through `just cargo`, which preserves the pinned compiler, idle I/O priority, canonical SSD target links and verified temporary directory.
+
 ## Getting Started
 
 ```bash

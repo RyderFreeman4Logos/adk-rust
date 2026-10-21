@@ -37,8 +37,8 @@ while IFS=' ' read -r shard package features; do
 
     printf '\n==> %s --features %s (shard %s)\n' "$package" "$features" "$shard"
     started=$SECONDS
-    if cargo clippy -p "$package" --features "$features" --all-targets -- -D warnings \
-        && cargo nextest run -p "$package" --features "$features"; then
+    if just cargo clippy -p "$package" --features "$features" --all-targets --locked -- -D warnings \
+        && just cargo nextest run -p "$package" --features "$features" --locked; then
         printf 'ok       %s --features %s (%ds)\n' "$package" "$features" "$((SECONDS - started))"
     else
         printf 'FAILED   %s --features %s (%ds)\n' "$package" "$features" "$((SECONDS - started))"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-cargo metadata --manifest-path "$ROOT/Cargo.toml" --no-deps --format-version 1 \
+just cargo metadata --manifest-path "$ROOT/Cargo.toml" --no-deps --format-version 1 \
   | python3 -c '
 import json
 import sys

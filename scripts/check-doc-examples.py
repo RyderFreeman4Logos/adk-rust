@@ -38,7 +38,7 @@ SKIPPED_CARGO_SUBCOMMANDS = {
 
 def cargo_metadata(*args: str, cwd: Path = ROOT) -> dict:
     proc = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1", *args],
+        ["just", "--justfile", str(ROOT / "justfile"), "--working-directory", str(cwd), "cargo", "metadata", "--no-deps", "--format-version", "1", *args],
         cwd=cwd,
         check=True,
         text=True,

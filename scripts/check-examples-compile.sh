@@ -12,8 +12,7 @@
 #   scripts/check-examples-compile.sh              # every example
 #   scripts/check-examples-compile.sh 0 4          # shard 0 of 4 (CI matrix)
 #
-# A shared CARGO_TARGET_DIR is used so the ADK crates and common dependencies
-# are built once and reused across examples.
+# Each example uses its canonical SSD target link through the local Just launcher.
 
 set -uo pipefail
 
@@ -28,7 +27,11 @@ SHARD_TOTAL="${2:-1}"
 # moved to crates.io and adk-codeact-monty joined the workspace.
 SKIP_EXAMPLES=()
 
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target/examples-check}"
+ADK_GATE_ROOT="$ROOT"
+source "$ROOT/scripts/local-env.sh"
+[[ "$SHARD_INDEX" =~ ^[0-9]+$ && "$SHARD_TOTAL" =~ ^[1-9][0-9]*$ && "$SHARD_INDEX" -lt "$SHARD_TOTAL" ]] || {
+    echo "error: expected shard index smaller than positive shard total" >&2; exit 2;
+}
 
 # `mapfile` needs bash 4; stock macOS ships 3.2, so read the list in a loop.
 MANIFESTS=()
@@ -37,7 +40,7 @@ while IFS= read -r manifest; do
 done < <(find examples -maxdepth 2 -name Cargo.toml | sort)
 
 # Per-run scratch file so parallel shards never share one path.
-ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/example-check-err.XXXXXX")"
+ERR_FILE="$(mktemp "${TMPDIR}/example-check-err.XXXXXX")"
 trap 'rm -f "$ERR_FILE"' EXIT
 
 declare -a failed=()
@@ -67,7 +70,7 @@ for manifest in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
     # Route through the pinned toolchain: hooks can run under a shadowing cargo
     # (e.g. nix) that ignores rust-toolchain.toml. Transparent in CI, where the
     # ambient cargo already matches the pin (falls back to plain cargo).
-    if bash "$ROOT/scripts/cargo-pinned.sh" check --manifest-path "$manifest" --locked --quiet 2>"$ERR_FILE"; then
+    if just cargo check --manifest-path "$manifest" --locked --quiet 2>"$ERR_FILE"; then
         printf 'ok       %s\n' "$dir"
     else
         printf 'FAILED   %s\n' "$dir"

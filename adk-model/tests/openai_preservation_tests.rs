@@ -625,7 +625,8 @@ mod preservation {
             "properties": {
                 "name": { "type": "string" }
             },
-            "required": ["name"]
+            "required": ["name"],
+            "additionalProperties": false
         });
 
         let request = LlmRequest::new("gpt-4o", vec![Content::new("user").with_text("test")])

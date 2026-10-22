@@ -208,7 +208,25 @@ async fn main() -> anyhow::Result<()> {
 
 ### Structured Output (JSON Schema)
 
-OpenAI supports guaranteed JSON output via `output_schema`. ADK-Rust automatically wires this to OpenAI's `response_format` API:
+`output_schema` maps to OpenAI-compatible `response_format`. The default strict
+mode admits only the conservative subset below and sends the schema unchanged.
+Unsupported or malformed strict schemas fail locally with `InvalidInput` code
+`model.openai_compat.response_schema_unsupported` and a JSON Pointer location;
+no HTTP request is sent. This is a behavior change: ADK no longer silently adds
+`additionalProperties: false` to the root object.
+
+Strict schemas require an explicit root `type: "object"`, `properties`,
+`additionalProperties: false`, and duplicate-free `required` naming every property.
+Nested objects follow the same rules; arrays need one schema-valued `items`.
+Primitive types are `string`, `number`, `integer`, `boolean`, and `null`.
+Descendants may use `[T, "null"]` (or the reverse) for nullable values. Nonempty,
+duplicate-free scalar `enum` values must match their declared type. String `title`
+and `description` annotations are accepted. Other keywords, including references,
+combinators, constraints, and object/array enums, are rejected rather than ignored.
+Property names are data, so names such as `enum` and `additionalProperties` are valid.
+This local subset does not guarantee that a particular provider/model accepts it.
+
+For example, make optional values nullable while keeping every field required:
 
 ```rust
 use adk_rust::prelude::*;
@@ -225,13 +243,14 @@ let agent = LlmAgentBuilder::new("data_extractor")
         "properties": {
             "name": { "type": "string" },
             "age": { "type": "number" },
-            "email": { "type": "string" }
+            "email": { "type": ["string", "null"] }
         },
-        "required": ["name", "age"]
+        "required": ["name", "age", "email"],
+        "additionalProperties": false
     }))
     .build()?;
 
-// Response is guaranteed to be valid JSON matching the schema
+// A supporting provider enforces the admitted strict schema.
 ```
 
 For strict mode with nested objects, include `additionalProperties: false` at each level:
@@ -247,14 +266,35 @@ For strict mode with nested objects, include `additionalProperties: false` at ea
                 "author": { "type": "string" },
                 "tags": { "type": "array", "items": { "type": "string" } }
             },
-            "required": ["author"],
+            "required": ["author", "tags"],
             "additionalProperties": false  // Required for nested objects
         }
     },
     "required": ["title", "metadata"],
-    "additionalProperties": false  // Auto-injected at root level
+    "additionalProperties": false  // Explicitly required at root level
 }))
 ```
+
+For a compatible provider that supports broader JSON Schema, explicitly opt out
+of strict admission on `OpenAICompatible`:
+
+```rust
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+
+let model = OpenAICompatible::new(OpenAICompatibleConfig::new("api-key", "model"))?
+    .with_response_schema_strict(false);
+# Ok::<(), adk_core::AdkError>(())
+```
+
+This sends the complete schema unchanged with `strict: false`, including object
+enums, open objects, and schema-valued `additionalProperties`. It does not silently
+fall back from strict mode, normalize the schema, or add prompt instructions. The
+provider may reject unsupported schemas; validate the intended model/service before
+relying on this mode. Neither setting affects requests without `response_schema`
+or tool-schema adapters. When a response schema is configured, an `openai`
+extension containing `response_format` or a request adapter changing that field
+fails with `InvalidInput` code `model.openai_compat.response_schema_conflict` before
+HTTP. Unrelated JSON/header customizations remain available.
 
 ### Reasoning Effort
 

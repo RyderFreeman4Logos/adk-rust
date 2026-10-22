@@ -733,6 +733,28 @@ per-attempt JSON/header customization. Retry limits remain controlled by
 Vertex endpoints, and a supplied Bedrock client avoid ambient configuration when
 the application owns authentication.
 
+### OpenAI-compatible response schemas
+
+`OpenAICompatible` preserves `response_schema` exactly. By default it sends
+`strict: true` after local admission of a conservative closed, all-required object
+subset. Nested objects must also be closed and all-required; arrays have one item
+schema. Primitive types, descendant nullable type pairs, matching scalar enums,
+and string title/description annotations are supported. References, combinators,
+other constraints, and object/array enums are rejected before HTTP with
+`InvalidInput` code `model.openai_compat.response_schema_unsupported` and a JSON
+Pointer location. See [the provider guide](../docs/official_docs/models/providers.md#structured-output-json-schema)
+for the complete local contract.
+
+For a service supporting broader schemas, explicitly select
+`.with_response_schema_strict(false)`. It sends the original schema with
+`strict: false`, including object enums, open objects, and schema-valued
+`additionalProperties`; provider support must be verified separately. There is no
+automatic fallback or schema rewriting. This changes prior behavior that silently
+closed root objects. Requests without a response schema and tool-schema adapters
+are unaffected. With a response schema, extensions cannot supply `response_format`
+and request adapters cannot change it (`model.openai_compat.response_schema_conflict`,
+`InvalidInput`, zero HTTP requests). Other customizations remain available.
+
 ## Environment Variables
 
 ```bash

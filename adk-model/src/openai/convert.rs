@@ -301,8 +301,8 @@ pub fn convert_tools(
 
 /// Convert OpenAI response to ADK LlmResponse (for non-streaming use).
 ///
-/// Used by [`AzureOpenAIClient`](super::client::AzureOpenAIClient) which still
-/// goes through `async-openai`'s typed client.
+/// Converts `async-openai`'s typed response. Azure and compatible clients use
+/// [`from_raw_openai_response`] instead, retaining provider-native usage.
 #[allow(dead_code)]
 pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse {
     let content = resp
@@ -400,6 +400,9 @@ pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse 
 
 /// Normalize one raw Chat Completions `usage` object while retaining the
 /// provider payload for diagnostics and future provider-specific projections.
+/// Empty/partial objects and invalid count values remain available verbatim.
+/// Missing/null/non-object usage is absent; normalized counters retain legacy
+/// defaults and must not be used to infer whether the provider observed a count.
 pub(crate) fn usage_metadata_from_raw(usage: &serde_json::Value) -> Option<UsageMetadata> {
     let usage = usage.as_object()?;
     let prompt_details = usage.get("prompt_tokens_details");

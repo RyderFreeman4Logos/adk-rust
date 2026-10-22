@@ -331,6 +331,10 @@ let model = OpenAIClient::new(config)?;
 
 > **Note**: Structured output (`output_schema`) requires backend support. Native OpenAI fully supports it; local servers may have limited support.
 
+`OpenAICompatible` retains usage objects verbatim in `UsageMetadata.provider_usage`, including empty/partial objects and malformed counts; omitted/null/non-object usage is absent.
+Normalized counters retain compatibility defaults: zero alone does not establish observed usage. Validate each raw field's presence and nonnegative integer type; do not infer missing totals.
+For SSE, consume the complete stream: a supplied usage-only trailer attaches one final snapshot, without adding cumulative counts. A missing or incomplete trailer does not supply final usage.
+
 ### OpenAI-Compatible Reasoning History
 
 Reasoning replay is disabled by default. `Part::Thinking` stays separate from

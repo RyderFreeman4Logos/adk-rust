@@ -28,7 +28,7 @@ SHARD_TOTAL="${2:-1}"
 SKIP_EXAMPLES=()
 
 ADK_GATE_ROOT="$ROOT"
-source "$ROOT/scripts/local-env.sh"
+source "$ADK_GATE_ROOT/scripts/local-env.sh"
 [[ "$SHARD_INDEX" =~ ^[0-9]+$ && "$SHARD_TOTAL" =~ ^[1-9][0-9]*$ && "$SHARD_INDEX" -lt "$SHARD_TOTAL" ]] || {
     echo "error: expected shard index smaller than positive shard total" >&2; exit 2;
 }
@@ -74,7 +74,7 @@ for manifest in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
         printf 'ok       %s\n' "$dir"
     else
         printf 'FAILED   %s\n' "$dir"
-        sed 's/^/         /' "$ERR_FILE" | head -20
+        sed 's/^/         /' "$ERR_FILE"
         failed+=("$dir")
     fi
     checked+=1

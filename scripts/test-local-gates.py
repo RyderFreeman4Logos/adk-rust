@@ -103,6 +103,39 @@ if "adk" in sys.argv and "new" in sys.argv:
             path.chmod(0o700)
         return {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}
 
+    def test_example_failures_retain_full_diagnostics_and_continue(self) -> None:
+        (self.repo / "scripts").mkdir()
+        for name in ("check-examples-compile.sh", "local-env.sh"):
+            shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        for name in ("a_failure", "z_success"):
+            project = self.repo / "examples" / name
+            project.mkdir(parents=True)
+            (project / "Cargo.toml").write_text("[package]\n")
+        binary = self.repo / "bin"
+        binary.mkdir()
+        launcher = binary / "just"
+        launcher.write_text("""#!/usr/bin/env python3
+import os
+import sys
+if "examples/a_failure/Cargo.toml" in sys.argv:
+    print("stderr_file=" + os.readlink("/proc/self/fd/2"))
+    for line in range(31):
+        print("build-script preamble " + str(line), file=sys.stderr)
+    print("ADK_NATIVE_CAUSE_AFTER_PREAMBLE_31", file=sys.stderr)
+    sys.exit(101)
+""")
+        launcher.chmod(0o700)
+        result = _run("bash", str(self.repo / "scripts/check-examples-compile.sh"),
+                      cwd=self.repo, ok=False,
+                      extra_env={"PATH": str(binary) + os.pathsep + os.environ["PATH"]})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ok       examples/z_success", result.stdout)
+        self.assertIn("examples checked: 2, skipped: 0, failed: 1", result.stdout)
+        stderr_file = next(line.removeprefix("stderr_file=") for line in result.stdout.splitlines()
+                           if line.startswith("stderr_file="))
+        self.assertFalse(Path(stderr_file).exists(), "collector must clean its temporary stderr")
+        self.assertIn("ADK_NATIVE_CAUSE_AFTER_PREAMBLE_31", result.stdout)
+
     def test_generated_templates_use_existing_sdk_target(self) -> None:
         env = {**self.cargo_spy(), "ADK_SPY_LOG": str(self.repo / "calls.jsonl")}
         before = (os.readlink(ROOT / "target"), (ROOT / "target").lstat().st_ino,

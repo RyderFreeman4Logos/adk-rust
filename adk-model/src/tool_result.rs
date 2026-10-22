@@ -1,5 +1,6 @@
 /// Expand nested tool images for providers whose tool-result wire format is text-only.
 /// Keep all consecutive results ahead of image messages so parallel calls stay paired.
+#[cfg(any(feature = "openai", test))]
 pub(crate) fn with_images(
     contents: &[adk_core::Content],
 ) -> std::borrow::Cow<'_, [adk_core::Content]> {

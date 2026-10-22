@@ -4,7 +4,7 @@ LLM model integrations for Rust Agent Development Kit (ADK-Rust) with Gemini, Op
 
 [![Crates.io](https://img.shields.io/crates/v/adk-model.svg)](https://crates.io/crates/adk-model)
 [![Documentation](https://docs.rs/adk-model/badge.svg)](https://docs.rs/adk-model)
-[![License](https://img.shields.io/crates/l/adk-model.svg)](LICENSE)
+[![License](https://img.shields.io/crates/l/adk-model.svg)](../LICENSE)
 
 ## Overview
 

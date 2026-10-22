@@ -23,18 +23,20 @@ if [[ -z "$CHANNEL" ]]; then
   exit 1
 fi
 
-if command -v rustup &>/dev/null && rustup toolchain list 2>/dev/null | grep -q "^${CHANNEL}"; then
-  TOOLCHAIN="$(rustup toolchain list 2>/dev/null | grep -o "^${CHANNEL}[^ ]*" | head -1)"
-  TOOLCHAIN_BIN="$(dirname "$(rustup which --toolchain "$TOOLCHAIN" cargo 2>/dev/null)")"
-  if [[ -n "$TOOLCHAIN_BIN" && -d "$TOOLCHAIN_BIN" ]]; then
-    export PATH="$TOOLCHAIN_BIN:$PATH"
+CARGO="cargo"
+if command -v rustup &>/dev/null; then
+  if ! CARGO="$(rustup which --toolchain "$CHANNEL" cargo)"; then
+    echo "error: cargo-pinned.sh cannot resolve cargo for pinned toolchain $CHANNEL" >&2
+    exit 1
   fi
+  TOOLCHAIN_BIN="$(dirname "$CARGO")"
+  export PATH="$TOOLCHAIN_BIN:$PATH"
 fi
 
-RESOLVED="$(cargo --version 2>/dev/null | awk '{print $2}')"
+RESOLVED="$("$CARGO" --version 2>/dev/null | awk '{print $2}')"
 if [[ "$RESOLVED" != "$CHANNEL" ]]; then
   echo "error: cargo-pinned.sh refuses to run: resolved cargo ${RESOLVED:-missing}, pin is $CHANNEL (rust-toolchain.toml)" >&2
   echo "  Install the pinned toolchain (rustup toolchain install $CHANNEL) or run from 'devenv shell'." >&2
   exit 1
 fi
-exec cargo "$@"
+exec "$CARGO" "$@"

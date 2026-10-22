@@ -73,10 +73,20 @@ class LocalGatesTests(unittest.TestCase):
                    "report_path": str(report), "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest()}
         (self.receipts / "review.json").write_text(json.dumps(receipt))
 
-    def cargo_spy(self) -> dict[str, str]:
+    def cargo_spy(self, rustup: bool = True) -> dict[str, str]:
         binary = self.repo / "bin"
         binary.mkdir()
-        (binary / "rustup").write_text("#!/bin/bash\nexit 1\n")
+        if rustup:
+            (binary / "rustup").write_text('''#!/bin/bash
+if [[ "$*" == "which --toolchain 1.95.0 cargo" ]]; then
+    printf '%s/cargo\\n' "$(dirname "$0")"
+else
+    exit 1
+fi
+''')
+        else:
+            for name in ("just", "bash", "python3", "readlink", "sed", "cut", "head", "awk", "dirname", "ionice"):
+                (binary / name).symlink_to(shutil.which(name))
         (binary / "cargo").write_text("""#!/usr/bin/env python3
 import json
 import os
@@ -100,8 +110,59 @@ if "adk" in sys.argv and "new" in sys.argv:
     (project / "Cargo.toml").write_text('[package]\\nname = "fixture"\\nversion = "0.1.0"\\nedition = "2024"\\n')
 """)
         for path in binary.iterdir():
-            path.chmod(0o700)
-        return {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}
+            if not path.is_symlink():
+                path.chmod(0o700)
+        return {"PATH": str(binary) + (os.pathsep + os.environ["PATH"] if rustup else "")}
+
+    def test_pin_resolution_does_not_depend_on_toolchain_listing(self) -> None:
+        env = {**self.cargo_spy(), "ADK_SPY_LOG": str(self.repo / "calls.jsonl")}
+        binary = self.repo / "bin"
+        pinned = self.repo / "pinned"
+        pinned.mkdir()
+        shutil.copy(binary / "cargo", pinned / "cargo")
+        with (pinned / "cargo").open("a") as output:
+            output.write('print(subprocess.check_output(["rustc", "--version"], text=True).strip())\n'
+                         'print(subprocess.check_output(["cargo-clippy", "--version"], text=True).strip())\n'
+                         'sys.exit(47)\n')
+        for name in ("rustc", "cargo-clippy"):
+            (pinned / name).write_text(f"#!/bin/bash\nprintf 'selected {name} 1.95.0\\n'\n")
+            (pinned / name).chmod(0o700)
+        (binary / "cargo").write_text("#!/bin/bash\necho 'cargo 1.99.1'\nexit 89\n")
+        (binary / "rustup").write_text(f'''#!/bin/bash
+if [[ "$*" == "which --toolchain 1.95.0 cargo" ]]; then
+    printf '%s\\n' '{pinned / "cargo"}'
+else
+    echo 'toolchain listing deliberately unavailable' >&2
+    exit 23
+fi
+''')
+        arguments = ["metadata", "--locked", "--", "argument with spaces", ""]
+        result = _run("just", "cargo", *arguments, ok=False, extra_env=env)
+        self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
+        self.assertIn("selected rustc 1.95.0", result.stdout)
+        self.assertIn("selected cargo-clippy 1.95.0", result.stdout)
+        records = [json.loads(line) for line in (self.repo / "calls.jsonl").read_text().splitlines()]
+        self.assertEqual([call["args"] for call in records], [arguments])
+
+    def test_failed_pin_resolution_never_executes_path_cargo(self) -> None:
+        env = {**self.cargo_spy(), "ADK_SPY_LOG": str(self.repo / "calls.jsonl")}
+        (self.repo / "bin/rustup").write_text("#!/bin/bash\necho 'pin resolution failed: missing toolchain' >&2\nexit 23\n")
+        result = _run("just", "cargo", "metadata", ok=False, extra_env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pin resolution failed: missing toolchain", result.stderr)
+        self.assertFalse((self.repo / "calls.jsonl").exists())
+
+    def test_native_exact_version_path_without_rustup(self) -> None:
+        env = {**self.cargo_spy(rustup=False), "ADK_SPY_LOG": str(self.repo / "calls.jsonl")}
+        self.assertIsNone(shutil.which("rustup", path=env["PATH"]))
+        result = _run("just", "cargo", "metadata", "--locked", extra_env=env)
+        self.assertIn("args=metadata --locked", result.stdout)
+        calls = (self.repo / "calls.jsonl").read_bytes()
+        result = _run("just", "cargo", "metadata", ok=False,
+                      extra_env={**env, "ADK_SPY_VERSION": "1.99.1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resolved cargo 1.99.1, pin is 1.95.0", result.stderr)
+        self.assertEqual(calls, (self.repo / "calls.jsonl").read_bytes())
 
     def test_example_failures_retain_full_diagnostics_and_continue(self) -> None:
         (self.repo / "scripts").mkdir()

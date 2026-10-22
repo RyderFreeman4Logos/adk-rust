@@ -671,7 +671,7 @@ impl Node for AgentNode {
     }
 
     async fn execute(&self, ctx: &NodeContext) -> Result<NodeOutput> {
-        use futures::StreamExt;
+        use futures::TryStreamExt;
 
         // Map state to input content
         let content = (self.input_mapper)(&ctx.state);
@@ -693,7 +693,12 @@ impl Node for AgentNode {
             }
         })?;
 
-        let events: Vec<adk_core::Event> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        let events: Vec<adk_core::Event> = stream.try_collect().await.map_err(|e| {
+            crate::error::GraphError::NodeExecutionFailed {
+                node: self.name.clone(),
+                message: e.to_string(),
+            }
+        })?;
 
         if let Some(request) =
             events.iter().find_map(|event| event.actions.tool_confirmation.clone())

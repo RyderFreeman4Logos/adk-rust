@@ -317,19 +317,91 @@ three-value `ReasoningEffort` API remains available for backward compatibility.
 
 ### OpenAI-Compatible Local APIs
 
-Use `OpenAIConfig::compatible()` to connect to local servers (Ollama, vLLM, LM Studio):
+For an explicitly authorized server that does not require Authorization, select
+`OpenAICompatible::new_no_auth`. No key lookup is needed; the existing serialized
+configuration can omit `api_key`:
 
 ```rust
-// Ollama exposes OpenAI-compatible API at /v1
-let config = OpenAIConfig::compatible(
-    "not-needed",                      // API key (ignored by Ollama)
-    "http://localhost:11434/v1",       // Base URL
-    "llama3.2"                         // Model name
-);
-let model = OpenAIClient::new(config)?;
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+let config: OpenAICompatibleConfig = serde_json::from_value(serde_json::json!({
+    "provider_name": "local", "model": "local-model",
+    "base_url": "http://127.0.0.1:8000/v1", "parallel_tool_calls": true
+}))?;
+let model = OpenAICompatible::new_no_auth(config)?;
 ```
 
+This policy forbids the `Authorization` header, not all credentials: Azure still
+sends its `api-key` through its existing dedicated client. No-auth ignores any
+configured bearer key and rejects Authorization from default headers or adapters
+before HTTP, on every retry and in both response modes. Other
+headers and request customization remain available. Policy conflicts return
+`InvalidInput` code `model.openai_compat.authorization_forbidden` without credentials.
+
+Clients built with authenticated `new`, `new_with_reasoning_effort`, `OpenAIClient`
+or provider presets retain valid bearer behavior. They now reject empty/blank/invalid header credentials
+with `model.openai_compat.invalid_api_key` before HTTP; missing deserialized keys
+do not silently select no-auth. All modes reject actual URL userinfo before HTTP
+with `model.openai_compat.url_userinfo_forbidden`; callers that relied on implicit
+Basic plus Bearer must remove URL credentials and configure their intended header.
+Migrate former empty-key callers explicitly to
+`new_no_auth`; a dummy key is unnecessary. The configuration fields and serde shape
+are unchanged. `compatible_auth_contract_tests` exercises this example configuration
+against a synthetic server over HTTP and SSE; live endpoint authorization and model
+acceptance remain the caller's responsibility.
+
 > **Note**: Structured output (`output_schema`) requires backend support. Native OpenAI fully supports it; local servers may have limited support.
+
+`OpenAICompatible` retains usage objects verbatim in `UsageMetadata.provider_usage`, including empty/partial objects and malformed counts; omitted/null/non-object usage is absent.
+Normalized counters retain compatibility defaults: zero alone does not establish observed usage. Validate each raw field's presence and nonnegative integer type; do not infer missing totals.
+For SSE, consume the complete stream: a supplied usage-only trailer attaches one final snapshot, without adding cumulative counts. A missing or incomplete trailer does not supply final usage.
+
+### OpenAI-compatible response observations
+
+The raw Chat Completions path (`OpenAICompatible`, including `OpenAIClient`,
+Azure OpenAI and OpenCode delegates) retains supplied observations in
+`LlmResponse.provider_metadata["openai"]`:
+
+| Field | Retained value |
+|---|---|
+| `id` | Last supplied response ID |
+| `prompt_token_ids` | Last supplied prompt-token value |
+| `metrics` | Last supplied metrics snapshot, restricted to `time_to_first_token_ms`, `generation_time_ms`, `queue_time_ms`, `mean_itl_ms`, `tokens_per_second` when it is an object |
+| `choices` | Ordered records containing only supplied `index` and `token_ids`, one per choice that supplies `token_ids` |
+
+Values are raw observations: omitted fields stay absent; explicit null, empty
+values and malformed types stay distinguishable. A malformed non-object metrics
+value is retained as supplied. Validate types before treating any value as a
+measurement. The SDK does not calculate units or missing counts. The installed
+vLLM metric contract uses milliseconds for the four `_ms` fields and tokens per
+second for `tokens_per_second`; retention does not prove a server enabled or
+supplied these metrics.
+
+For SSE, choice records retain fragment order and boundaries, including repeated
+indices; they are not concatenated or deduplicated because providers may send
+incremental or cumulative token lists. The non-partial response with a finish
+reason carries observations parsed through its existing delivery point: a finish
+with inline usage is delivered immediately; otherwise the first usage-only
+`choices: []` trailer completes the pending finish, or `[DONE]`/normal EOF releases
+it without a usage trailer. Metrics on that usage trailer are retained with its
+raw usage snapshot; cumulative counts are never added. Later observations do not
+delay delivery or produce another final. Partial responses have no observation
+snapshot and retain their existing content/control semantics.
+
+A normal EOF after a finish retains only fields actually parsed; it does not
+certify that a trailer arrived. Without a finish, or on a read error before final
+delivery, no final observation snapshot is emitted. Consumers that keep reading
+after an already delivered final still receive subsequent read errors. Incomplete
+JSON cannot supply usage or metrics. Data sent after the delivery point, including
+any later trailer after an inline-usage finish, is outside that final snapshot.
+
+No request API is added: `GenerateContentConfig.extensions["openai"]` already
+passes `cache_salt`, `return_token_ids` and `return_prompt_text`; streams request
+`stream_options.include_usage: true`. Response retention excludes `prompt_text`,
+arbitrary response/metric keys and agent control fields, even if the provider
+returns them. Token IDs may identify input text; request and persist them only
+when appropriate for that caller's data policy. Each request/retry keeps its own
+observations; an HTTP error body never supplies successful response metadata.
+Live provider availability and consumer adoption require separate acceptance.
 
 ### OpenAI-Compatible Reasoning History
 

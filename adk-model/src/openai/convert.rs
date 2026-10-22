@@ -301,8 +301,8 @@ pub fn convert_tools(
 
 /// Convert OpenAI response to ADK LlmResponse (for non-streaming use).
 ///
-/// Used by [`AzureOpenAIClient`](super::client::AzureOpenAIClient) which still
-/// goes through `async-openai`'s typed client.
+/// Converts `async-openai`'s typed response. Azure and compatible clients use
+/// [`from_raw_openai_response`] instead, retaining provider-native usage.
 #[allow(dead_code)]
 pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse {
     let content = resp
@@ -400,6 +400,9 @@ pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse 
 
 /// Normalize one raw Chat Completions `usage` object while retaining the
 /// provider payload for diagnostics and future provider-specific projections.
+/// Empty/partial objects and invalid count values remain available verbatim.
+/// Missing/null/non-object usage is absent; normalized counters retain legacy
+/// defaults and must not be used to infer whether the provider observed a count.
 pub(crate) fn usage_metadata_from_raw(usage: &serde_json::Value) -> Option<UsageMetadata> {
     let usage = usage.as_object()?;
     let prompt_details = usage.get("prompt_tokens_details");
@@ -428,6 +431,65 @@ fn json_i32(value: Option<&serde_json::Value>) -> Option<i32> {
     i32::try_from(value?.as_i64()?).ok()
 }
 
+/// Response-local raw observations, isolated from agent control metadata.
+/// Choice records retain wire order/fragment boundaries, without guessing whether
+/// a provider supplies token deltas or cumulative snapshots. Only final responses
+/// consume this state; partial emissions do not clone the growing record list.
+#[derive(Default)]
+pub(crate) struct ResponseObservations {
+    fields: serde_json::Map<String, serde_json::Value>,
+    choices: Vec<serde_json::Value>,
+}
+
+impl ResponseObservations {
+    pub(crate) fn observe(&mut self, json: &serde_json::Value) {
+        for name in ["id", "prompt_token_ids"] {
+            if let Some(value) = json.get(name) {
+                self.fields.insert(name.to_owned(), value.clone());
+            }
+        }
+        if let Some(value) = json.get("metrics") {
+            let metrics = if let Some(object) = value.as_object() {
+                let mut selected = serde_json::Map::new();
+                for name in [
+                    "time_to_first_token_ms",
+                    "generation_time_ms",
+                    "queue_time_ms",
+                    "mean_itl_ms",
+                    "tokens_per_second",
+                ] {
+                    if let Some(value) = object.get(name) {
+                        selected.insert(name.to_owned(), value.clone());
+                    }
+                }
+                serde_json::Value::Object(selected)
+            } else {
+                value.clone()
+            };
+            self.fields.insert("metrics".to_owned(), metrics);
+        }
+        if let Some(choices) = json.get("choices").and_then(serde_json::Value::as_array) {
+            for choice in choices {
+                if let Some(tokens) = choice.get("token_ids") {
+                    let mut record = serde_json::Map::new();
+                    if let Some(index) = choice.get("index") {
+                        record.insert("index".to_owned(), index.clone());
+                    }
+                    record.insert("token_ids".to_owned(), tokens.clone());
+                    self.choices.push(serde_json::Value::Object(record));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn into_metadata(mut self) -> Option<serde_json::Value> {
+        if !self.choices.is_empty() {
+            self.fields.insert("choices".to_owned(), serde_json::Value::Array(self.choices));
+        }
+        if self.fields.is_empty() { None } else { Some(serde_json::json!({"openai": self.fields})) }
+    }
+}
+
 /// Convert a raw OpenAI JSON response to ADK LlmResponse.
 ///
 /// Unlike [`from_openai_response`], this parses the raw JSON directly so it can
@@ -439,6 +501,8 @@ pub(crate) fn from_raw_openai_response(
     json: &serde_json::Value,
     declared_tools: &HashSet<String>,
 ) -> Result<LlmResponse, String> {
+    let mut observations = ResponseObservations::default();
+    observations.observe(json);
     let choice = json.get("choices").and_then(|c| c.get(0));
 
     let content = choice
@@ -526,7 +590,7 @@ pub(crate) fn from_raw_openai_response(
         interrupted: false,
         error_code: None,
         error_message: None,
-        provider_metadata: None,
+        provider_metadata: observations.into_metadata(),
         interaction_id: None,
     })
 }

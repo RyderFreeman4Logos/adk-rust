@@ -261,6 +261,10 @@ pub struct UsageMetadata {
 
     /// Provider-native usage data retained when available, including fields
     /// that are not yet projected into the normalized counters above.
+    /// OpenAI-compatible responses retain any usage object verbatim, including
+    /// empty, partial or malformed counts; omitted/null/non-object usage is absent.
+    /// Normalized zero defaults do not prove observed zero: validate the raw
+    /// field's presence and numeric type before accounting for tokens.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub provider_usage: Option<serde_json::Value>,
 }

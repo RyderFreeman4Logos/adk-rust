@@ -65,7 +65,7 @@ impl AzureOpenAIClient {
         let mut key = reqwest::header::HeaderValue::from_str(&config.api_key)
             .map_err(|_| AdkError::model("invalid Azure API key"))?;
         key.set_sensitive(true);
-        let inner = OpenAICompatible::new(
+        let inner = OpenAICompatible::new_no_auth(
             OpenAICompatibleConfig::new("", config.deployment_id)
                 .with_provider_name("azure-openai"),
         )?

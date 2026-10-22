@@ -13,7 +13,7 @@ HTTP server and A2A v1.0.0 protocol for Rust Agent Development Kit (ADK-Rust) ag
 - **REST API** - Standard HTTP endpoints for agent interaction
 - **A2A Protocol** - Agent-to-Agent v1.0.0 communication (JSON-RPC 2.0, all 11 operations)
 - **SSE Streaming** - Server-Sent Events for real-time responses
-- **Web UI** - Built-in chat interface for testing
+- **Runtime UI** - Built-in responsive interface for agent and team execution
 - **RemoteA2aAgent** - Connect to remote agents as sub-agents
 - **Auth Bridge** - Flow authenticated identity from HTTP headers into agent execution
 - **Artifacts** - Binary artifact storage and retrieval per session
@@ -29,14 +29,14 @@ HTTP server and A2A v1.0.0 protocol for Rust Agent Development Kit (ADK-Rust) ag
 
 ```toml
 [dependencies]
-adk-server = "2.0.0"
+adk-server = "2.3.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.0.0", features = ["server"] }
+adk-rust = { version = "2.3.0", features = ["server"] }
 ```
 
 ## Quick Start
@@ -235,7 +235,56 @@ let config = ServerConfig::new(agent_loader, session_service)
     .with_request_context(Arc::new(MyExtractor));
 ```
 
-When configured, the extracted `RequestContext` flows into `InvocationContext`, making scopes available to tools via `ToolContext::user_scopes()`. Session and artifact endpoints enforce user_id authorization against the authenticated identity.
+When configured, the extracted `RequestContext` flows into `InvocationContext`, making scopes available to tools via `ToolContext::user_scopes()`. Session and artifact endpoints enforce user_id authorization against the authenticated identity. A2A routes use the authenticated identity as the session user and the owner of every task they create, so `tasks/get` and `tasks/cancel` cannot reach another caller's task.
+
+### Background Runs and Cron (feature: `background`)
+
+Runs a workflow without holding the request open, and schedules one on a cron
+expression. Neither is compiled unless the feature is on.
+
+```rust
+use adk_server::background::{FileRunPersistence, RunRetention, RunStore};
+use std::sync::Arc;
+
+// Runs are held in memory. Attach persistence so a restart can still see them.
+let store = RunStore::new()
+    .with_persistence(Arc::new(FileRunPersistence::new("/var/lib/adk/runs.json")))
+    .with_retention(RunRetention::keep_finished(1000));
+
+// At startup, report what the last stop interrupted.
+for run_id in store.restore().await? {
+    tracing::warn!(run.id = %run_id, "this run did not finish before the last restart");
+}
+```
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/runs` | POST | Start a run, returning its id immediately |
+| `/runs/{id}` | GET | Read a run's status and result |
+| `/runs/{id}` | DELETE | Cancel a run |
+| `/cron` | POST / GET / PATCH / DELETE | Manage scheduled jobs |
+
+Cron jobs take a concurrency policy — `skip`, `allow` or `queue` — for what happens
+when the previous run is still going. A `queue` job holds at most 100 waiting runs
+by default (`CronState::with_max_queue_depth`), and resuming a paused job skips the
+occurrences that fell inside the pause.
+
+> **Important:** the routers carry no authentication. Mount them with
+> `ServerBuilder::with_background_runs` and `ServerBuilder::with_cron_jobs`, which
+> serve `/api/runs` and `/api/cron` behind the server's auth middleware, or put a
+> standalone mount behind your own authentication layer.
+
+**What survives a restart.** With a `RunPersistence` attached, run records do. A run
+that was still going cannot still be going, so `restore` returns it as `Failed` with
+a reason and gives it a live cancellation token. The graph state behind it is
+separate: a checkpointed `adk-graph` thread can still be resumed by its id.
+
+Finished runs are bounded by default — the newest 1000 — because a store that keeps
+every finished run forever is a leak that only appears after weeks.
+`RunRetention::unlimited()` opts out. A run still in flight is never discarded.
+
+`FileRunPersistence` writes one JSON file and is enough for a single node. A
+deployment across several needs a shared store; implement `RunPersistence` for one.
 
 ## API Endpoints
 
@@ -291,6 +340,7 @@ When configured, the extracted `RequestContext` flows into `InvocationContext`, 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/ui/capabilities` | GET | Supported UI protocols plus capability metadata (`versions`, `features`, `implementationTier`, `specTrack`, `summary`, `limitations`) |
+| `/api/ui/agents/{name}` | GET | Agent capabilities, hierarchy, and exact portable team topology |
 | `/api/ui/initialize` | POST | Additive MCP Apps host-bridge initialize helper (direct body or JSON-RPC-like envelope) |
 | `/api/ui/message` | POST | Additive MCP Apps host-bridge message helper |
 | `/api/ui/update-model-context` | POST | Additive MCP Apps host-bridge model-context helper |
@@ -345,10 +395,22 @@ For embedded-host mappings, the additive HTTP bridge corresponds to MCP Apps hos
 
 ### Web UI
 
+The ADK-Rust-owned interface uses the Studio Next visual language while staying
+focused on execution. It displays Markdown-formatted conversations and multimodal attachments,
+streaming tool activity, handoffs, animated exact team delegation/handoff topology, realtime
+transcripts and completed audio, event timelines, dedicated telemetry spans, session and shared
+state, artifacts, prior sessions, configured runtime services, A2A discovery, and negotiated UI
+and MCP Apps protocols. It is responsive, keyboard accessible, supports system/light/dark themes,
+and has no external font or asset dependency. The **ADK Runtime** brand links to
+[adk-rust.com](https://adk-rust.com).
+
+See [`examples/advanced_agents/`](../examples/advanced_agents/) for one OpenAI-backed server
+demonstrating ambient scheduling, realtime voice, A2A, MCP discovery/tasks, and telemetry.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Redirect to `/ui/` |
-| `/ui/` | GET | Built-in chat interface |
+| `/ui/` | GET | Built-in agent and team runtime interface |
 | `/ui/assets/config/runtime-config.json` | GET | Runtime configuration |
 | `/ui/{*path}` | GET | Static UI assets |
 

@@ -1,0 +1,65 @@
+[package]
+name = "adk-computer-use"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ADK-Rust graph, auth, and wire contracts for computer-use-mcp"
+homepage.workspace = true
+repository.workspace = true
+keywords = ["ai", "agent", "computer-use", "mcp", "automation"]
+categories = ["api-bindings", "asynchronous"]
+readme = "README.md"
+
+[dependencies]
+adk-core.workspace = true
+adk-graph.workspace = true
+adk-auth.workspace = true
+adk-tool = { workspace = true, features = ["mcp"] }
+adk-eval.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Lease expiry is an RFC 3339 timestamp that must be compared, not merely stored.
+chrono.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+rmcp = { version = "3.1", features = ["client"] }
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = "1.5"
+# Path-only (no version) on purpose: a versioned internal dev-dependency has to be
+# published before this crate can be, which constrains — and can deadlock — the
+# release order. Cargo strips path-only dev-dependencies when packaging.
+# See scripts/check-publish-order.py.
+adk-agent = { path = "../adk-agent" }
+adk-model = { path = "../adk-model", features = ["gemini"] }
+adk-runner = { path = "../adk-runner" }
+adk-session = { path = "../adk-session" }
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+
+# Portable, dependency-free graph showcase (runs on any platform, no server).
+[[example]]
+name = "minimal_graph"
+path = "examples/minimal_graph.rs"
+
+# Cross-platform live showcase (macOS, Linux, Windows). Requires a running
+# computer-use-mcp server; verifies the result via the platform clipboard tool.
+[[example]]
+name = "live_clipboard"
+path = "examples/live_clipboard.rs"
+
+# Native-UI macOS showcases. These require a running computer-use-mcp server and
+# macOS-only tooling (osascript, swiftc, Electron); see examples/macos/README.md.
+[[example]]
+name = "live_form"
+path = "examples/macos/live_form.rs"
+
+[[example]]
+name = "live_background_finder"
+path = "examples/macos/live_background_finder.rs"

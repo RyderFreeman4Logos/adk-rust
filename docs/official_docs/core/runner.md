@@ -47,7 +47,7 @@ sequenceDiagram
 
 ```toml
 [dependencies]
-adk-runner = "2.0.0"
+adk-runner = "2.3.0"
 ```
 
 ## RunnerConfig
@@ -108,10 +108,34 @@ The builder requires three fields: `app_name`, `agent`, and `session_service`. E
 | `plugin_manager` | `Option<Arc<PluginManager>>` | No | Plugin lifecycle hooks |
 | `compaction_config` | `Option<EventsCompactionConfig>` | No | Context compaction settings |
 | `run_config` | `Option<RunConfig>` | No | Execution options |
-| `context_cache_config` | `Option<ContextCacheConfig>` | No | Prompt caching lifecycle |
-| `cache_capable` | `Option<Arc<dyn CacheCapable>>` | No | Cache-capable model reference |
+| `context_cache_config` | `Option<ContextCacheConfig>` | No | Runner-level context cache lifecycle (experimental — see below) |
+| `cache_capable` | `Option<Arc<dyn CacheCapable>>` | No | Cache-capable model reference (experimental — see below) |
 | `request_context` | `Option<RequestContext>` | No | Auth middleware context |
 | `cancellation_token` | `Option<CancellationToken>` | No | Cooperative cancellation |
+
+### Prompt caching
+
+**Caching is a provider-level concern and needs no Runner configuration.** Each
+provider integration handles it where the request is assembled:
+
+| Provider | Mechanism | Default |
+|----------|-----------|---------|
+| Anthropic / Bedrock | `cache_control` breakpoints | **on** (`AnthropicConfig::prompt_caching`, opt out with `with_prompt_caching(false)`) |
+| OpenAI | server-side prompt caching, `PromptCacheRetention` for retention | automatic |
+| Gemini | implicit caching on 2.5/3.x — a shared prefix earns a discount with no code change | automatic |
+
+Cache hits are observable without any extra wiring: the Gemini integration
+records `cachedContentTokenCount` on each response.
+
+> **`context_cache_config` and `cache_capable` are experimental and should be
+> left unset.** They drive Gemini's *explicit* `cachedContents` API from the
+> Runner. That API requires the cache to **replace** `system_instruction`,
+> `tools`, and `tool_config` — sending a cache alongside any of them is rejected
+> with `INVALID_ARGUMENT`. The Runner selects a cache before the agent resolves
+> its tools, so it cannot assemble that request, and enabling these fields does
+> not currently produce cache hits. Guaranteed (rather than best-effort) caching
+> for Gemini belongs in the model integration, alongside how the other providers
+> do it.
 
 ## Running Agents
 
@@ -158,6 +182,39 @@ let mut stream = runner.run_str(
 ```
 
 If the string fails validation (empty, contains null bytes, or exceeds the length limit), `run_str()` returns an error before starting the agent loop. The existing `run()` method with typed `UserId`/`SessionId` remains unchanged.
+
+## Interruption and Run Isolation
+
+A run is registered as soon as `run()` returns its stream, and deregistered when
+that stream is dropped — including when it is dropped without ever being polled.
+
+| Method | Scope |
+|--------|-------|
+| `interrupt(session_id)` | Cancels **every** in-flight run for that session ID, across apps and users |
+| `interrupt_identity(app_name, user_id, session_id)` | Cancels runs for one exact identity |
+| `active_runs()` | The identity of every in-flight run; a repeated identity means concurrent runs |
+| `active_session_ids()` | Deduplicated session IDs of in-flight runs |
+
+```rust
+// Cancel one tenant's run without touching another that shares the session ID
+let cancelled = runner.interrupt_identity("my-app", "user-1", "session-1");
+```
+
+A session ID is only unique within an app and user, so `interrupt(session_id)` is
+the broad form and `interrupt_identity` the precise one. Prefer
+`interrupt_identity` when a single `Runner` serves more than one app or user.
+
+Runs are tracked by a unique run ID rather than by session ID, so two runs for the
+same identity are tracked separately and each deregisters only itself.
+
+### Persistence Is Identity-Bound
+
+Every event the Runner persists — user turns, model responses, transfer events,
+plugin events, and compaction events — is written through
+`SessionService::append_event_for_identity` with the full
+`(app_name, user_id, session_id)` triple. A `SessionService` whose natural key is
+composite can therefore bind each event to its tenant, and can reject or ignore
+the raw-session-ID `append_event` path entirely.
 
 ## Execution Flow
 
@@ -263,8 +320,8 @@ Controls how multiple tool calls from a single LLM response are dispatched:
 | Strategy | Behavior |
 |----------|----------|
 | `Sequential` (default) | Execute tools one at a time in LLM-returned order |
-| `Parallel` | Execute all tools concurrently via `join_all` |
-| `Auto` | Execute read-only tools concurrently, then mutable tools sequentially |
+| `Parallel` | Execute all tools concurrently; the caller owns safety |
+| `Auto` | Execute the safe read-only subset concurrently, then all remaining calls sequentially |
 
 Set per-agent via `LlmAgentBuilder`:
 
@@ -274,12 +331,16 @@ use adk_core::ToolExecutionStrategy;
 let agent = LlmAgentBuilder::new("fast_agent")
     .model(model)
     .tool_execution_strategy(ToolExecutionStrategy::Auto)
-    .tool(Arc::new(search_tool.with_read_only(true)))
-    .tool(Arc::new(save_tool))  // mutable — runs after read-only batch
+    .tool(Arc::new(
+        search_tool
+            .with_read_only(true)
+            .with_concurrency_safe(true),
+    ))
+    .tool(Arc::new(save_tool)) // runs after the concurrent safe subset
     .build()?;
 ```
 
-In `Auto` mode, the dispatch loop queries each tool's `is_read_only()` method. Tools that return `true` run concurrently first, then the remaining tools run sequentially. Results are always reassembled in the original LLM-returned order regardless of strategy. Failed tools produce a JSON error response without aborting the batch.
+In `Auto` mode, the dispatch loop queries both `is_read_only()` and `is_concurrency_safe()`. Calls whose selected tools return `true` for both methods run concurrently first; all remaining calls then run sequentially. `Parallel` bypasses these metadata checks as an explicit caller override. Results are always reassembled in the original LLM-returned order regardless of strategy. Failed tools produce a JSON error response without aborting the batch.
 
 ```rust
 pub enum StreamingMode {

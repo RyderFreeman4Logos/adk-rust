@@ -65,18 +65,70 @@ pub enum Part {
     Text { text: String },
     
     // Binary data embedded in the message
-    InlineData { mime_type: String, data: Vec<u8> },
+    InlineData {
+        mime_type: String,
+        data: Vec<u8>,
+        uri: Option<String>,
+        annotations: Option<Value>,
+    },
     
     // Reference to external file (URL or cloud storage)
-    FileData { mime_type: String, file_uri: String },
+    FileData {
+        mime_type: String,
+        file_uri: String,
+        annotations: Option<Value>,
+    },
     
     // Model requesting a tool call
     FunctionCall { name: String, args: Value, id: Option<String> },
     
     // Result of a tool execution
-    FunctionResponse { function_response: FunctionResponseData, id: Option<String> },
+    FunctionResponse {
+        function_response: FunctionResponseData,
+        id: Option<String>,
+        annotations: Option<Value>,
+    },
+    
+    // A complete resource embedded in the message (source URI + inline contents)
+    EmbeddedResource { resource: EmbeddedResource },
 }
 ```
+
+**Embedded resources:**
+
+`Part::EmbeddedResource` carries a complete resource — a source URI plus inline
+text or binary contents — mirroring the MCP / ACP embedded-resource block. This
+lets `@`-mentioned file context round-trip losslessly through session
+persistence and protocol layers such as `adk-acp`.
+
+```rust
+use adk_core::{BlobResourceContents, Content, EmbeddedResource, TextResourceContents};
+
+// Text resource (verbatim UTF-8 payload, never base64-encoded)
+let text = EmbeddedResource::Text(TextResourceContents::new(
+    "file:///src/main.rs",
+    Some("text/x-rust".to_string()),
+    "fn main() {}",
+));
+
+// Binary resource (checked constructor rejects payloads over MAX_INLINE_DATA_SIZE)
+let blob = EmbeddedResource::Blob(BlobResourceContents::new(
+    "file:///logo.png",
+    Some("image/png".to_string()),
+    vec![0x89, 0x50, 0x4E, 0x47],
+)?);
+
+let content = Content::new("user")
+    .with_text("Here is the entry point and the logo:")
+    .with_embedded_resource(text)
+    .with_embedded_resource(blob);
+```
+
+`EmbeddedResource` is an untagged enum with `Text(TextResourceContents)` and
+`Blob(BlobResourceContents)` variants, each carrying a required `uri` and an
+optional `mime_type`. The variant is additive: older serialized `Content`
+values deserialize unchanged, and existing `Part::InlineData` construction sites
+are unaffected.
 
 **Creating Parts Directly:**
 
@@ -137,6 +189,9 @@ for part in &content.parts {
                 function_response.name, 
                 function_response.response
             );
+        }
+        Part::EmbeddedResource { resource } => {
+            println!("Embedded resource: {}", resource.uri());
         }
     }
 }
@@ -395,23 +450,59 @@ Full context for agent execution (extends CallbackContext):
 pub trait InvocationContext: CallbackContext {
     /// The agent being executed
     fn agent(&self) -> Arc<dyn Agent>;
-    
+
     /// Memory service (if configured)
     fn memory(&self) -> Option<Arc<dyn Memory>>;
-    
+
     /// Current session with state and history
     fn session(&self) -> &dyn Session;
-    
+
     /// Execution configuration
     fn run_config(&self) -> &RunConfig;
-    
+
     /// Signal that this invocation should end
     fn end_invocation(&self);
-    
+
     /// Check if invocation has been ended
     fn ended(&self) -> bool;
+
+    // Capability methods — all have defaults, so an implementation may omit them.
+
+    /// Whether the run has been cancelled, e.g. by `Runner::interrupt`.
+    /// Default: `false`.
+    fn is_cancelled(&self) -> bool;
+
+    /// Authenticated scopes for the caller. Default: empty.
+    fn user_scopes(&self) -> Vec<String>;
+
+    /// Request-scoped metadata. Default: empty.
+    fn request_metadata(&self) -> HashMap<String, serde_json::Value>;
+
+    /// Resolve a secret through the configured provider. Default: `Ok(None)`.
+    async fn get_secret(&self, name: &str) -> Result<Option<String>>;
 }
 ```
+
+#### Capability preservation in derived contexts
+
+The capability methods above, plus `shared_state()` and `artifacts()` on
+`CallbackContext`, all have permissive defaults — `false`, empty, or `None`. That
+matters when a context is *derived*: workflow agents wrap the caller's context to
+change one thing (a branch, the user content, the session), and a wrapper that
+does not forward a capability method silently falls back to its default rather
+than failing to compile.
+
+Every wrapper in the workspace forwards all of them, and a conformance suite
+enforces it by pushing a context with non-default values for each capability
+through each wrapper, including a composed stack. Practically this means
+cancellation, secrets, scopes, request metadata, shared state, artifacts, and
+memory reach a sub-agent regardless of whether it runs directly, under a
+`LoopAgent`, under a `ParallelAgent`, or with skills injected.
+
+> **Note:** if you implement `InvocationContext` yourself by wrapping another
+> context, forward every method above. `ToolContext` does not expose
+> `is_cancelled` or `request_metadata`, so an agent invoked *as a tool* does not
+> currently observe cancellation.
 
 ---
 
@@ -710,7 +801,7 @@ The trait that all LLM providers implement:
 ```rust
 #[async_trait]
 pub trait Llm: Send + Sync {
-    /// Model identifier (e.g., "gemini-2.5-flash", "gpt-5-mini")
+    /// Model identifier (e.g., "gemini-3.7-flash", "gpt-5.6-terra")
     fn name(&self) -> &str;
     
     /// Generate content (streaming or non-streaming)
@@ -795,7 +886,7 @@ All providers (Gemini, OpenAI, Anthropic, Ollama, etc.) implement this trait, ma
 
 ```rust
 // Switch providers by changing one line
-let model: Arc<dyn Llm> = Arc::new(GeminiModel::new(&key, "gemini-2.5-flash")?);
+let model: Arc<dyn Llm> = Arc::new(GeminiModel::new(&key, "gemini-3.7-flash")?);
 // let model: Arc<dyn Llm> = Arc::new(OpenAIClient::new(config)?);
 // let model: Arc<dyn Llm> = Arc::new(AnthropicClient::new(config)?);
 

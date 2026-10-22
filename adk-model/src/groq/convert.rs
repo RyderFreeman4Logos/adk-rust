@@ -186,19 +186,27 @@ pub fn content_to_message(content: &Content) -> Message {
                     },
                 });
             }
-            Part::FunctionResponse { function_response, id } => {
+            Part::FunctionResponse { function_response, id, .. } => {
                 tool_call_id = id.clone();
                 text_parts
                     .push(crate::tool_result::serialize_tool_result(&function_response.response));
             }
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 text_parts.push(attachment::inline_attachment_to_text(mime_type, data));
             }
-            Part::FileData { mime_type, file_uri } => {
+            Part::FileData { mime_type, file_uri, .. } => {
                 text_parts.push(attachment::file_attachment_to_text(mime_type, file_uri));
             }
             // Server-side tool parts are Gemini-specific; skip for Groq
             Part::ServerToolCall { .. } | Part::ServerToolResponse { .. } => {}
+            // Embedded resources: text → text; blob → inline-bytes text representation.
+            Part::EmbeddedResource { resource } => match resource {
+                adk_core::EmbeddedResource::Text(text) => text_parts.push(text.text.clone()),
+                adk_core::EmbeddedResource::Blob(blob) => {
+                    let mime_type = blob.mime_type.as_deref().unwrap_or("application/octet-stream");
+                    text_parts.push(attachment::inline_attachment_to_text(mime_type, &blob.data));
+                }
+            },
         }
     }
 
@@ -303,13 +311,15 @@ pub fn from_response(response: &ChatCompletionResponse) -> LlmResponse {
         meta
     });
 
+    let turn_complete = content.as_ref().is_none_or(|value| !value.has_function_calls());
+
     LlmResponse {
         content,
         usage_metadata: usage,
         finish_reason,
         citation_metadata: None,
         partial: false,
-        turn_complete: true,
+        turn_complete,
         interrupted: false,
         error_code: None,
         error_message: None,
@@ -339,7 +349,8 @@ pub fn create_tool_call_response(
         finish_reason,
         citation_metadata: None,
         partial: false,
-        turn_complete: true,
+        // A tool-call response keeps the turn open so the Runner can execute it.
+        turn_complete: false,
         interrupted: false,
         error_code: None,
         error_message: None,
@@ -353,13 +364,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_call_response_keeps_the_turn_open() {
+        let response = create_tool_call_response(
+            vec![("call-1".to_string(), "lookup".to_string(), serde_json::json!({}))],
+            Some(FinishReason::Stop),
+        );
+
+        assert!(!response.turn_complete);
+        assert!(response.content.as_ref().is_some_and(Content::has_function_calls));
+    }
+
+    #[test]
     fn content_to_message_keeps_inline_attachment_payload() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::InlineData {
-                mime_type: "application/octet-stream".to_string(),
-                data: vec![0xCA, 0xFE],
-            }],
+            parts: vec![Part::inline_data("application/octet-stream", vec![0xCA, 0xFE])],
         };
         let message = content_to_message(&content);
         let payload = message.content.unwrap_or_default();
@@ -371,10 +390,7 @@ mod tests {
     fn content_to_message_keeps_file_attachment_payload() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::FileData {
-                mime_type: "application/pdf".to_string(),
-                file_uri: "https://example.com/report.pdf".to_string(),
-            }],
+            parts: vec![Part::file_data("application/pdf", "https://example.com/report.pdf")],
         };
         let message = content_to_message(&content);
         let payload = message.content.unwrap_or_default();

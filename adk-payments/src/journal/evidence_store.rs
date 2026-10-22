@@ -75,6 +75,8 @@ impl EvidenceStore for ArtifactBackedEvidenceStore {
                 part: Part::InlineData {
                     mime_type: command.content_type.clone(),
                     data: command.body.clone(),
+                    uri: None,
+                    annotations: None,
                 },
                 version: None,
             })
@@ -105,7 +107,7 @@ impl EvidenceStore for ArtifactBackedEvidenceStore {
 
         match response {
             Ok(response) => {
-                let Part::InlineData { mime_type, data } = response.part else {
+                let Part::InlineData { mime_type, data, .. } = response.part else {
                     return Err(AdkError::new(
                         ErrorComponent::Artifact,
                         ErrorCategory::Internal,

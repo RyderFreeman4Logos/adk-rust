@@ -7,25 +7,2231 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [2.3.0] - 2026-10-09
 
-- **adk-core: Event serialization no longer produces duplicate `"provider_metadata"` keys.**
-  `Event.provider_metadata` is now serialized as `"event_metadata"` to avoid collision
-  with `LlmResponse.provider_metadata` (which is flattened into the same JSON object).
-  Regression test added. (`#414`)
+### Breaking
 
-## [2.0.0] - 2026-06-28
+- **`adk-acp` moves to `agent-client-protocol` 2.2.** `adk_acp::agent_client_protocol`
+  re-exports the SDK, so code that uses it directly compiles against the 2.x API.
+  The wire protocol stays stable ACP v1, and the `adk-acp` API is unchanged.
 
-### Changed
+- **AP2 amount conversion is fallible** (`adk-payments`, `ap2`):
+  `PaymentCurrencyAmount::to_money` and `Ap2McpReceiptStatus::from_receipt`
+  return `Result<_, Ap2Error>`. Malformed, over-precise, or overflowing amounts
+  return `Ap2Error::InvalidAmount` instead of a zero or wrapped value.
 
-- **Breaking:** major version bump. Accumulated API changes since 1.0.0 include
-  new public enum variants in `adk-anthropic` (`ContentBlock::WebFetchToolResult`,
-  `ToolUnionParam::WebFetch20250910`, `ServerTool::WebFetch20250910`) and a new
-  public field on `adk-graph`'s `StateGraph` (`deferred_configs`), which require
-  a major release under semver.
+- **Chrome starts with its sandbox on** (`adk-browser`): `BrowserSession` no longer adds
+  `--no-sandbox` to every Chrome session. Containers that run Chrome as root opt in with
+  `BrowserConfig::add_arg("--no-sandbox")`; `chrome_options` cannot replace the argument list.
+  `BrowserConfig` gains the public fields `require_explicit_start` and `chrome_options`, so
+  struct-literal construction needs `..Default::default()`.
+
+- **Terminal streaming events carry the complete response** (`adk-agent`, `adk-server`): the
+  last event of a streamed model response holds the whole response, marked
+  `provider_metadata.content_complete = true`, instead of only the final chunk. Raw
+  `/api/run_sse` clients that append every event's text show the reply twice; replace the
+  content rendered for an event `id` when `content_complete` is set, or pass each event
+  through `adk_core::EventTextDeltas`. Tool-result events arrive in completion order rather
+  than call order.
+
+### Security
+
+- **A2A sessions and tasks bind to the authenticated caller** (`adk-server`): the
+  `/a2a` and `/a2a/stream` routes, and the v1 `jsonrpc_handler` and `rest_router`,
+  use the authenticated principal as the session user and record it as the owner
+  of every task they create. `tasks/get`, `tasks/cancel`, and the v1 task, list,
+  subscribe, and push-config operations answer "not found" for another caller's
+  task; a v1 `messageId` deduplicates per caller; and a v1 `INPUT_REQUIRED` task
+  resumes only for its owner. The session user was derived from the
+  client-supplied `contextId`, so an authenticated caller who knew another
+  caller's `contextId` or task ID could read that caller's history, poll its
+  task, or cancel it. Deployments without authentication keep the
+  `contextId`-derived session user.
+
+- **Debug event lookup checks trace ownership** (`adk-server`):
+  `GET /api/apps/{app}/users/{user}/sessions/{session}/events/{event}` answers 403
+  when spans recorded for the session belong to a different user, as
+  `GET /api/debug/trace/session/{session_id}` does, instead of reading the trace
+  by session ID alone.
+
+- **Background and cron routes mount behind authentication** (`adk-server`,
+  feature `background`): `ServerBuilder::with_background_runs` and
+  `ServerBuilder::with_cron_jobs` serve `/api/runs` and `/api/cron` behind the
+  server's auth middleware. The standalone routers carry no authentication; their
+  rustdoc and the functional API guide state that a standalone mount must sit
+  behind an authentication layer.
+
+- **Push webhook validation covers metadata and internal ranges** (`adk-server`,
+  feature `a2a-v1`): `validate_webhook_url` also rejects `0.0.0.0/8`,
+  `169.254.0.0/16`, `100.64.0.0/10`, `fc00::/7`, `fe80::/10`, multicast,
+  broadcast, `*.localhost`, and IPv4-mapped, IPv4-compatible, and NAT64 forms of
+  blocked IPv4 addresses. `HttpPushNotificationSender::new()` does not follow
+  redirects and bounds each delivery attempt at 10 seconds.
+
+- **Seatbelt profiles escape every interpolated path** (`adk-sandbox`,
+  `sandbox-macos`): allowed paths are written as SBPL string literals with `\`,
+  `"`, and control characters escaped. A directory named
+  `w"))(allow network*)(allow file-write* (subpath "/` previously closed the
+  literal and granted full network access and writes to `/`. Paths that are not
+  valid UTF-8 are rejected with `PolicyViolation`.
+
+- **The Seatbelt profile is deny-by-default** (`adk-sandbox`, `sandbox-macos`):
+  `(allow default)` followed `(deny default)`, so every read and mach lookup was
+  allowed — `~/.ssh` and other host secrets were readable from inside the
+  sandbox. The profile now grants only the system runtime (`/bin`, `/sbin`,
+  `/usr`, `/System`, `/Library/Apple`, `/Library/Frameworks`, `/opt/homebrew`,
+  `/private/etc` minus `master.passwd` and `sudoers`, the dyld cache), a fixed set
+  of startup mach services, and the policy's paths. `ProcessBackend` now reports
+  `filesystem_read_isolation` on macOS. Programs installed elsewhere, such as a
+  rustup toolchain or Xcode, need `allow_read`.
+
+- **Linux `allow_process_spawn = false` is enforced** (`adk-sandbox`,
+  `sandbox-linux`): it previously added only `--new-session`, which does not
+  block `fork` or `exec`. bubblewrap now loads a seccomp program that fails
+  `fork`, `vfork`, and non-thread `clone` with `EPERM` and `clone3` with
+  `ENOSYS` on x86-64 and AArch64; other architectures return `EnforcerFailed`.
+  `SandboxEnforcer::configure_command` installs the program and must be called on
+  the wrapped command.
+
+- **`LocalUnixSession::exec_command` is hardened** (`adk-sandbox`, `workspace`):
+  commands run with a cleared environment (only `PATH`, `HOME`, `USER`,
+  `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, and `TERM` pass
+  through), stdin from `/dev/null`, output read while the command runs and capped
+  at 1 MiB per stream, and their own process group, killed on timeout and on
+  exit. Host credentials in the environment previously reached every command, and
+  a timeout killed only `sh`.
+
+- **`DockerClient` containers drop privileges and network** (`adk-sandbox`,
+  `workspace-docker`): containers start with `cap_drop: ALL`,
+  `no-new-privileges`, a 512-process limit, and network mode `none`.
+  `with_network_mode` and `with_pids_limit` change the defaults; `GitRepo`
+  manifest entries need a network mode other than `none`.
+
+- **`DockerClient` no longer builds shell commands from paths** (`adk-sandbox`,
+  `workspace-docker`): file writes, `git clone`, and `git checkout` pass paths,
+  URLs, and branch names as arguments. A `'` in a path previously injected shell
+  commands into the container. Branch names starting with `-` are rejected.
+
+- **Redis memory `delete_user` erased other users' memories** (`adk-memory`): the
+  index-key `SCAN` pattern was `mem_idx:{app}:{user}*`, with no delimiter after the
+  user id and no glob escaping, so deleting `alice` also deleted the index sets of
+  `alice2` and `alice-admin`, and a `user_id` of `*` matched every user. Both
+  `delete_user` patterns now end the user segment with `:` and escape `*`, `?`,
+  `[`, `]` and `\`.
+
+- **Redis key delimiter collisions** (`adk-memory`, `adk-session`): identifiers were
+  joined with `:`, which identity validation allows, so app `a:b` with user `c`
+  shared keys with app `a` and user `b:c`, and a session id ending in `:events`
+  aliased another session's event set. Key segments are now percent-encoded; the
+  key-format change is listed under Changed.
+
+- **LanceDB delete predicate injection** (`adk-rag`): `LanceDBVectorStore::delete`
+  spliced ids into `id IN ('…')` without escaping, so an id containing `'` failed
+  the delete and the id `x') OR ('1'='1` deleted every row. Ids are now typed
+  string literals in a DataFusion expression.
+
+- **Firestore tenant isolation** (`adk-session`, feature `firestore`): `delete`
+  and every append re-read the session document inside their transaction and
+  apply only when its app, user, and session ID match the request. Deleting
+  another user's session is a no-op, and appending to it fails with
+  `session.not_found`. `create` no longer upserts: an ID already taken in the app
+  fails with `session.already_exists`, so a session and its events cannot be
+  taken over, and a new session never inherits events left under its path.
+  App names, user IDs, and session IDs containing `/` are rejected.
+
+- **`EncryptedSession` encrypts events and binds ciphertext to the session**
+  (`adk-session`, feature `encrypted-session`):
+  - Event content, LLM response metadata, actions, and long-running tool IDs are
+    sealed into one envelope per event; `llm_request` and event
+    `provider_metadata` are not persisted.
+  - State values from `create` and from event `state_delta` are encrypted per
+    value, so `app:` and `user:` values stay in their shared tiers and later
+    writes are encrypted even when the initial state is empty.
+  - Associated data binds each ciphertext to its app, user, session, and state
+    key or event ID; data moved to another session fails with
+    `session.encryption.decrypt_failed`.
+  - `list` returns decrypted state and events instead of ciphertext.
+  - Key rotation re-encrypts state through a state-only event appended with
+    `append_event_for_identity` and returns failures, instead of calling
+    `create` over the existing session and discarding the result.
+  - `append_event(session_id, ..)` returns
+    `session.encryption.identity_required`; use `append_event_for_identity`.
+  - Data in the previous format is rejected with
+    `session.encryption.unencrypted_data`;
+    `EncryptedSession::with_legacy_migration(true)` reads and re-encrypts it.
+    `inner()` and `into_inner()` expose the wrapped service.
+
+- **`RedisSessionConfig` redacts credentials in `Debug`** (`adk-session`,
+  feature `redis`): the URL password and `*password*` query parameters print as
+  `[REDACTED]`.
+
+- **UI sign-in warning** (`adk-cli`): the account name no longer reaches
+  stdout when the launcher warns about UI sign-in.
+
+- **`LoopAgent` with zero iterations** (`adk-agent`): `with_max_iterations(0)`
+  runs no iterations and completes after its callbacks, instead of panicking on
+  `u32` underflow in debug builds and looping `u32::MAX` times in release builds.
+
+- **`output_key` written before schema validation** (`adk-agent`): with
+  `output_schema` set, `state[output_key]` receives only a response that passes
+  validation. Rejected attempts, including every attempt of a run that exhausts
+  `output_max_retries`, are no longer persisted.
+
+- **After-tool callbacks without shared state** (`adk-agent`):
+  `CallbackContext::shared_state()` in after-tool callbacks returns the
+  `ParallelAgent` shared state, matching before-tool callbacks.
+
+- **Two tasks leaked per run with a global cancellation token** (`adk-runner`):
+  each run derives a child of `RunnerConfig::cancellation_token` instead of
+  spawning two watcher tasks that never completed. Cancelling the global token
+  still stops every in-flight run, and `Runner::interrupt` cancels only its target.
+
+- **Lost wakeup in `SharedState::wait_for_key`** (`adk-core`): a waiter registers
+  for notification before it reads the key, so a `set_shared` that lands between
+  the read and the wait wakes it instead of leaving it to time out.
+
+- **adk-devtools: file tools refuse dangling symlinks, and `glob` stays inside the
+  workspace.** `Workspace::resolve` stepped past a path component that failed to
+  canonicalize, so a dangling symlink passed the containment check and `write_file`
+  followed it, creating its target outside the root — a repository containing
+  `link -> ~/.zshenv` let `write_file("link", ..)` create `~/.zshenv`. Dangling and
+  looping symlinks are now refused wherever they point, and `write_file`/`edit_file`
+  re-check the canonical parent before the open and open with `O_NOFOLLOW` on Unix.
+  `glob` joined the pattern onto the root unchecked, so `../*` and symlinked
+  directories listed host paths; it now refuses `..` and absolute patterns, escapes
+  the root path, and drops every match that resolves outside the root.
+
+- **adk-devtools: `bash` output is capped as it is read, and a cancelled call kills
+  the command.** Output was collected in full and cut afterwards with
+  `String::truncate`, which bounded only the report and panicked when the cap fell
+  inside a multi-byte character. Each stream now keeps at most `max_output_bytes`
+  while reading, drains and discards the excess so the command still completes, and
+  cuts on a character boundary. Dropping the tool call left the command and its
+  descendants running; the process group is now killed on drop, as on timeout.
+
+- **adk-tool: `bigquery_execute_sql` no longer runs writes while reporting itself
+  read-only.** The tool returned `is_read_only() == true` but executed any SQL, so
+  parallel dispatch could run a `DROP TABLE` alongside other calls. In read-only mode,
+  now the default, it accepts a single `SELECT` or `WITH` statement (comments and
+  string contents are ignored, multiple statements are refused), and a BigQuery dry
+  run must classify the query as `SELECT` before it runs. `is_read_only()` follows
+  the configuration.
+
+- **adk-tool: BigQuery and Spanner service-account keys stay in memory.** Keys
+  resolved through `from_secret` were written to the shared temp directory with
+  default permissions and removed only on normal completion, so a cancelled call left
+  the key on disk. They are now parsed in memory and never written. A malformed key
+  secret is no longer quoted back in the tool error.
+
+- **adk-browser: navigation accepts only web URLs, and arbitrary JavaScript is
+  opt-in.** `browser_navigate` only checked that the URL parsed, so a model could open
+  `file:///etc/passwd`, `javascript:` and `data:` URLs, or `chrome://` pages;
+  `browser_new_tab` and `browser_new_window` did not check at all. All three now
+  accept only `http` and `https` (`DEFAULT_ALLOWED_SCHEMES`) unless
+  `BrowserToolset::with_allowed_schemes` widens the list, and refuse other schemes
+  before the browser is touched. `browser_evaluate_js` was part of the default
+  toolset and the `Full` and `Scraping` profiles; it is now excluded from all of them.
+
+- **adk-code: Rust executors no longer expose the host environment.**
+  `RustExecutor` and `RustSandboxExecutor` ran `rustc` with the inherited
+  environment, so `env!("OPENAI_API_KEY")` or `option_env!` in model-written
+  code embedded host credentials in the binary, and `RustSandboxExecutor` ran the
+  binary with the full host environment. `rustc` now starts from a cleared
+  environment plus the `ProcessBackend::toolchain_env` allowlist, with
+  `kill_on_drop` and the request timeout. `RustSandboxExecutor` runs the binary
+  with only the variables named by the request's `EnvironmentPolicy` and now
+  reports `enforce_environment_policy: true`. `RustExecutor` compiles inside
+  the `SandboxBackend` when the backend confines filesystem reads, so
+  `include_str!` is confined like the binary; otherwise it compiles on the host.
+
+- **adk-code: `validate_policy` rejects environment policies the backend cannot
+  enforce.** `EnvironmentPolicy::None` passed validation on backends reporting
+  `enforce_environment_policy: false`, although those backends pass the host
+  environment through. Such backends now reject every request with
+  `ExecutionError::UnsupportedPolicy`.
+
+- **adk-code: `EmbeddedJsExecutor` enforces its timeout.** The timeout was
+  checked only after evaluation returned, so `while (true) {}` never returned
+  and pinned a blocking-pool thread. Evaluation runs on a dedicated thread,
+  `execute` returns `ExecutionStatus::Timeout` at the deadline, and Boa runtime
+  limits (10,000,000 loop iterations per call frame, call depth 512, VM stack
+  10,240 values) stop the interpreter with an uncatchable error.
+
+- **adk-code: `DockerExecutor` honours the request's sandbox policy.** Network,
+  bind mounts, and environment came from `DockerConfig` alone while the backend
+  reported network, filesystem, and environment enforcement. Each request is now
+  checked with `DockerConfig::validate_sandbox_policy`, and a request stricter
+  than the container — for example `SandboxPolicy::strict_rust()` against a
+  `with_network()` container — fails with `ExecutionError::UnsupportedPolicy`.
+  Variables named by `EnvironmentPolicy::AllowList` are passed from the host to
+  the exec.
+
+- **Caller-aware A2A handlers** (`adk-server`): the built-in routers mount
+  `handle_jsonrpc_for_caller` and `handle_jsonrpc_stream_for_caller`.
+  `handle_jsonrpc` and `handle_jsonrpc_stream` are deprecated because they ignore
+  the authenticated caller. `tasks/cancel` for an unknown task answers
+  `Task not found` (`-32603`), as `tasks/get` does, instead of a canceled status.
+
+- **v1 `jsonrpc_handler` takes an `AuthenticatedCaller`** (`adk-server`, feature
+  `a2a-v1`): a direct call passes the extractor as the second argument;
+  `post(jsonrpc_handler)` mounts are unchanged.
+
+- **`CronJobStore::enqueue_run` returns `bool`** (`adk-server`, feature
+  `background`): `false` when the job's queue is full or the job does not exist.
+
+- **AP2 adapter requires verifiers** (`adk-payments`, `ap2`): `Ap2Adapter::new`
+  configures no authorization verifier, so merchant, intent, and payment
+  authorizations fail with `Ap2Error::AuthorizationVerifierNotConfigured` until
+  `with_merchant_authorization_verifier` and `with_user_authorization_verifier`
+  are set. `allow_unverified_authorizations()` restores the presence-only checks
+  for local development and logs a warning.
+
+- **`AcpVerificationConfig::strict()` enforces signatures and timestamps**
+  (`adk-payments`, `acp`): the strict profile requires a verified `Signature`, a
+  `Timestamp` within five minutes, and an `Idempotency-Key` on POST, and router
+  `build()` fails until `with_signature_verifier` is set. The previous
+  idempotency-only profile is
+  `permissive().with_idempotency_mode(IdempotencyMode::RequireForPost)`.
+
+- **Amounts follow the currency minor unit** (`adk-payments`): AP2 amounts and ACP
+  delegated-payment allowances use the ISO 4217 minor-unit scale (`JPY` 0, `KWD`
+  3) instead of a fixed scale of 2. `AmountThresholdGuardrail::new` thresholds are
+  minor units at that scale; `with_currency` binds them to one currency and
+  denies the others.
+
+- **AP2 human-not-present authority** (`adk-payments`, `ap2`): an intent needs
+  merchant or SKU constraints; `requires_refundability` alone no longer
+  authorizes autonomous payment.
+
+- **AP2 authorizations are verified, not just present** (`adk-payments`, `ap2`):
+  the default verifiers accepted any non-empty `merchant_authorization` or
+  `user_authorization`, so a forged value reached `execute_payment`. The adapter
+  now rejects every authorization until cryptographic verifiers are configured.
+  A merchant verifier that sets `VERIFIED_MERCHANT_NAME_CLAIM` makes the adapter
+  reject carts whose `merchant_name` differs from the verified signer.
+
+- **AP2 payment mandates are single-use** (`adk-payments`, `ap2`): the adapter
+  consumes each mandate in a `PaymentMandateLedger` before execution and records
+  it on the transaction. A resubmitted mandate returns
+  `Ap2Error::PaymentMandateReplayed`, a second mandate for a paid transaction
+  returns `Ap2Error::TransactionAlreadyPaid`, and `ap2_payment_mandate_id` is
+  never rebound by later receipts. `with_payment_mandate_ledger` plugs in shared
+  storage for multi-instance deployments.
+
+- **ACP signature enforcement without a verifier** (`adk-payments`, `acp`):
+  `require_signature(true)` without `with_signature_verifier` only checked that
+  the header existed. Router `build()` now fails for that profile, and the
+  request verifier rejects every request if reached.
+
+- **Card data in delegated-payment selections** (`adk-payments`, `acp`):
+  `PaymentMethodSelection.extensions` carried the full card, including PAN, CVC,
+  and cryptogram. It now keeps only type, funding type, brand, last four digits,
+  wallet type, and the virtual flag.
+
+- **Team relationship approval honours `Deny`** (`adk-agent`): a tool whose
+  confirmation the invocation context requires — a team `Delegate` relationship
+  with `RelationshipApprovalPolicy::Required` — no longer executes when the static
+  or handler decision for the call is `Deny`. The tool executor applies the union
+  of the agent's `ToolConfirmationPolicy` and
+  `InvocationContext::requires_tool_confirmation`, so a denied delegate call
+  returns the same denied function response as the agent-policy path.
+
+- **Redis key segments are percent-encoded** (`adk-memory`, `adk-session`): `%`
+  becomes `%25` and `:` becomes `%3A` in every app, user, session and project
+  segment. Identifiers containing neither character keep their existing keys.
+  Data stored under an identifier containing `:` or `%` must be renamed to the
+  encoded key, for example memory entries of app `a:b`, user `c`, session `s` move
+  from `mem:a:b:c:s` to `mem:a%3Ab:c:s`. In `adk-session`, an app named
+  `app_state`, `user_state`, `sessions_idx` or `session_lookup` also has its first
+  byte encoded in session and event keys (`user_state:app:alice` →
+  `%75ser_state:app:alice`).
+
+- **Neo4j memory entry ids** (`adk-memory`): new entries use the scoped id format
+  `s:{app}:{user}:{scope}:{session}:{index}` or `d:{app}:{user}:{scope}:{uuid}`.
+  Entries written earlier keep their ids, so re-ingesting a session stored before
+  this release adds a second copy; call `delete_session` first to avoid it.
+
+- **Anthropic API keys in `Debug` output** (`adk-anthropic`): `Anthropic`,
+  `ManagedAgentsClient`, and `FilesClient` redact the API key in `Debug`
+  output, and the `x-api-key` and bearer `Authorization` header values are
+  marked sensitive.
+
+- **Provider API keys in `Debug` and `Serialize` output** (`adk-model`):
+  `OpenAIConfig`, `AzureConfig`, `OpenAIResponsesConfig`, `OpenAICompatibleConfig`,
+  `AnthropicConfig`, `GroqConfig`, `DeepSeekConfig`, `OpenRouterConfig`, and
+  `AzureAIConfig` redact `api_key` in `Debug` output and omit it when serialized.
+  A config deserialized without `api_key` gets an empty key.
+
+- **Model clients no longer follow HTTP redirects** (`adk-anthropic`, `adk-gemini`,
+  `adk-model`): the Anthropic client, the Gemini Studio and Vertex backends, and the
+  OpenAI-compatible, Azure OpenAI, OpenAI Responses (generation), Azure AI Inference and
+  DeepSeek clients return a 3xx response as an error instead of re-sending the request and
+  its credentials to another host. Proxies configured through `HTTP_PROXY`/`HTTPS_PROXY`
+  are unaffected. The Groq, OpenRouter and Conversations clients still follow redirects.
+
+- **Direct MCP tool calls follow ADK's MRTR input policy** (`adk-tool`):
+  `McpToolset::call_tool_value` went through rmcp's `call_tool`, which answered a
+  server's MRTR sampling requests with the configured sampling handler. Every toolset on
+  `AdkClientHandler`, including one passed to `McpToolset::new`, now applies ADK's input
+  policy, which rejects MRTR sampling and roots. On any other client handler, MRTR
+  sampling and roots requests reach the handler only when it declared those capabilities.
+
+- **rustls upgraded to 0.23.45** (workspace and every standalone example): resolves
+  RUSTSEC-2026-0285. No API change; the lockfiles move together so `cargo check --locked`
+  keeps passing for each example.
 
 ### Added
 
+- **Gemini Live spoken language** (`adk-realtime`): `RealtimeConfig::with_language`
+  sends a BCP-47 tag as `generationConfig.speechConfig.languageCode` for AI Studio
+  and Vertex AI Live, so transcription does not switch languages on short or
+  accented turns. Native-audio output models ignore it.
+
+- **Live ACP end-to-end example** (`examples/acp_openai_e2e`): an OpenAI-backed
+  coordinator delegates over ACP stdio to an OpenAI-backed ADK agent served by
+  `AcpServer`, and asserts environment passing, one-shot and persistent sessions,
+  and the permission bridge.
+
+- **Automatic progressive-skill guidance** (`adk-skill`, `adk-agent`):
+  `SkillToolset` now adds guidance for its currently available tools to each
+  model request through the new `Toolset::process_llm_request` hook. Guidance
+  is also applied to invocation-scoped toolsets.
+
+- **`AuthenticatedCaller` extractor** (`adk-server`): reads the request's
+  `RequestContext` from the extensions the auth layer sets, and yields `None`
+  when no authentication ran.
+
+- **`A2aTaskRetention`** (`adk-server`): bounds finished A2A task records — the
+  newest 1,000 for at most one hour by default — configured with
+  `ServerBuilder::with_a2a_task_retention` or `A2aController::with_task_retention`.
+
+- **`RequestHandler::for_caller`** (`adk-server`, feature `a2a-v1`): returns a
+  `CallerScope` that runs every v1 operation for one caller.
+
+- **`ProcessBackend::toolchain_env` is public** (`adk-sandbox`): callers that
+  invoke `rustc` themselves apply the same minimal toolchain allowlist after
+  `env_clear()`.
+
+- **`DockerConfig::validate_sandbox_policy`** (`adk-code`): checks whether a
+  container created from a `DockerConfig` satisfies a `SandboxPolicy`.
+
+- **Plain-HTTP base URLs for internal gateways** (`adk-anthropic`, `adk-model`):
+  `Anthropic::allow_insecure_http()` and `AnthropicConfig::allow_insecure_http()` accept
+  an `http://` base URL on a non-loopback host and log a warning naming the host. On
+  `Anthropic`, call it before `with_base_url`, which validates when called. A base URL
+  from `ANTHROPIC_BASE_URL` is acknowledged by `ANTHROPIC_ALLOW_INSECURE_HTTP=1` instead.
+  Without the opt-in, the validation error now names it (#700).
+
+- **Host-managed browser sessions** (`adk-browser`): `BrowserConfig::require_explicit_start`
+  makes tools wait for the host to call `BrowserSession::start()`, which now keeps a live
+  session and replaces one that no longer responds; `chrome_option` passes Chrome options
+  such as `binary` and `prefs`.
+
+- **`EventTextDeltas`** (`adk-core`): converts complete response snapshots back into text and
+  thinking deltas for append-only output such as terminals and chat streams.
+
+- **`McpToolset::cancel_pending_tasks`** (`adk-tool`): cancels remote MCP tasks whose
+  tool-call future was dropped, and in-flight ones, and releases each task once the
+  server reports it terminal or no longer knows it. `McpServerManager` runs it within the
+  grace period when it stops a server.
+
+- **OpenCode Go and Zen** (`adk-model`): the `opencode` feature adds `OpenCodeClient`, which
+  routes documented models through Chat Completions, Responses, Anthropic Messages or Gemini
+  `generateContent` and sends the application's `User-Agent` and `x-opencode-session` headers
+  with every request. Unknown models take an explicit `OpenCodeApi`.
+
+- **Default HTTP headers on model clients** (`adk-anthropic`, `adk-model`):
+  `Anthropic::with_default_headers`, `AnthropicClient::with_default_headers`,
+  `OpenAICompatible::with_default_headers` and `OpenAIResponsesClient::with_default_headers`
+  add headers to every request. Authentication headers and disabled redirects are kept, and
+  the Responses client keeps its request rewriting and adapter in either call order.
+
+- **OrcaRouter preset** (`adk-model`): `OpenAICompatibleConfig::orcarouter()` targets
+  `https://api.orcarouter.ai/v1` through the shared OpenAI-compatible client and needs only the
+  `openai` feature.
+
+### Changed
+
+- **wasmtime 48** (`adk-sandbox`, feature `wasm`): `wasmtime` and `wasmtime-wasi`
+  move from 46 to 48.0.3 together. No `adk-sandbox` API changes; wasmtime types
+  are not part of its public API.
+
+- **Supported versions** (`SECURITY.md`): security fixes target the 2.2.x line
+  and 2.1.x; 2.0.x and 1.x no longer receive updates.
+
+- **`Model::Gemini3ProPreview` is deprecated** (`adk-gemini`): the
+  `gemini-3-pro-preview` model is retired. Use `Model::Gemini31ProPreview`.
+
+- **`#[task]` calls shared one cached result** (`adk-rust-macros`, `adk-graph`):
+  the execution-log key was the task's name alone and the log is consulted within
+  the run, so a task called in a loop returned the first call's result for every
+  later call. Each call is now keyed by its ordinal in the run and a hash of its
+  serializable arguments; see `adk_graph::functional::task_call_id`. The wrapper
+  also uses the context parameter's real name instead of assuming `ctx`.
+
+- **Dynamic pauses dropped completed siblings' successors** (`adk-graph`): a
+  dynamic or tool-confirmation pause saved only the paused node, so the successors
+  and `goto` targets of nodes that completed in the same super-step never ran after
+  the resume. The saved frontier is now those successors plus the paused node, in
+  `invoke` and in every stream mode.
+
+- **Fan-in arrivals lost across a pause or crash** (`adk-graph`): a join's
+  recorded arrivals lived only in the executor, so a join whose first predecessor
+  finished before a pause never ran. Arrivals and wait start times are stored in
+  checkpoint metadata (`adk.graph.fanIn`, versioned); a checkpoint without the key
+  loads with no arrivals, as before. `CompiledGraph::update_state` now keeps the
+  arrivals, the answered gate, the retry budget, and the child ledger.
+
+- **`GraphAgent` answered every later turn with the first** (`adk-graph`): with a
+  checkpointer, the session's finished thread was reloaded with an empty frontier,
+  so no node ran and the old output came back. A turn on a finished thread now
+  runs the graph again from its entry nodes, starting from the previous turn's
+  state; a paused thread still resumes. The recursion limit counts per turn.
+
+- **Node-cache hits broke super-step isolation** (`adk-graph`, `node-cache`): a
+  hit's updates were applied before uncached siblings read the state, and a miss in
+  the same step stored its result under a key computed from that changed state,
+  which no lookup matched. Hits now join the step's update batch and every key is
+  computed from the pre-step state.
+
+- **Action nodes trusted interpolated paths and URLs** (`adk-graph`, `action`):
+  file nodes are confined to allowed roots, rejecting `..` and symbolic-link
+  escapes; HTTP nodes reject URLs outside an `HttpActionPolicy` (default `https`
+  and `http`), re-check every redirect, and log URLs without query strings or
+  credentials.
+
+- **Unimplemented action nodes pointed at feature flags** (`adk-graph`, `action`):
+  database, email, and JavaScript/TypeScript code nodes now report that the node
+  type is not implemented, since `action-db`, `action-email`, and `action-code`
+  compile placeholders only.
+
+- **Failed retry-budget checkpoint was silent** (`adk-graph`): when a super-step
+  fails and its checkpoint cannot be saved, the executor logs a warning with the
+  error instead of discarding it.
+
+- **`#[task]` execution-log keys** (`adk-rust-macros`): keys change from
+  `{task}` to `{task}#{ordinal}` or `{task}#{ordinal}:{arg_hash}`, so a workflow
+  resumed from a log written before this release runs its tasks again. Every
+  `#[task]` parameter must be a plain identifier.
+
+- **File action confinement** (`adk-graph`, `action`): file nodes default to the
+  current working directory as their only root; `ActionNodeExecutor::with_file_roots`
+  and `action::file::execute_file_in` name others. Reported paths are the resolved
+  absolute paths, and listing skips symbolic links.
+
+- **HTTP action policy** (`adk-graph`, `action-http`): new `HttpActionPolicy`,
+  `ActionNodeExecutor::with_http_policy`, and `action::http::execute_http_with_policy`.
+  Redirects are limited to 5 by default (previously reqwest's 10).
+
+- **Node-cache store lifetime** (`adk-graph`, `node-cache`): the in-memory store
+  belongs to the compiled graph and is shared by every run, so an identical later
+  run hits; previously each run started with an empty store.
+
+- **`BigQueryToolset` is read-only by default** (`adk-tool`, feature `bigquery`):
+  `bigquery_execute_sql` refuses DML, DDL, and scripts. Restore the previous
+  behavior with `BigQueryToolset::with_project("my-project").with_read_only(false)`;
+  the tool then reports itself as mutating.
+
+- **`browser_evaluate_js` is opt-in, and navigation is limited to `http`/`https`**
+  (`adk-browser`): `BrowserToolset::new`, `with_pool`, and every `BrowserProfile`
+  leave out `browser_evaluate_js` (`Full` now has 45 tools, `Scraping` 13); the
+  scroll, hover, and alert helpers stay. Opt in with
+  `BrowserToolset::new(browser).with_evaluate_js(true)`; `.with_js(true)` also
+  enables it. Allow other URL schemes with `.with_allowed_schemes(["https", "file"])`.
+
+- **`a2a-protocol-types` upgraded from 0.5 to 0.12.1** (`adk-server`, feature `a2a-v1`): the
+  pin was five minor versions behind. Two changes in the dependency's 0.7.0 release reach this
+  crate's `a2a-v1` surface. `JsonRpcRequest.id` is now the three-state `JsonRpcRequestId`
+  (`Absent`/`Null`/`Value`), so an explicit `"id": null` is treated as the call JSON-RPC 2.0
+  says it is rather than collapsing into a notification; responses are unchanged, because
+  `to_response_id()` maps both `Absent` and `Null` to the `None` the previous `Option<Value>`
+  produced. `TaskPushNotificationConfig::task_id` and `AuthenticationInfo.credentials` are now
+  `Option<String>`, matching the canonical schema that previously rejected valid cross-SDK
+  payloads at parse time; a standalone push-config create with no task id is now refused with
+  a structured invalid-params error, and a push notification whose config carries no
+  credentials now omits the `Authorization` header rather than sending an empty or placeholder
+  bearer token.
+
+- **Anthropic streams must end with `message_stop`** (`adk-model`): a stream that closes
+  without `message_stop`, or whose message has no stop reason, now fails instead of
+  ending quietly. Anthropic-compatible proxies that drop the final event are affected.
+
+- **Azure OpenAI streams on the shared Chat Completions transport** (`adk-model`):
+  `AzureOpenAIClient` now streams when asked instead of always making a non-streaming
+  call, and accepts `with_reasoning_effort`. Error codes stay `model.azure_openai.*`,
+  including the status-specific ones.
+
+- **`GeminiBuilder::with_http_client` applies to AI Studio** (`adk-gemini`): the configured
+  `reqwest::ClientBuilder` was previously ignored on the AI Studio path and now carries its
+  proxy, timeout and default-header settings into every request. The redirect policy is
+  always replaced with `Policy::none()`, and a client build failure returns
+  `Error::PerformRequestNew` instead of panicking.
+
+- **Gemini grounding is no longer appended to the answer** (`adk-model`): the
+  "Searched" and "Sources" text that followed Google Search grounded responses is gone. The
+  queries, sources and supports remain in `provider_metadata` (`webSearchQueries`,
+  `groundingChunks`, `groundingSupports`) for applications that display them.
+
+- **Model-facing MCP tools forward MRTR input to a custom client handler** (`adk-tool`):
+  on `McpToolset::new` with a handler other than `AdkClientHandler`, an MRTR input
+  request from a tool call returned an error. It now reaches the handler, whose default
+  `create_elicitation` declines.
+
+- **Local quality gates run on the pinned toolchain** (`lefthook.yml`, `scripts/cargo-pinned.sh`):
+  the pre-commit and pre-push hooks and the examples gate route through
+  `scripts/cargo-pinned.sh`, which resolves the `rust-toolchain.toml` pin via rustup and refuses
+  to run on any other cargo, so a shadowing toolchain cannot lint with the wrong compiler.
+  `scripts/setup-dev.sh` reports the cargo the gates resolve and installs the ALSA headers
+  `examples/desktop_audio` needs on Linux.
+
+- **Streams end with a complete snapshot** (`adk-model`): Anthropic streaming, and OpenAI
+  Responses streaming with commentary, emit a final response carrying the full message with
+  `provider_metadata.content_complete` set to `true`. Code that consumes `Llm` streams
+  directly replaces the earlier deltas with that response instead of appending it.
+
+- **Token usage counts cache and thought tokens** (`adk-model`): Anthropic
+  `prompt_token_count` now includes cache-read and cache-creation input tokens, and Gemini
+  `candidates_token_count` now includes thought tokens; `provider_usage` carries the
+  provider's raw usage. `adk-eval`'s `CostTracker` prices `prompt_token_count` at the full
+  input rate, so cached Anthropic input is counted at that rate, and Claude through Bedrock
+  still reports `prompt_token_count` without cache tokens, so the two paths differ for the
+  same request.
+
+- **Vertex requests are no longer replayed over REST** (`adk-gemini`, `adk-model`): a gRPC
+  transport failure on a non-streaming Vertex `generateContent` call is returned instead of
+  being re-sent over REST, because the first request may already have reached the model.
+  `adk-model` maps those failures to `ErrorCategory::Unavailable`, so `RetryConfig` decides
+  whether to retry.
+
+### Fixed
+
+- **`acp_full_protocol` permission tests** (`examples/acp_full_protocol`): the
+  example reads `tool_confirmation_decisions` by function-call ID, matching the
+  key the ACP server populates, so approval and denial resume correctly.
+
+- **OpenAI reasoning history** (`adk-model`): `Part::Thinking` is excluded
+  from visible user, assistant, and system message content. By default,
+  subsequent model requests omit Thinking entirely instead of replaying it
+  as visible content; stored history is unchanged. Compatible backends can
+  opt in with `with_reasoning_replay(true)` to send `reasoning_content`, or
+  use `with_reasoning_replay_field(ReasoningReplayField::Reasoning)` to send
+  `reasoning`. Replay emits only the selected field; standard OpenAI and
+  Azure requests omit both fields by default.
+
+- **Open Responses argument identity** (`adk-model`): conflicting item or call
+  identities terminate compatible streams before cached arguments can cross
+  tool calls. Blank completed snapshots restore matching streamed arguments
+  without replacing explicit nonblank values.
+
+- **Overlapping and interrupted tool history** (`adk-runner`): model requests
+  retain actual tool results from overlapping turns and omit unresolved calls
+  from earlier turns without fabricating interruption results. Persisted events
+  remain unchanged.
+
+- **OpenAI Responses stream completion** (`adk-model`): completion events retain
+  model errors and usage metadata. Open Responses mode ignores empty SSE data
+  frames, restores missing arguments by tool identity or output index, and keeps
+  streamed arguments when a terminal snapshot is blank.
+
+- **OpenAI-compatible structured tool arguments** (`adk-model`): Chat
+  Completions streaming now preserves structured JSON `function.arguments`
+  emitted by compatible intermediaries, including repeated and empty snapshot
+  chunks, instead of converting the tool call to empty arguments.
+
+- **OpenAI Responses web search** (`adk-tool`): the stable built-in tool now
+  serializes as `web_search`, matching the OpenAI Responses API. The explicit
+  preview variant remains `web_search_preview_2025_03_11`. URL annotations from
+  response text are preserved as ADK citation metadata. Open Responses mode now
+  also accepts compatible endpoints that omit output-message IDs, statuses, or
+  empty `output_text.annotations`, and reconstructs final function arguments
+  from their streaming events when the completed response omits them.
+
+- **OpenAI-compatible usage metadata** (`adk-model`): Chat Completions
+  streaming and non-streaming responses now use one normalization path,
+  preserve the complete provider-native `usage` object in `provider_usage`,
+  and project reported cache-write tokens alongside cache reads.
+
+- **OpenAI tool request stability** (`adk-model`): Chat Completions and
+  Responses requests now serialize function tools in deterministic name order,
+  preserving identical cacheable prefixes across repeated executions.
+
+- **DeepSeek streaming emitted every response twice** (`adk-model`): the
+  terminal SSE chunk replayed the accumulated text and reasoning buffers on top
+  of the deltas it had already yielded as partial chunks. Consumers accumulate
+  the parts of every chunk — `LlmAgent` does, to build conversation history — so
+  they saw the whole response twice. With `output_schema` set that is
+  `{...}{...}`, which fails JSON parsing ("Response is not valid JSON: trailing
+  characters") and burns every schema-validation retry, so structured output was
+  unusable on DeepSeek. The terminal chunk now contributes only its own `delta`,
+  plus reasoning that was buffered but never streamed (thinking disabled), and a
+  `delta.content` arriving in the same chunk as `finish_reason` is no longer
+  dropped.
+
+- **Rust sandbox and container stdin delivery** (`adk-code`):
+  `RustSandboxExecutor` and `ContainerCommandExecutor` write stdin concurrently
+  with draining stdout and stderr, inside the execution timeout. A program that
+  stopped reading stdin, or filled an output pipe first, previously blocked the
+  caller indefinitely. Captured output is capped while it is read.
+
+- **A2A task store hygiene** (`adk-server`): finished task records are evicted by
+  count and age instead of accumulating for the life of the process. A
+  `message/send` that reuses the `taskId` of a running task, or of another
+  caller's task, is rejected with JSON-RPC error `-32602` instead of replacing the
+  running task's registration and its abort handle. A task is registered before
+  it is spawned, so a fast failure cannot leave a permanent `working` entry. A
+  failed task's stored status message carries the same sanitized text as the
+  streaming error.
+
+- **Cron pause, queue depth, and execution count** (`adk-server`, feature
+  `background`): resuming a paused job skips the occurrences missed while paused
+  instead of claiming them one per scheduler tick. The `Queue` policy holds at
+  most `DEFAULT_MAX_QUEUE_DEPTH` (100) runs per job, configurable with
+  `CronState::with_max_queue_depth`, and skips an occurrence with a warning when
+  full. `executionCount` reports the runs the scheduler started.
+
+- **`A2aServerBuilder::bind_addr` rustdoc** (`adk-server`): states the actual
+  default, `127.0.0.1:8080`.
+
+- **AP2 amount parsing** (`adk-payments`, `ap2`): the sign comes from the decimal
+  string, so `-0.50` is `-50` minor units rather than `+50`, and exponent
+  notation parses exactly. Every amount in a cart shares one scale, so
+  mixed-precision items no longer produce a spurious `ap2_unallocated_delta`.
+  Cart sums use checked arithmetic; overflow, more than 18 fraction digits, and
+  mixed currencies return `Ap2Error::InvalidAmount` instead of panicking or
+  wrapping.
+
+- **Scale-aware amount guardrail** (`adk-payments`): `AmountThresholdGuardrail`
+  compares totals with thresholds by value across scales and denies when the two
+  cannot be aligned.
+
+- **Seatbelt domain rules fail closed** (`adk-sandbox`, `sandbox-macos`):
+  Seatbelt accepts only `*` or `localhost` as a network host, so `allow_domain`
+  rules produced a profile `sandbox-exec` refused to parse and nothing ran. They
+  are now ignored with a `tracing::warn` and all network access is blocked, as
+  on Linux. The `NetworkRule` documentation no longer claims macOS enforces them.
+
+- **`ProcessBackend` stdin cannot hang an execution** (`adk-sandbox`): stdin is
+  written concurrently with the output reads and inside the timeout. Writing it
+  first deadlocked any child that filled its output pipe before reading stdin, and
+  a child that never read stdin blocked the backend past the timeout.
+
+- **`ProcessBackend` background jobs end with the execution** (`adk-sandbox`):
+  the process group is killed when the main process exits, not only on timeout,
+  so `nohup … &` descendants no longer outlive the call or hold its pipes open.
+
+- **`ProcessBackend` keeps enforcer configuration** (`adk-sandbox`): the
+  wrapped program is resolved before `configure_command` runs. Rebuilding the
+  command afterwards discarded what the enforcer attached to it.
+
+- **Sandboxed `ProcessBackend` executions run in their own scratch directory**
+  (`adk-sandbox`): under an enforcer, the per-execution directory holding the
+  source file and compiler output is the working directory and is granted
+  read-write, so Python, JavaScript, and Rust run under deny-default profiles.
+
+- **`LocalUnixSession` large output** (`adk-sandbox`, `workspace`): output over
+  64 KiB deadlocked the command, which was then reported as `timed_out`.
+
+- **`SandboxTool` clamps `timeout_secs`** (`adk-sandbox`): values outside the
+  schema's 1–300 second range are clamped instead of passed to the backend, and
+  negative or fractional values no longer fall back to the 30-second default.
+
+- **`WasmBackend` enforces memory without a request limit** (`adk-sandbox`,
+  `wasm`): `memory_limit_mb: None` applies `WasmBackend::DEFAULT_MEMORY_LIMIT_MB`
+  (256 MiB) and modules are held to one linear memory, matching the
+  `memory: true` capability. Previously no limit applied.
+
+- **`DockerSession` reads binary files intact and kills timed-out commands**
+  (`adk-sandbox`, `workspace-docker`): `read_file` returns raw bytes instead of
+  lossily decoded UTF-8, and a command that exceeds its timeout is killed inside
+  the container with its descendants instead of running on.
+
+- **Neo4j memory entry ids** (`adk-memory`): `MemoryEntry.id` carries a global
+  uniqueness constraint but was `{session_id}_{i}` or `entry_{millis}`, so a second
+  `add_session` for a session id failed, as did the same session id under another
+  tenant, and two `add_entry_to_project` calls in one millisecond collided. Ids are
+  now scoped by app, user, project and session, direct entries use a UUID, and
+  `add_session` merges on the id, so re-ingesting a session updates it.
+
+- **Neo4j vector search returned nothing for most tenants** (`adk-memory`): search
+  took the global top `limit` from the vector index, then filtered by app, user
+  and project. It now requests `limit × 10` candidates, capped at
+  `DEFAULT_VECTOR_CANDIDATE_CAP` (1000) and configurable with
+  `Neo4jMemoryService::with_vector_candidate_cap`, filters them, then applies
+  `limit`. A tenant whose entries all rank below the cap still gets no vector
+  results.
+
+- **SQLite memory search failed on ordinary text** (`adk-memory`): `search`,
+  `delete_entries` and `delete_entries_in_project` bound the raw query to FTS5
+  `MATCH`, so `what's my name?` raised an FTS5 syntax error. Each word is now a
+  quoted phrase, bare `AND`/`OR`/`NOT`/`NEAR` are dropped, and an entry matches
+  when it contains every word, as with `plainto_tsquery` in the Postgres backend.
+
+- **Chunkers looped forever on multibyte text** (`adk-rag`): when
+  `chunk_size - chunk_overlap` was narrower than a character, `FixedSizeChunker`,
+  `RecursiveChunker` and `MarkdownChunker` stopped advancing and grew memory until
+  the process ran out. Every chunk now advances at least one character. The new
+  `try_new` constructors reject `chunk_size == 0` and `chunk_overlap >= chunk_size`
+  with `RagError::ConfigError`; `new` normalises such pairs with a warning instead
+  of stopping after the first chunk. Docs now state that sizes are bytes of UTF-8.
+
+- **LanceDB `upsert` appended duplicates** (`adk-rag`): `upsert` called
+  `table.add`, so re-ingesting a document duplicated its chunks. It now
+  merge-inserts on `id`, keeping the last duplicate in a batch, and an embedding
+  whose length differs from the collection's dimensions returns
+  `RagError::VectorStoreError` instead of panicking.
+
+- **RAG ingest dropped chunks without embeddings** (`adk-rag`):
+  `RagPipeline::ingest` zipped chunks with embeddings, so a provider returning
+  fewer vectors than chunks silently stored fewer chunks. A count mismatch now
+  fails with `RagError::PipelineError`.
+
+- **Opt-in total stream bound** (`adk-anthropic`): `Anthropic::with_stream_timeout`
+  bounds the whole duration of a streaming request. Streams have no total bound
+  by default.
+
+- **Shared HTTP error helpers** (`adk-model`): `retry::category_for_status_code`,
+  `retry::parse_retry_after`, and `retry::with_retry_after` give every provider
+  client the same status mapping and `Retry-After` handling.
+
+- **Long Anthropic streams** (`adk-anthropic`): streaming requests run on an HTTP
+  client without a total request timeout, so a generation longer than 60 seconds
+  is no longer cut off mid-body. `with_timeout` still bounds non-streaming
+  requests and the wait for streaming response headers.
+
+- **Anthropic stream inactivity timeout** (`adk-anthropic`): the 30-second timeout
+  now measures only the wait on the server, so a stalled server fails the stream
+  and a consumer that pauses between polls does not. A timeout, a transport
+  error, or a buffer overflow ends the stream after one `Err` instead of
+  repeating the error.
+
+- **Mid-stream Anthropic `error` events** (`adk-anthropic`): `AccumulatingStream`
+  yields an SSE `error` event (for example `overloaded_error`) as `Err` and sends
+  the error, not the partial message, through its channel.
+  `From<ApiError> for Error` maps `overloaded_error` and `rate_limit_error` to
+  the retryable `ServiceUnavailable` and `RateLimit` variants.
+
+- **Unknown Anthropic SSE event types** (`adk-anthropic`): an unrecognized event
+  type is logged at `debug` and surfaced as `MessageStreamEvent::Ping` instead
+  of failing the stream.
+
+- **Anthropic request size validation** (`adk-anthropic`):
+  `MessageCreateParams::validate` measures text bytes in place instead of
+  `Debug`-formatting the payload. Base64 images are held to the API's 5 MB
+  limit and PDFs to 32 MB, with 32 MB of text plus base64 media per request, so
+  an 800 KB JPEG or a typical PDF is no longer rejected by the 1 MB text cap.
+
+- **Anthropic server tool input** (`adk-anthropic`): `AccumulatingStream` applies
+  `input_json_delta` fragments to `server_tool_use` blocks, which previously kept
+  the empty `{}` input from `content_block_start`.
+
+- **Text tool-call false positives** (`adk-model`): text-encoded tool calls are
+  parsed only when the request declares the named tool, so a ` ```json ` example
+  with a `"name"` key stays text. The DeepSeek fence format requires an
+  `arguments` or `parameters` object instead of defaulting to `{}`, and text after
+  the closing fence is kept. `parse_declared_tool_calls` and
+  `ToolCallBuffer::for_declared_tools` expose the filtered parse.
+
+- **Transient upstream errors are retried** (`adk-model`): HTTP 500, 502, 503, and
+  504 from OpenAI-compatible, Azure OpenAI, Azure AI, Anthropic, DeepSeek, and
+  Groq map to `ErrorCategory::Unavailable` with the upstream status, so
+  `execute_with_retry` retries them. A `Retry-After` header becomes the error's
+  retry hint for every one of these providers.
+
+- **`Retry-After` capped at `max_delay`** (`adk-model`): a server-provided retry
+  delay no longer exceeds `RetryConfig::max_delay`, so `Retry-After: 3600` cannot
+  stall an agent run for an hour.
+
+- **Stable tool order for cached providers** (`adk-model`): Anthropic and Bedrock
+  send tool definitions sorted by name, so the prompt-cache prefix matches across
+  requests.
+
+- **Malformed streamed tool arguments** (`adk-model`): Anthropic, Bedrock,
+  DeepSeek, Groq, and Azure AI fail with `model.<provider>.invalid_tool_arguments`
+  instead of calling the tool with `{}` or `null`. A zero-argument Bedrock call
+  receives `{}`.
+
+- **Mid-stream Anthropic errors in `AnthropicClient`** (`adk-model`): an SSE
+  `error` event fails the stream with the category of the equivalent HTTP error
+  (`overloaded_error` → `Unavailable`, `rate_limit_error` → `RateLimited`)
+  instead of being logged at `debug`.
+
+- **Firestore app-state path** (`adk-session`, feature `firestore`): app state
+  moves to `{root}/{app_name}/app_state/current`. The previous
+  `{root}/{app_name}/app_state` path is a collection path, so every `create` and
+  `append_event` failed. `app_state_path` and `user_state_path` now return the
+  document paths the backend writes.
+
+- **Undecodable stored events are logged** (`adk-session`): the SQLite,
+  PostgreSQL, Redis, and Firestore backends emit a `warn!` with the session and
+  event ID for each stored event that fails to deserialize, and still return the
+  remaining events.
+
+- **Agent event fidelity** (`adk-agent`, `adk-runner`, `adk-cli`, `adk-graph`): preserve
+  citations and complete terminal content, continue provider-native paused turns, and emit
+  individual tool results while sibling approvals are pending. An approval failure ends the
+  turn with an error once running tools finish, approvals are requested one at a time, and
+  tool-start events no longer end responses. Built-in streaming consumers render complete
+  snapshots once, and later agents in the same invocation see each streamed response once.
+
+- **Direct MCP tool calls keep the task lifecycle** (`adk-tool`):
+  `McpToolset::call_tool_value` polls server-materialized tasks, answers MRTR and in-task
+  input through the connection's handler, and restores resource subscriptions after a
+  reconnect, as model-facing calls do. A task returned while task support is disabled is
+  cancelled, and the error names `McpToolset::with_task_support(McpTaskConfig::enabled())`.
+  Each input round is capped at 64 requests, a pending elicitation no longer holds the
+  connection lock, and an error result without a text block reports its structured
+  content.
+
+- **MCP tool schemas are bounded at discovery** (`adk-tool`): `McpToolset` measures
+  each tool's input and output schema against `McpSchemaLimits` (256 KiB and 10 000
+  JSON values by default) before copying or logging it. A tool over a limit is skipped
+  with a warning naming the toolset and the tool, and discovery continues with the
+  remaining tools. Accepted tools log `schema.bytes` and `schema.nodes` at `debug`
+  instead of the full schema. `McpToolset::with_schema_limits` and
+  `McpServerManager::with_schema_limits` configure the limits, and managed toolsets
+  are named after their server ID.
+
+- **Native provider fidelity** (`adk-model`, `adk-anthropic`, `adk-gemini`): retain
+  streamed Unicode, tool images, PDF inputs, native search/reasoning blocks and usage;
+  preserve commentary for application rendering and honor explicit request/retry
+  configuration.
+
+- **Windows: the Rust sandbox links again, Docker policy accepts rooted mounts, and the
+  devtools `glob` tool finds files** (`adk-code`, `adk-devtools`): `rustc` is pinned to
+  `rust-lld` as in `adk-sandbox`, so Git's GNU `link.exe` on PATH no longer intercepts the
+  link step; bind-mount containment checks for a rooted rather than an absolute path, so
+  Linux-container mounts such as `/srv/data` validate on a Windows host; and `glob` walks
+  the workspace instead of expanding a canonical root whose `\\?\` prefix the glob crate
+  read as a wildcard.
+
+## [2.2.0] - 2026-09-01
+
+### Added
+
+- **Progressive skill disclosure** (`adk-skill`, `skills-progressive-disclosure`):
+  a Google ADK-style `SkillToolset` exposing `list_skills`, `load_skill` and
+  `load_skill_resource`, so an agent discovers a skill index first and pulls full
+  skill bodies and resources only when it needs them, rather than carrying every
+  skill in the prompt. `ResourceAccessPolicy` bounds which resources a loaded
+  skill may read, and `ReadonlyContext::state()` is a new defaulted trait method
+  letting dynamic toolsets read session state without mutable access —
+  third-party context implementations stay source-compatible.
+
+- **Wave 4 platform services (round two)** — the Govern-pillar invocation
+  and consumption features, closing out the Agent Engine plan:
+  - `vertex-remote-engine` (adk-server): `RemoteReasoningEngineAgent` —
+    invoke other deployed Agent Engine agents as sub-agents over
+    `reasoningEngines:streamQuery` (`?alt=sse`, canonical camelCase
+    envelope), with `stream_query` fallback, mid-stream error events, and
+    URN resolution via the Agent Registry. Wire compatibility with the
+    server-side dispatcher is pinned by the shared fixture round-trip.
+  - Registry registration CLI (adk-cli `vertex-agent-registry`):
+    `adk-rust registry register-agent|register-mcp|register-endpoint|search`
+    with idempotent create-or-patch upsert
+    (`AgentRegistryClient::register_or_update_service`). Agent Engine
+    deployments auto-register and are deliberately not re-registered.
+  - Remote skills (adk-skill `vertex-skill-registry` + adk-cli):
+    `load_skill_index_from_registry` (registry-sourced skills are
+    byte-equivalent to disk-sourced ones through the unchanged
+    `SkillDocument` path), `SkillSearchTool`, and
+    `adk-rust skills search|pull`.
+  - `examples/agent_orchestrator`: discover a registered agent with
+    `AgentSearchTool`, then delegate to it via
+    `RemoteReasoningEngineAgent`.
+- **Wave 4 platform services (round one)** — five opt-in Gemini Enterprise
+  Agent Platform integrations, all composable with any preset and appended
+  to `gemini-agent-platform`:
+  - `vertex-eval` (adk-eval): Gen AI Evaluation Service bridge —
+    `VertexEvalClient` for `evaluateInstances` (pointwise + trajectory
+    metrics, autorater config) and `VertexEvalJudge` mirroring `LlmJudge`'s
+    surface with service-side scoring.
+  - `vertex-rag` (adk-rag): Vertex AI RAG Engine retrieval —
+    `VertexRagEngineClient` (corpus discovery, `retrieveContexts` via the
+    current `ragRetrievalConfig` wire path) and `VertexAiRagRetrievalTool`
+    (read-only, concurrency-safe). Ships `examples/vertex_rag`.
+  - `agent-retrieval` (adk-rag): Agent Retrieval (formerly Vector Search
+    2.0) as a full `VectorStore` backend — BYOE dense vectors, chunk text
+    and metadata stored in the Data Object, atomic batched writes,
+    dot-product search, and a `hybrid_search` RRF extra. Passes the shared
+    `VectorStore` contract/property suite.
+  - `vertex-agent-registry` (adk-tool): Agent Registry client
+    (registration for custom deployments, URN-aware get, search across
+    agents and MCP servers) and `AgentSearchTool` for agent-driven
+    discovery.
+  - `vertex-skill-registry` (adk-skill): read-only Skill Registry client
+    (get/list/semantic search/revisions, sha256-verified inline zip
+    payloads) with defense-in-depth archive extraction limits.
+- **Vertex RAG grounding declaration** (adk-gemini `vertex`, adk-model
+  `gemini-vertex`, no new flag): `Tool::Retrieval` with `VertexRagStore`
+  (current `ragRetrievalConfig` path; deprecated fields not exposed),
+  `GeminiModel::with_vertex_rag_store(...)`, Studio-backend requests fail
+  with a structured error, and grounding responses surface
+  `retrievedContext` including `ragChunk` provenance.
+
+### Fixed
+
+- **Runtime SSE errors** (`adk-server`): ADK UI and legacy wrapped transports
+  emit structured runtime error events instead of ending the stream silently;
+  protocol-native AG-UI continues to emit `RUN_ERROR`.
+- **Bounded partial streaming events** (`adk-agent`): incremental LLM events
+  no longer repeat the complete request and response payload on every chunk.
+  Terminal events retain the existing debug payload, while long histories now
+  incur constant payload overhead instead of growing with the chunk count.
+- **Text tool-call buffering** (`adk-model`): ordinary text that begins like a
+  split tool-call prefix is released as soon as later chunks disambiguate it, so
+  Markdown links and similar content do not remain buffered until stream end.
+- **OpenAI-compatible streaming usage** (`adk-model`): usage-only terminal
+  chunks with empty `choices` attach token counts to the final response.
+- **Span parenting across suspension points** (`adk-agent`, `adk-runner`): one
+  logical invocation was exported as several disconnected traces. `LlmAgent`
+  held a `call_llm` span guard across the `.await`/`yield` points of its
+  `async_stream` generator — an entered guard is bound to the thread, not the
+  task, so it was neither exited on suspension nor re-entered on resumption, and
+  everything after the first suspension detached from `call_llm`. `Runner`
+  instrumented only the future that constructs the agent stream, not the
+  draining of it, so every span the agent produced was created outside
+  `agent.execute`. Both now instrument the individual futures, which is correct
+  across suspension by construction. Span names, attributes and durations are
+  unchanged — only parentage.
+- **`adk-realtime` with `livekit` compiles again**: livekit 0.8.1 requires
+  `livekit-data-stream = "0.1"`, and 0.1.2 changed `incoming::Manager::new`'s
+  arity and added a `topic` field, which broke livekit's own source. The
+  workspace now pins `=0.1.1`.
+- **`adk-audio` ONNX features compile again**: `ort` 2.0.0-rc.13 moved the CUDA
+  and CoreML execution providers out of `ort::execution_providers`, so the
+  floating pre-release requirement broke every ONNX model feature. Pinned to
+  `=2.0.0-rc.11`.
+
+## [2.1.0] - 2026-08-25
+
+### Added
+
+- **ADK-Rust runtime UI** (`adk-server`): replaces the opaque copied Angular
+  bundle with an owned React/TypeScript frontend using the Studio Next design
+  language. The responsive system/light/dark interface streams conversations,
+  tool activity, failures, and handoffs, and inspects event timelines, session
+  and shared state, artifacts, prior sessions, runtime capabilities, and UI
+  protocols. `Agent::topology()` is an additive provider-neutral metadata hook;
+  `CompiledTeam` exposes its exact members and delegation-versus-handoff edges,
+  and `/api/ui/agents/{name}` serves that data without coupling the server to
+  `TeamSpec`. The embedded build uses local assets only and ships with CSP,
+  no-sniff, referrer, and immutable-cache headers. Strict TypeScript and
+  provider-free SSE parser tests accompany the existing Rust server tests.
+  Model responses render safe GitHub-flavored Markdown, and live team runs
+  animate the active member and incoming edge using Studio Next's directional
+  flow pattern while honoring reduced-motion preferences. Transcript messages
+  keep a readable minimum height instead of collapsing around long responses.
+  `GraphAgent` also exports its entry and declared control-flow edges through
+  the same portable topology contract, allowing the UI to render workflow nodes
+  by execution level. `examples/runtime_ui_showcase` documents and illustrates
+  tool-calling, graph, and team runs through the embedded interface. Realtime
+  agents now declare their interaction mode through the shared `Agent` contract;
+  the interface coalesces their transcript stream and exposes completed PCM16
+  output as playable WAV audio. Dedicated **Telemetry** and **Protocols** views
+  make spans, configured artifact/memory services, A2A discovery, and UI/MCP
+  Apps support explicit. The ADK Runtime brand links to adk-rust.com.
+  `examples/advanced_agents` runs OpenAI chat, an ambient schedule, OpenAI
+  Realtime voice, A2A, and MCP `2026-07-28`/SEP-2663 tasks through one server.
+
+- **Anthropic request customization and server-side refusal fallback**
+  (`adk-anthropic`): additive client methods now support caller-selected beta
+  headers, exact per-request header replacement, bearer-only authentication,
+  and API-version overrides without adding fields to the exhaustive
+  `MessageCreateParams` struct. `ServerFallbackRequest` models both
+  `"default"` routing and one-to-three explicit fallback models, validates
+  duplicates and primary-model loops, and has fallback-aware response and SSE
+  types so handoff markers and per-attempt usage are not discarded. Fallback
+  is documented and tested as a safety-refusal feature, not a retry mechanism
+  for rate limits, overloads, or server errors. New live examples read
+  credentials from the environment; provider-free wire tests cover headers,
+  bodies, responses, and streams.
+- **Vertex AI Agent Engine sandbox client** (`adk-code`, feature
+  `vertex-sandbox`; same-named umbrella feature, part of
+  `gemini-agent-platform`): `VertexSandboxClient` against the v1beta1
+  `sandboxEnvironments` surface — create and delete wait their long-running
+  operations, get and list (paginated) are plain reads, and `:execute` is
+  synchronous. `execute_code` implements the code-execution chunk
+  conventions shared with adk-python and the Vertex AI SDK (JSON code
+  chunk, `file_name`-attributed file chunks, `msg_out`/`msg_err` console
+  output) with the 100 MB per-request file limit enforced before sending.
+  `SandboxCodeExecutor` mirrors adk-python's
+  `AgentEngineSandboxCodeExecutor`: per-session lazy sandbox creation
+  (display name `default_sandbox`, TTL one year) with recreate when the
+  sandbox is missing or not running. `VertexSandboxTool` exposes execution
+  to LLM agents keyed by the calling session. Built on the shared `adk-gcp`
+  plumbing. New example: `examples/vertex_sandbox`.
+
+- **`adk-gcp` crate**: shared Google Cloud REST plumbing for Vertex AI
+  backends — `GcpHttpClient` (ADC with cached auth headers per
+  `CacheableResource` semantics, redirect-disabled bounded transport,
+  HTTPS-or-loopback endpoint validation), `LroPoller` (long-running-operation
+  polling with capped backoff, operation identity pinning, and
+  project/location scope validation), `VertexResourceName`
+  (`projects/*/locations/*/reasoningEngines/*` parse/format), and
+  `GcpErrorContext` (consumer-branded errors across the `AdkError`
+  boundary). Purely additive: consolidates the pattern duplicated across
+  `adk-session`, `adk-memory`, `adk-tool`, `adk-deploy`, and `adk-artifact`;
+  call-site migrations follow in later PRs.
+
+- **CLI deploy subcommand** (`adk-cli`, feature `gcp-deploy`):
+  `adk-rust deploy agent-engine --image-uri <uri> --project <p> --location <l>
+  [--service-account <sa>] [--kms-key <key>] [--display-name <n>]` deploys a
+  pushed container image as a Gemini Enterprise Agent Platform engine via the
+  adk-deploy `gcp` client — declares the full class-method contract, waits
+  for the create operation, and prints the engine resource name. The display
+  name defaults to the image name. Install with
+  `cargo install adk-cli --features gcp-deploy`.
+
+- **Agent Engine deployment client** (`adk-deploy`, feature `gcp`; umbrella
+  feature `gcp-deploy` — host-side tooling, deliberately not part of
+  `gemini-agent-platform`): `GcpDeployClient` with exactly four operations
+  against the v1beta1 `reasoningEngines` surface — `create_reasoning_engine`,
+  `poll_operation` (plus a backoff-polling `wait_for_operation`),
+  `get_reasoning_engine`, `delete_reasoning_engine`. Typed camelCase wire
+  DTOs for the BYOC create body (`containerSpec.imageUri`, `deploymentSpec`
+  env/secret-env/scaling/resource limits/PSC-I, `classMethods`,
+  `agentFramework`, `serviceAccount`, CMEK `encryptionSpec`);
+  `CreateReasoningEngineRequest::byoc` declares the full WP1 class-method
+  contract by default. Image build/push stays with Cloud Build
+  (`gcloud_build_submit_command` renders the documented command).
+  `reasoningEngines:asyncQuery` is deliberately not declared (cannot be
+  added post-create; adk-python parity excludes it).
+
+- **cargo-adk `agent-engine` template** (`cargo adk new my-agent --template
+  agent-engine`): scaffolds a Gemini Enterprise Agent Engine BYOC container — a
+  binary whose `main` is `serve_agent_engine(agent, AgentEngineOptions::new())`
+  (features `["minimal", "agent-engine"]`), the docker addon's `Dockerfile` and
+  `.dockerignore`, and `deploy/terraform/` with a
+  `google_vertex_ai_reasoning_engine` BYOC resource (`spec.container_spec.image_uri`,
+  the full 14-method `class_methods` contract in `jsonencode`,
+  `agent_framework = "google-adk"`, optional `service_account`), plus
+  `variables.tf`/`outputs.tf` mirroring the containerized-agent codelab. The
+  generated README covers `gcloud builds submit`, `terraform apply`, the
+  platform-set environment variables, the `/api` passthrough for querying the
+  deployed engine, and the optional A2A-routes setup via
+  `ServerBuilder::with_agent_engine(true)` + `.with_a2a(...)`. Template and
+  addon file fragments now support `{name}` substitution and path override
+  (a template file replaces a base file with the same path).
+- **Tool guardrails** (`adk-guardrail`; `adk-agent` feature `guardrails`):
+  `Guardrail` validates `Content` and never sees a tool call, and
+  `ToolConfirmationPolicy` decides per tool *name*, so neither could express
+  "this tool may run, but not with these arguments" — argument-level policy had
+  nowhere to live inside the framework. `ToolGuardrail::validate_call` receives
+  the tool name and arguments and returns `Allow`, `Deny`, or `ReviseArgs`;
+  `ToolGuardrailSet::evaluate` runs guardrails in order so revisions compose, and
+  stops at the first denial. `LlmAgentBuilder::tool_guardrails` wires a set in.
+  Screening happens before the concurrency permit is acquired and before
+  confirmation is resolved, so a denied call neither queues behind other work nor
+  prompts the user, and the denial is reported as the tool's result so the model
+  can correct the call instead of the run stalling. Two implementations ship:
+  `DeniedArgumentPattern` (regex over the serialized arguments, optionally scoped
+  to named tools) and `PathAllowList` (confines path-valued arguments to allowed
+  roots, comparing by path component rather than string prefix so
+  `/etc/passwd-backup` is not admitted by a root of `/etc/passwd`, and refusing
+  any path containing a `..` component. It also resolves every existing candidate
+  component to reject symlink escapes; hostile local races still require secure-open
+  primitives in the filesystem tool itself).
+
+- **Skill write path** (`adk-skill`): the crate was read-only — every `fs::write`
+  lived behind `#[cfg(test)]` — so an agent could not persist a skill it derived
+  at runtime and an operator could not generate one programmatically.
+  `SkillWriter` writes into the `.skills` directory `load_skill_index` already
+  discovers, through a unique temporary file that is synchronized and atomically
+  replaces the destination on Unix and Windows, so a crash mid-write cannot leave
+  a half-written skill that breaks the whole index load. `SkillDraft` is a builder
+  for the document; `SkillDraft::to_markdown`
+  renders frontmatter plus body and omits unset fields, and round-trips through
+  `parse_skill_markdown`. `validate_skill_name` enforces the specification's
+  `[a-z0-9-]` rule (1–64 characters, no leading or trailing hyphen) and is also
+  the path-safety boundary, since a name becomes a filename — `../escape` and
+  `nested/name` are rejected before any file is touched. `SkillWriter::remove`
+  and `exists` complete the lifecycle. `SkillInjector::reloaded` rescans the root
+  and returns a refreshed injector, and `SkillInjector::root` reports what it
+  rescans; `reloaded` returns a new value rather than mutating because
+  `build_plugin` captures the index by handle, so a plugin already handed to a
+  runner must be rebuilt to see new skills.
+
+- **`AgentInvoker` and the ambient runner bridge** (`adk-core`, `adk-runner`,
+  `adk-agent` feature `ambient`): `AmbientAgent::start` refuses to run without a
+  trigger handler, and writing one meant building `Content`, inventing a session
+  id, and calling `Runner::run` by hand. `Runner::run` also resolves an *existing*
+  session and yields `session.not_found` through the stream when there is none,
+  which an external trigger has no opportunity to pre-register — so the obvious
+  wiring failed at the first tick, inside the stream rather than at the call site.
+  `adk-core` now defines `AgentInvoker`, a single `invoke(user_id, session_id,
+  content)` operation whose implementations create a missing session;
+  `adk-runner` implements it for `Runner`; and
+  `AmbientAgent::with_invoker(invoker, RunnerTriggerConfig)` supplies the handler.
+  `TriggerSessionPolicy` chooses between `PerTrigger` (default — a fresh session
+  per event, so a frequent schedule cannot grow one session's history and per-run
+  cost without bound) and `Shared(id)`; shared invocations are serialized through
+  the returned stream. The wrapper adopts the runner's executable root for accurate
+  diagnostics. `RunnerTriggerConfig::with_prompt` shapes the event into prompt text.
+  The OpenAI-backed `ambient_cron_agent` example failed at `start()`
+  and documented that it did not invoke the agent; it now runs all seven lifecycle
+  steps and prints what each run produced.
+
+- **Cron missed-tick handling** (`adk-agent`, feature `ambient`):
+  `CronTrigger::subscribe` computes the next tick from the moment it is called, so
+  a trigger that restarted after downtime — or ran on a host that suspended —
+  resumed at the next future tick and discarded every tick that came due in
+  between, with no record that anything was skipped. `MissedTickPolicy` now
+  decides that span's fate: `Skip` (default, prior behaviour), `CoalesceOne` (one
+  event for the whole gap), or `All` (one event per elapsed tick, oldest first,
+  bounded by `CronTrigger::with_max_catch_up`, default 64). Detecting a gap across
+  a process restart needs a `TickWatermark`; `FileTickWatermark` stores one
+  RFC 3339 cursor using portable atomic replacement. A capped replay persists its
+  skipped-through cursor, and a persistence failure stops the stream before
+  emission. Replayed events carry
+  `scheduled_for`, `catch_up`, and — for `CoalesceOne` — `missed_count` in their
+  payload. The watermark advances on emission rather than on consumer completion,
+  making delivery at-most-once so a consumer that stops polling cannot replay the
+  same gap on every restart.
+
+- **cargo-adk `docker` addon** (`cargo adk new my-agent --addon docker`): emits a
+  multi-stage `Dockerfile` (`rust:1.95-slim` build stage kept in lockstep with
+  `rust-toolchain.toml`, `gcr.io/distroless/cc-debian12` runtime, `ENV PORT=8080`,
+  `ENTRYPOINT ["/app/agent"]`), a fully static `Dockerfile.static`
+  (`x86_64-unknown-linux-musl` + `FROM scratch`, CA bundle copied in for
+  `rustls-tls-native-roots`, with a compatibility guard naming the feature sets
+  that cannot link statically), and a `.dockerignore`. Fixes the README drift
+  that advertised a `docker` addon the registry did not provide.
+- **Example Store client** (`adk-tool`, feature `example-store`; umbrella
+  feature `example-store`, included in `gemini-agent-platform`):
+  `ExampleStoreClient` is an ADC-authenticated REST client for the Vertex AI
+  Example Store v1beta1 data plane (Preview, `us-central1` only) —
+  `upsert_examples`, `search_examples`, and `fetch_examples` against a
+  pre-provisioned `projects/*/locations/*/exampleStores/*` resource (no store
+  create/delete). `ExampleStoreProvider` packages top-k retrieval as a
+  `BeforeModelCallback` that injects the most similar stored examples into the
+  request preamble as dynamic few-shot instructions. New standalone example:
+  `examples/example_store/`.
+- **Vertex AI Memory Bank backend** (`adk-memory`, feature `vertex-memory`;
+  umbrella feature `vertex-memory`, included in `gemini-agent-platform`):
+  `VertexAiMemoryBankService` implements `MemoryService` over the platform's
+  `memories:generate` (LRO-polled) and `memories:retrieve` (similarity
+  search) endpoints with the same `{app_name, user_id}` scope adk-python
+  writes, so both runtimes share one Memory Bank. `VertexAiMemoryConfig`
+  mirrors the session config (`from_env()` reads the platform's container
+  variables). `add_events_to_memory` persists a subset of events;
+  `delete_user` enumerates and deletes a scope's memories. This completes the
+  Agent Engine dispatch surface's `async_add_session_to_memory` /
+  `async_search_memory` class methods, which returned `Unsupported` until
+  now.
+
+- **Agent Engine turnkey entrypoint** (`adk-server`, feature `agent-engine`;
+  umbrella feature `agent-engine`, included in `gemini-agent-platform`):
+  `serve_agent_engine(agent, options)` is the whole `main` of a deployable
+  Gemini Enterprise Agent Platform engine — binds `0.0.0.0:$PORT` (fallback
+  `8080`), installs the crypto provider, and serves the dispatch endpoints
+  plus `GET /health`. `AgentEngineOptions` configures session, memory, and
+  artifact services, app name, and port; `build_agent_engine_app` returns the
+  same app as a plain `Router`. `ServerBuilder::with_agent_engine(true)`
+  mounts the dispatch surface alongside the built-in REST/UI/A2A routes.
+  New docs page: `docs/official_docs/deployment/agent-engine.md`.
+
+- **Agent Engine dispatch surface** (`adk-server`, feature `agent-engine`): the
+  container-side runtime contract that makes an adk-rust agent drivable by the
+  Gemini Enterprise Agent Platform (`reasoningEngines.query` /
+  `streamQuery`, console Playground, platform SDKs). `agent_engine_router`
+  mounts `POST /api/reasoning_engine` (unary, `{"output": ...}`) and
+  `POST /api/stream_reasoning_engine` (newline-delimited JSON events), dispatching
+  the exact `AdkApp` operation set — session CRUD in sync/async pairs,
+  `stream_query` / `async_stream_query`, `streaming_agent_run_with_events`,
+  `async_add_session_to_memory` / `async_search_memory` (Unsupported until a
+  memory service is configured), and `register_operations`. A shared wire
+  fixture (`adk-server/tests/fixtures/agent_engine_wire.json`) pins the
+  envelope and streamed-event framing for the future remote-engine client.
+
+- **adk-rag: shared `VectorStore` contract test suite.** A new
+  `adk-rag/tests/common/vector_store_contract.rs` holds the behavioral contract
+  every vector store backend must satisfy — idempotent collection creation,
+  upsert-then-search round trips, descending-score ordering bounded by `top_k`,
+  deletion by ID, empty-input no-ops, metadata preservation, collection
+  isolation, and teardown — plus proptest search invariants. The suite runs
+  against InMemory, SurrealDB (embedded), and LanceDB (embedded, behind the
+  `lancedb` feature). LanceDB scopes out the upsert-replaces-by-ID assertion:
+  its `upsert` appends instead of replacing, a divergence the suite documents
+  rather than fixes.
+- **GCS artifact backend** (`adk-artifact`, feature `gcs`): `GcsArtifactService`
+  stores artifacts in a Google Cloud Storage bucket over the GCS JSON API with
+  ADC authentication, keeping byte-for-byte blob-name parity with adk-python's
+  `GcsArtifactService` (session-scoped and `user:`-namespaced layouts, `adkDisplayName`/
+  `adkIsText`/`adkFileUri`/`adkFileMimeType` object metadata, versions starting at 0).
+  Umbrella feature `gcs-artifacts`, included in the `gemini-agent-platform` meta-feature.
+- **adk-gemini: cached content on Vertex AI.** `VertexBackend` implements the five
+  cached-content operations (create, get, update, list, delete) against the Vertex
+  REST endpoint `…/v1/projects/{project}/locations/{location}/cachedContents`,
+  including TTL refresh via `updateCachedContent` so the runner's cache-refresh
+  path works on Vertex. Studio-style model names (`models/{model}`) in create
+  payloads are normalized to full Vertex resource names. The Files API, batch
+  operations, and the Interactions API remain Studio-only on the Vertex backend.
+- **Telemetry to Google Cloud** (`adk-telemetry` feature `gcp`, umbrella
+  `gcp-telemetry`, included in `gemini-agent-platform`). `init_with_gcp`
+  exports traces to `https://telemetry.googleapis.com` with per-request
+  `Authorization: Bearer` headers minted from Application Default Credentials
+  (refreshed in the background) plus `x-goog-user-project`. Resource
+  attributes (`service.name`, `gcp.project_id`,
+  `cloud.platform = gcp.agent_engine`) are detected from `K_SERVICE`,
+  `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_AGENT_ENGINE_ID`.
+  `init_json_logging` emits Cloud Logging structured JSON (severity mapping,
+  `logging.googleapis.com/trace` correlation). A collector-sidecar fallback is
+  documented in `docs/official_docs/observability/gcp.md`.
+### Fixed
+
+- **Model pricing corrected across every provider table.** All rates are now the
+  vendors' published standard-tier list prices, verified 2026-08-23, and each
+  module records the source URL and verification date.
+  - `adk-model` (OpenAI): every GPT-5.x rate was wrong, in both directions.
+    `gpt-5` was overstated 2× on input, `gpt-5-mini` 2.4×, `gpt-5-nano` 3×;
+    `gpt-5.5-pro` was understated 5× and `gpt-5.4-pro` 7.5×. `gpt-5`,
+    `gpt-5-mini`, `gpt-5-nano`, `gpt-5.1`, `gpt-5.2`, `gpt-5.4`, `gpt-5.4-mini`,
+    `gpt-5.4-nano`, `gpt-5.4-pro`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5-pro` and
+    `gpt-5.3-codex` are corrected. `gpt-image-2` image output was $32, now $30.
+  - `adk-gemini`: Gemini 2.5 Flash-Lite was documented as having no cache
+    support and priced cache reads at $0, when Google charges $0.01/MTok.
+    `cache_input_long` on 2.5 Flash and 3 Flash Preview held audio cache rates
+    ($0.10) rather than long-context rates, inflating cached cost on long
+    prompts by 2–3.3×; those models have no long-context tier and now report the
+    base rate.
+  - `adk-eval`: `default_pricing()` contained no current model and understated
+    Gemini 2.5 Flash output 4× and 2.5 Pro output 2×. Replaced with the current
+    Gemini, OpenAI, Anthropic and DeepSeek line-ups.
+- **Gemini 2.0 shutdown date** corrected in `AGENTS.md` from March 31 2026 to
+  June 1 2026, the date Google published.
+- **Current provider request contracts are validated before dispatch.** Direct
+  `adk-gemini` calls reject sampling, `candidate_count`, and token-based thinking
+  settings removed by Gemini 3.7. Anthropic rejects restricted sampling and
+  budget-based thinking on the current Claude families, and limits fast mode to
+  Claude Opus 5 and Opus 4.8.
+- **Gemini Live catalog lifecycle metadata is endpoint-aware.** The Vertex GA
+  `gemini-live-2.5-flash-native-audio` remains active through December 2026,
+  while the retired AI Studio `gemini-live-2.5-flash-preview` is rejected. The
+  catalog also covers additional retired Gemini aliases and Groq's Qwen 3 32B
+  deprecation.
+- **Runnable examples and crate README quickstarts no longer target superseded
+  provider defaults.** Gemini examples now use Gemini 3.7 Flash (or 3.5 Flash
+  Lite for deterministic benchmarks), image examples use the GA Gemini 3.1
+  Flash Image model, and provider-specific READMEs align with the shared model
+  catalog.
+
+### Changed
+
+- **`adk_gemini::Model::default()` is now Gemini 3.7 Flash**, not Gemini 2.5
+  Flash. This changes per-token cost for anyone relying on `Default`: 3.7 Flash
+  is $0.75/$3.75 per MTok against 2.5 Flash's $0.30/$2.50, so input is 2.5× and
+  output 1.5× the previous rate per token. Pin `Model::Gemini25Flash` explicitly
+  to keep the old behaviour.
+- The umbrella `provider_from_env()` and `run()` helpers now use the same shared
+  Gemini and OpenAI catalog defaults as CLI-generated projects.
+- **`lookup_pricing` and the new resolvers return `None` for models the vendor
+  publishes no rate for**, rather than a fabricated rate. Five OpenAI constants
+  (`GPT_55_INSTANT`, `GPT_52_CODEX`, `GPT_51_CODEX`, `GPT_51_CODEX_MAX`,
+  `GPT_51_CODEX_MINI`), `GPT_53_CHAT_LATEST` and both deep-research constants are
+  deprecated and no longer answer lookups. Treat `None` as unpriced, never free.
+- Introductory Gemini rates are marked with their expiry: Gemini 3.7 and 3.6
+  Flash double on 2027-01-01, and GPT-5.6 Sol's promotional rate runs at least
+  to 2026-11-21.
+
+### Added
+
+- **`ModelPricing::for_model` / `for_model_id`** (`adk-anthropic`) and
+  **`GeminiPricing::for_model_id`** (`adk-gemini`) resolve pricing from a wire
+  model ID, including the `Custom(..)` identifiers returned by the model
+  factories and Anthropic's dated aliases. Previously `adk-anthropic` had no
+  model-to-pricing mapping at all and `adk-gemini` special-cased one ID.
+- Anthropic Claude Mythos 5 and fast-mode rates (`ModelPricing::MYTHOS_5`,
+  `OPUS_5_FAST`), Haiku 3.5, and a `Model::claude_mythos_5()` factory.
+- Gemini 3.6 Flash and 3.5 Flash-Lite pricing plus a
+  `Model::gemini_3_5_flash_lite()` factory. Gemini 3.6 Flash previously had a
+  factory but no pricing entry, so it resolved as unpriced.
+- OpenAI GPT-5.6 Cyber, GPT-5.5 Cyber, GPT-5.2 Pro, `chat-latest`,
+  `gpt-5-search-api`, `gpt-5.3-codex` fast mode, and long-context constants for
+  the GPT-5.4, GPT-5.5 and GPT-5.6 families.
+- `OpenAIReasoningEffort` and additive Chat Completions / Responses constructors
+  expose `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` without
+  adding variants to the existing exhaustive `ReasoningEffort` enum.
+- `scripts/check-model-pricing.sh` checks the encoded rates against the vendor
+  pricing pages and runs in the monthly advisory model-freshness workflow.
+
+### Changed
+
+- **`provider_from_env()` now consults the Vertex opt-in flags before any API
+  key.** A truthy `GOOGLE_GENAI_USE_ENTERPRISE` or `GOOGLE_GENAI_USE_VERTEXAI`
+  (`1` or a case-insensitive `true`) selects Gemini on Vertex AI — via
+  Application Default Credentials with `GOOGLE_CLOUD_PROJECT` and
+  `GOOGLE_CLOUD_LOCATION` — even when `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+  `GOOGLE_API_KEY` is set. Previously these flags were ignored and API-key
+  sniffing alone decided the provider. If you already set a `GOOGLE_GENAI_USE_*`
+  variable for another SDK (e.g. adk-python) and rely on `provider_from_env()`
+  picking Anthropic or OpenAI from an API key, unset the flag or set it to a
+  falsy value. `GOOGLE_GENAI_USE_ENTERPRISE` takes precedence when both flags
+  are set. When a flag is truthy but the `gemini-vertex` feature is not
+  compiled, `provider_from_env()` emits a `tracing` warning and falls through
+  to API-key detection; a truthy flag with `GOOGLE_CLOUD_PROJECT` /
+  `GOOGLE_CLOUD_LOCATION` missing is an error, not a Studio fallback.
+
+### Added
+
+- **`GeminiModel::from_env(model)`** — environment-driven construction: Vertex
+  AI via ADC when `GOOGLE_GENAI_USE_ENTERPRISE` / `GOOGLE_GENAI_USE_VERTEXAI`
+  is truthy (requires the `gemini-vertex` feature; errors when the feature is
+  missing or the Vertex target is incomplete), otherwise the Gemini API via
+  `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
+- **`adk_model::gemini::vertex_env_requested()`** — reports whether the
+  environment opts in to the Vertex AI backend.
+- New docs page
+  [Vertex-Only Deployments](docs/official_docs/compliance/vertex-only-deployments.md)
+  — guaranteeing no `generativelanguage.googleapis.com` traffic for HIPAA and
+  data-residency workloads.
+### Added
+
+- **`VertexAiSessionConfig::from_env()`** builds the config from
+  `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and
+  `GOOGLE_CLOUD_AGENT_ENGINE_ID` (the bare numeric engine ID) — the variables
+  the Vertex AI Agent Engine platform sets inside deployed containers. Missing
+  or blank variables produce an actionable invalid-input error naming each one.
+- **Vertex session expiration**: `VertexAiSessionConfig::with_ttl()` and
+  `with_expire_time()` send the `Session.expiration` oneof (`ttl` /
+  `expireTime` from `google/cloud/aiplatform/v1beta1/session.proto`) on
+  session create. Setting both members, or a TTL below the 24-hour minimum,
+  fails at service construction.
+- **adk-server**: `agent_skills_from_index` bridges an `adk_skill::SkillIndex` to A2A
+  agent-card `skills[]` entries (skill name → `id` and `name`, description →
+  `description`, tags → `tags`, version folded into `tags` as `version:{v}`).
+  `ServerBuilder::with_skill_index` and `A2aServerBuilder::skill_index` attach an
+  index so the card served at `/.well-known/agent.json` includes those entries —
+  the surface Agent Registry keyword/prefix search indexes.
+  `A2aController::with_skill_index` is the underlying constructor.
+- **`POST /api/run` plain-JSON endpoint in `adk-server`.** Accepts the same body as
+  `/api/run_sse`, runs the agent to completion, and returns the collected events as a
+  JSON array — parity with Google ADK's `api_server` non-streaming `/run` route.
+
+### Fixed
+
+- **adk-rag: SurrealDB `create_collection` parse error.** The `metadata` field
+  definition used the pre-3.2 modifier order `FLEXIBLE TYPE object`, which
+  surrealdb 3.2 rejects with `FLEXIBLE must be specified after TYPE`. Reordered
+  to `TYPE object FLEXIBLE`, and the `surrealdb` feature now has a PR-tier
+  `feature-coverage` matrix entry so the backend cannot silently break again
+  (#568).
+
+### Changed
+
+- **Wave 3 ADC/LRO consolidation** — the Vertex plumbing duplicated across
+  five backends now lives in `adk-gcp`, with no public API change and each
+  backend's error codes, categories, and mock contract tests preserved:
+  `adk-session` (`vertex-session`), `adk-memory` (`vertex-memory`),
+  `adk-tool` (`example-store`), `adk-deploy` (`gcp`), and `adk-artifact`
+  (`gcs`, credential handling only).
+- **adk-gcp**: `GcpErrorContext` gains `with_response_too_large_code` (a
+  dedicated size-limit code override; the default remains the consumer's
+  `invalid_response` literal); `GcpHttpClient` gains `send_value_counted`
+  (parsed JSON plus decoded body size, for aggregate pagination bounds) and
+  a post-construction `with_max_response_bytes` override.
+
+### Contributors
+
+Thank you to [@joseph-wortmann](https://github.com/joseph-wortmann),
+[@1111mp](https://github.com/1111mp), and
+[@jkmaina](https://github.com/jkmaina) for their contributions to v2.1.0.
+
+## [2.0.0] - 2026-08-09
+
+### Breaking
+
+- **`DeferredNodeConfig` gained a public `min_predecessors` field.** Every struct
+  literal needs `min_predecessors: None` to keep the previous behaviour, which is
+  to release the join when all direct predecessors have arrived. `Some(n)` releases
+  after *n* of them, for a quorum instead of a full join.
+- **`CompiledGraph::get_next_nodes` returns `Result<Vec<String>>`.** A router
+  answering with a key that is not among the declared targets previously stopped
+  that branch and the run reported success with the target never executed. It now
+  gives `GraphError::UnknownRouteTarget`, naming the key and listing the declared
+  ones. A route to `END` stays legal, because `END` is declared.
+- **`CompiledGraph::time_travel` returns `Result<TimeTravelHandle>`.** It used to
+  panic when the graph had no checkpointer. Add `?` at the call site.
+
+- **`ConnectionRefresher::call_tool` and `SimpleClient::call_tool` return
+  `CallToolResponse`** instead of `CallToolResult`. SEP-2663 lets a server answer
+  `tools/call` with a task, and SEP-2322 with a request for more input, so the
+  response now says which of the three happened. Both wrappers moved to rmcp's
+  `call_tool_once`: the `call_tool` helper fulfils input rounds through the local
+  handler on its own and rejects a task response outright, which would break every
+  server that materializes one. `McpToolset::execute` handles all three cases
+  internally, so agents built on `McpToolset` need no change.
+- **Task execution now needs the extension declared at handshake time.** SEP-2663
+  moved the declaration from the request to the client's capabilities: a server
+  must not answer with a task unless the client declared
+  `io.modelcontextprotocol/tasks`. Call
+  `AdkClientHandler::with_tasks()` when building the client;
+  `McpToolset::with_task_support` continues to set how the client polls. Under
+  rmcp 2.2 each call carried its own task metadata, so no handshake declaration
+  was needed. `examples/mcp_protocol_revisions` demonstrates both.
+- **A tool no longer declares its own task contract.** SEP-2663 removed the
+  per-tool signal, so `Tool::is_long_running` on an MCP tool now answers per
+  connection: true when tasks are enabled and the server negotiated them. A
+  `CodeActAgent` that suspends on long-running tools suspends for any tool on a
+  task-capable server rather than only those that declared support.
+- **`rmcp::model::SamplingMessageContent` is now `SamplingMessageContentBlock`**
+  under the `mcp-sampling` feature. `adk-tool --features mcp-sampling` joins the
+  PR-tier feature-coverage matrix; nothing in the workspace enabled it, so its
+  only cover was an example crate.
+
+### Changed
+
+- **A graph's default `recursion_limit` is 100, up from 50.** `LlmAgent`'s tool loop
+  already allowed 100, so a graph stopped at half the budget an agent got, for no
+  stated reason. A cycle now runs twice as far before
+  `GraphError::RecursionLimitExceeded`.
+- **`RetryPolicy::default()` allows ten attempts, up from one.** One attempt made
+  the default a no-op. Ten attempts sleep about 243 seconds in total, so a node that
+  keeps failing takes roughly four minutes to give up; lower `max_attempts` where a
+  caller is waiting. Retry is still opt-in: a node with **no** policy runs once.
+
+### Added
+
+- **`adk-graph` parity and reliability work.** Each item is off by default, so an
+  existing graph behaves as it did:
+  - **Routing from inside a node.** `NodeOutput::with_goto` names the successors,
+    replacing that node's declared edges, so a node reaches a node it has no edge
+    to. `AgentNode::with_goto_mapper` derives the route from the updates its output
+    mapper produced, so an agent routes on its own answer. Naming `END` stops the
+    branch; an unknown name fails the run.
+  - **Per-node retry.** `RetryPolicy` with capped exponential backoff and jitter,
+    attached by `with_node_retry`. An interrupt is never retried. The attempt count
+    is checkpointed, so a resumed run continues the budget.
+  - **A concurrency bound.** `with_max_concurrency` caps how many nodes run at
+    once, admitting the frontier in sorted order.
+  - **Invoking a node directly.** `ctx.run_node_with(name, input, options)` runs a
+    node the graph has no edge to, sized from state. Completed children are
+    recorded under `<parent>/<child>@<run_id>`, so a resume returns the recorded
+    answer instead of paying for the child again.
+  - **A graph or a node as a tool.** `NodeTool::for_graph` and `for_node` expose
+    either through the `Tool` trait, reporting long-running so a graph pause travels
+    the existing tool-confirmation path.
+  - **An *n*-of-*m* join.** `DeferredNodeConfig::min_predecessors` releases a join
+    on a quorum.
+  - **Channel enforcement.** `with_strict_channels` fails the run when a node writes
+    a channel the schema does not declare, which otherwise took the overwrite
+    reducer silently.
+  - **`StreamEvent::NodeInterrupt`.** A node reporting a pause on the streamed
+    path. The executor converts it into the pause and does not forward it, so a
+    caller still sees only `Interrupted`.
+  - **Subgraphs.** `SubgraphNode` runs a compiled graph as a node, exchanging
+    named channels. A pause inside pauses the parent. A channel mapping naming a
+    channel neither side declares fails when the parent compiles, through a new
+    `Node::validate_against(&parent_schema)` that `compile()` calls for every node.
+  - **`NodeOutput::with_goto_parent`.** A node inside a subgraph ends its own graph
+    and names a node of the graph that holds it, read from the new
+    `CompiledGraph::invoke_detailed`. The counterpart to LangGraph's
+    `Command(graph=Command.PARENT)`.
+  - **`CompiledGraph::with_node_defaults`.** One retry, timeout or failure handler
+    for every node that sets none; a per-node value wins. A graph-wide
+    `default_timeout` already existed on `GraphAgentBuilder`.
+  - **`CompiledGraph::with_node_error_handler`.** Once a node's retry budget is
+    spent, a handler may record the failure and name a recovery node instead of
+    ending the run. An interrupt never reaches it.
+  - **Checkpoint retention.** `CompiledGraph::with_checkpoint_retention` bounds how
+    many checkpoints a thread keeps, by count, by age, or both, pruned after each
+    save. The newest is never discarded, because it is the one a resume loads.
+    `Checkpointer::prune` has a default that keeps everything, so a custom backend
+    is unaffected. A long-running thread previously grew without bound; LangGraph
+    documents the same growth and advises an external cron job.
+  - **Background runs survive a restart.** `adk-server`'s `RunStore` held runs in
+    an in-memory map, so graph state survived a restart through a checkpointer but
+    the list of runs did not, and a restarted server could not report what had been
+    in flight. `RunPersistence` records them, `FileRunPersistence` writes one JSON
+    file through a temporary and a rename, and `RunStore::restore` loads them at
+    startup — reporting any run that was `Running` or `Queued` as `Failed`, because
+    it cannot still be running. A restored run gets a live cancellation token. A
+    networked backend is a follow-up; the trait is the seam for one. Finished runs
+    are bounded by default — `RunRetention` keeps the newest 1000 and discards the
+    rest from both the map and the records, because a store that persists every
+    finished run forever is a leak that only appears after weeks. A run still in
+    flight is never discarded.
+  - **`FileManagedStateStore`.** The first `ManagedStateStore` reporting
+    `Durability::CrashDurable`, so a managed session can be reconstructed after
+    process loss. One JSON file per session, synced and renamed, so an acknowledged
+    write is persisted and a reader never sees a partial snapshot. Session ids are
+    escaped, so an id containing a path separator cannot write outside the root.
+    `InMemoryManagedStateStore` remains, and still reports `ProcessLocal`.
+  - **Umbrella features.** `graph-functional`, `graph-node-cache`, `graph-delta`,
+    `graph-time-travel`, `graph-sqlite`, and `graph-redis-cache` on `adk-rust`
+    forward to `adk-graph`, which has no default features. The first four are in
+    `full`.
+- **`gemini-agent-platform` / `gemini-agent-platform-full` umbrella meta-features.** One
+  switch that pulls in every Gemini Enterprise Agent Platform (Vertex/EAP)
+  integration, composable with any tier preset:
+  `features = ["standard", "gemini-agent-platform"]`. The base variant covers
+  `gemini-vertex`, `vertex-session`, and `gcp-secrets` (growing as later
+  platform integrations land) and excludes realtime transports — the right
+  default for ReasoningEngine BYOC deployments. `gemini-agent-platform-full` adds
+  `vertex-live` (Vertex AI Live API, which pulls in the adk-realtime stack).
+  Deploy-time tooling is host-side and excluded from both.
+
+### Changed
+
+- **MCP moves to the official `rmcp 3.1` SDK.** The client still advertises MCP
+  `2025-11-25`, so every existing server is unaffected: `rmcp 3.1` keeps
+  `ProtocolVersion::LATEST` at `2025-11-25`, and a `2026-07-28` server answers
+  the same handshake. `2026-07-28` adds a stateless `server/discover` handshake,
+  now selectable per connection through `adk_tool::mcp::ClientLifecycleMode`. It
+  stays opt-in because the SDK falls back to the legacy handshake only when a
+  server refuses the probe with `METHOD_NOT_FOUND`, and applies no timeout to it.
+  A new `adk-tool/tests/mcp_protocol_compatibility_tests.rs` holds the contract
+  across every revision the SDK knows: the default path must send `initialize`
+  first and advertise `2025-11-25`; a server pinned to `2024-11-05` stays
+  reachable; and `Discover` and `Auto` settle on `2026-07-28` against a server
+  that supports it. Two further tests run against external servers and are
+  `#[ignore]`d by default.
+  Closes #552.
+
+
+### Fixed
+
+- **`StreamMode::Messages` ignored every interrupt and wrote no checkpoint.** That
+  mode runs nodes in its own loop to forward tokens as they arrive, and both
+  interrupt checks lived in `execute_super_step`, which the loop never calls. So
+  `interrupt_before`, `interrupt_after`, and a node's own
+  `NodeOutput::interrupt` were all silently skipped — an approval gate did not
+  hold — and a completed run left nothing to resume from. The checks now live in
+  `gate_before`/`gate_after`, which both paths call, a node's pause travels as
+  `StreamEvent::NodeInterrupt` because that path yields events and no
+  `NodeOutput`, and the loop checkpoints each super-step. `GraphAgent`'s
+  `Agent::run` uses `invoke` and was never affected.
+- **A static interrupt could not be resumed past.** `interrupt_before` re-armed on
+  every resume, so the gated node never ran. `interrupt_after` had the same defect
+  and needed the opposite fix, because that node has already applied its updates.
+  A `cleared_interrupt` marker is now checkpointed, with a SQLite column, so the
+  durable backend keeps it too.
+- **A fan-in node ran once per arriving branch.** Branches of unequal length made
+  the join fire more than once. A node with more than one incoming direct edge is
+  now deferred automatically at compile time. Conditional predecessors are excluded
+  from the count, because a branch that never fires would stall the join.
+- **Parallel state updates depended on completion order.** Two nodes appending to
+  the same channel produced a different array depending on which finished first.
+  Updates now apply in sorted node order, and by sorted key within a node.
+- **An interrupt's data did not reach a caller through `GraphAgent`.** The pause is
+  now carried as a JSON payload under one reserved `provider_metadata` key, with
+  `GraphInterruptPayload::from_event` to read it back.
+- **`StreamEvent::RouteDispatched` was never emitted.** The debug stream now reports
+  one per conditional edge.
+
+
+- **`adk-memory --features database-memory` compiles again.** `pgvector` accepts
+  `sqlx >= 0.8, < 0.10` and resolved to 0.9 while the workspace pinned 0.8, so
+  two semver-incompatible `sqlx` majors sat in one graph and `pgvector::Vector`
+  implemented the other `sqlx::Type`. The lockfile now holds a single `sqlx`
+  0.8.6. `adk-rag --features pgvector` and the three sqlx-backed backends join
+  the PR-tier feature-coverage matrix, which no job had built.
+- **Inline and file content metadata survives session persistence.**
+  `Part::InlineData`, `Part::FileData`, `Part::FunctionResponse`, and multimodal
+  function-response parts retain optional annotations; inline data also retains
+  its optional source URI. ACP image conversion now round-trips both fields, and
+  Vertex sessions route metadata-bearing content through lossless `rawEvent`
+  persistence. Existing payloads continue to deserialize with empty metadata.
+- **MCP tool annotations now control per-tool safety metadata.** Discovered
+  `readOnlyHint` and `idempotentHint` values flow into ADK tool metadata,
+  automatic dispatch, and reconnect replay decisions. Tools without hints keep
+  the conservative sequential, no-replay defaults.
+- **Schema caches keep adapter results isolated.** `SchemaCache` binds one
+  `SchemaAdapter` instance at construction, so the same input schema cannot
+  return a result produced by another provider or adapter configuration. The
+  deprecated per-call adapter API also keys entries by normalized output to
+  preserve correctness during migration.
+- **`LlmAgent` skill injection preserves prompt-cache prefixes.** Contextual
+  skills are injected into the current user turn instead of leading the request,
+  so stable instructions and prior conversation history remain reusable by
+  provider prompt caches across turns.
+- **adk-sandbox's optional dependencies are no longer scoped to Unix.** Every
+  optional dependency sat below a `[target.'cfg(unix)'.dependencies]` header, so
+  `wasmtime` and `wasmtime-wasi` were unix-only and the `wasm` feature could not
+  build on Windows, while `windows-sys` — declared for the AppContainer path —
+  could never be selected on any platform. The optional dependencies move back to
+  `[dependencies]` and `windows-sys` gets a `cfg(windows)` block.
+- **The workspace builds clean on Windows.** Three `collapsible_if` violations
+  failed `clippy -D warnings` in code paths no CI job compiled: one in
+  `cargo-adk` behind `#[cfg(not(unix))]`, two in `adk-rust`'s `run()` that only
+  compile at the `standard` tier and above. An `unneeded_return` in
+  `adk-sandbox`'s Windows enforcer surfaced once the manifest fix made that
+  module compile.
+- **adk-bench's external-runner tests run on a stock Windows host.** They invoked
+  `sh` and a bare `echo`, neither of which a plain Windows install provides, and
+  passing a shell one-liner as an argument corrupted any embedded JSON because
+  `cmd.exe` does not implement `CommandLineToArgvW` escaping. The tests now write
+  a temporary script — PowerShell on Windows, `sh` elsewhere — so no payload
+  crosses the command line.
+- **Sandboxed Rust compilation discovers the Windows SDK outside a Developer
+  shell.** `ProcessBackend` now obtains the MSVC `PATH`, `LIB`, `LIBPATH`, and
+  `INCLUDE` values from the installed Build Tools when the parent environment
+  does not provide them. The compiler receives the SDK import-library paths while
+  the generated program still starts with a cleared environment. The exact
+  compile-and-run regression now runs in the PR-tier Windows smoke gate.
+- **adk-sandbox now preserves Windows shell quoting and selects the intended Rust
+  linker.** Raw command text reaches `cmd.exe` without `CommandLineToArgvW`
+  escaping, so quoted executable and script paths work. Direct sandboxed Rust
+  compilation uses the toolchain's `rust-lld` instead of accidentally resolving
+  Git's unrelated GNU `link.exe` from `PATH` on hosted Windows runners.
+
+### Added
+
+- **adk-code: in-process Python execution via Pydantic Monty** (`embedded-python`
+  feature). One `MontyExecutorBuilder` produces two `CodeExecutor` products:
+  `MontyOneShotExecutor` (fresh interpreter per call) and `MontyReplExecutor`
+  (variables, functions, and imports persist across calls, with
+  `start`/`stop`/`restart` lifecycle). OS access is host-granted at
+  construction — filesystem mounts (read-only/read-write), an explicit
+  environment map, and the clock — and serviced in place; ungranted access
+  raises a catchable in-script `OSError`. Monty has no network or subprocess
+  surface at all. Registered `HostFunction`s (sync or async) become callable
+  Python functions; the drive loop segments across `spawn_blocking` so async
+  host functions are awaited without holding interpreter state across `await`.
+  The per-request `SandboxPolicy` may only narrow within the grants — a grant
+  covers its entire directory subtree (a granted mount or any subdirectory of
+  one may be requested), and requests exceeding the grants are rejected
+  fail-closed with `UnsupportedPolicy`. Mount virtual paths are validated at
+  build time (normalized absolute, unique). Host-side buffers are bounded:
+  `print()` output is capped at `max_stdout_bytes` *during* the drive, and
+  JSON↔Monty conversion is depth-capped so iteratively built deep nesting
+  degrades to a placeholder instead of overflowing the host stack.
+  `SandboxPolicy::strict_python()` added.
+- **adk-code: `CodeExecutor::prompt_snippet()`** — a new defaulted trait method
+  (default `None`, backward compatible) letting backends describe their built
+  execution environment for LLM-facing tool descriptions. Both Monty executors
+  implement it: mode semantics, granted mounts, environment variable names
+  (never values), clock availability, and Python stubs for registered host
+  functions.
+- **adk-tool: `MontyPythonCodeTool`** (`monty_python_code`, feature
+  `code-embedded-python`) — the agent-facing tool over the Monty executors,
+  complementing the container-backed `PythonCodeTool` (which remains unchanged
+  for full-CPython workloads: pip packages, C extensions, the complete
+  standard library). One-shot mode shares a stateless executor; REPL mode keys
+  interpreter sessions by the full ADK session identity (app, user, session
+  id) with an LRU cap (default 100). The
+  tool description is composed from the executor's `prompt_snippet()`, the
+  schema is mode-aware (`reset` exists only in REPL mode), and
+  `MontyPythonCodeTool::builder()` forwards grants, host functions, and
+  limits. The umbrella crate forwards the feature as `code-embedded-python`.
+  New standalone example: `examples/monty_python_code_tool`.
+- **adk-codeact-monty is now publishable** (Experimental tier). The Python
+  `CodeRuntime` for the `CodeActAgent` joins the crates.io release train at the
+  workspace version, so `CodeActAgent` + Python is reachable from a published
+  dependency instead of a git checkout. Its duplicated Monty plumbing is gone:
+  the crate now consumes `adk-code`'s `embedded-python` integration kernel —
+  shared JSON↔Monty conversion (`json_to_monty`/`monty_to_json`), shared
+  OS-call servicing (`resolve_os_call`), a shared `PathAccess`, the shared
+  `pathlib` capability listing, and re-exports of the `monty`/`monty-types`/
+  `monty-fs` crates — so the Monty release is pinned exactly once, by
+  `adk-code`. Behavior change: an ungranted clock now raises a catchable
+  `OSError` (previously `RuntimeError`), matching the executors.
+- **adk-rust: `codeact` and `codeact-monty` umbrella features.** `codeact`
+  forwards `adk-agent/codeact` (the `CodeActAgent` was previously unreachable
+  through the umbrella); `codeact-monty` adds the `adk-codeact-monty` runtime
+  and re-exports it as `adk_rust::codeact_monty`. Both are opt-in specialist
+  features, composable with any tier — like `code-embedded-python`, they are
+  not part of `full`. The docs.rs build now enables the Monty opt-ins so their
+  modules appear in the umbrella documentation.
+- **adk-rust: `code-tools`, `code-embedded-js`, and `code-docker` umbrella
+  features — and `full` now includes `code-tools`.** Previously no tier enabled
+  `adk-tool/code`, so the code-execution tools (`CodeTool`, `PythonCodeTool`,
+  `JavaScriptCodeTool`, `FrontendCodeTool`, `MontyPythonCodeTool`) were
+  unreachable through the umbrella even on `full`, which compiled both
+  `adk-code` and `adk-tool` but not the integration layer between them.
+  `code-tools` forwards `adk-tool/code` (with `code` and `sandbox`, since
+  constructing `CodeTool` takes an adk-sandbox backend); `code-embedded-js`
+  and `code-docker` forward the embedded-JS and persistent-Docker live paths,
+  completing the family alongside `code-embedded-python` (which now implies
+  `code-tools`).
+- **adk-realtime: `DisconnectReason`, so a closed stream can say why.**
+  `RealtimeSession::disconnect_reason()` reports the close code and reason the
+  provider sent, and `RealtimeRunner::disconnect_reason()` forwards it. The
+  Gemini session records its close frame before the event stream ends.
+
+  Applications that *poll* `RealtimeRunner::next_event()` never reach the
+  runner's `on_disconnect` dispatch, and `next_event` returns a bare `None`
+  whether the provider deliberately closed an idle session or the socket died.
+  Both therefore landed in the caller's terminal record as the same generic
+  stream failure — one that reads like a network defect when it was a policy
+  close. Google's Live API closes an idle session with `1008` and
+  `"The operation was aborted."`; that string was reachable in logs but nowhere
+  a durable record could use it.
+
+  The trait method is defaulted to `None`, so existing `RealtimeSession`
+  implementations are unaffected and this is not a breaking change.
+
+- **`scripts/setup-dev.ps1` — first-time setup for Windows.** `make setup`,
+  `scripts/setup-dev.sh`, and `devenv shell` all require a POSIX shell, so
+  Windows had no scripted path. Checks the toolchain and MSVC environment,
+  installs `sccache`, `cargo-nextest`, `protoc`, and NASM, verifies `bash` and
+  `python3` resolve, registers lefthook, and persists `RUSTC_WRAPPER`,
+  `CMAKE_POLICY_VERSION_MINIMUM`, and `PROTOC`. `-Check` reports without
+  changing anything.
+- **`scripts/setup-dev.sh` now checks `cargo-nextest` and `protoc`.** Both are
+  required by gates that CI installs for itself, so a missing local copy failed
+  the build while CI stayed green.
+- **PSScriptAnalyzer pre-commit gate.** `scripts/lint-powershell.ps1` backs a new
+  lefthook hook for staged `*.ps1`, the PowerShell counterpart to the shellcheck
+  gate. Skips itself when the module is not installed.
+
+### Security
+
+- **Wasmtime is updated to 46.0.3 and Monty to 0.0.21.** Wasmtime resolves
+  RUSTSEC-2026-0222 and RUSTSEC-2026-0223. Monty moves to `jiter 0.16` and
+  PyO3 0.29, resolving GHSA-36hh-v3qg-5jq4 and GHSA-chgr-c6px-7xpp even though
+  PyO3 remains behind jiter's disabled `python` feature. The Monty update also
+  brings descriptor-based mount confinement and fixes for Windows mount escape
+  and cached-overlay path revalidation. The supply-chain license policy
+  recognizes Monty's OSI-approved Unicode-DFS-2016 data license.
+- **Example web interfaces no longer build DOM from untrusted HTML.** The
+  realtime voice example renders provider, memory, and pipeline data with DOM
+  text nodes, while the streaming bash example uses a cryptographic session ID
+  and a `Map` for untrusted tool-call keys. This resolves the five open CodeQL
+  XSS, prototype-pollution, and insecure-randomness findings.
+- **The audio `fx` feature drops unused `rubato` and `dasp` dependencies.** Its
+  processors already use ADK-Rust's internal bounded implementations and never
+  called either crate, so the public feature and behavior are unchanged while
+  the unnecessary dependency surface is removed.
+- **HTTP and cloud SDK dependencies are refreshed for RUSTSEC-2026-0258.** The
+  active HTTP/2 stack now uses `h2 0.4.19`; Azure Identity is aligned with the
+  0.22 Azure Core generation already used by Key Vault, and AWS Secrets Manager
+  no longer enables its legacy Hyper 0.14 TLS transport. The lockfile-only
+  `rkyv 0.7` advisory is documented as unreachable because no workspace feature
+  enables `rust_decimal`'s optional archive integration.
+
+### Changed
+
+- **PostgreSQL vector memory remains aligned with SQLx 0.8.** `pgvector` is
+  pinned to `0.4.1`, the latest release whose SQLx integration uses the
+  workspace's SQLx 0.8 line. `pgvector 0.4.2` moved that integration to SQLx
+  0.9 and is intentionally excluded until the workspace upgrades SQLx.
+- **adk-codeact-monty joined the root workspace.** Monty is on crates.io since
+  `0.0.19`, so the crate's git dependency (and the empty `[workspace]` table it
+  forced) is gone: it now depends on `monty`, `monty-types`, and `monty-fs`
+  `0.0.21` from crates.io and is covered by the standard workspace gates
+  (`clippy`, `nextest`, docs) on every PR. The dedicated out-of-workspace CI
+  (`codeact-monty.yml`, the `out-of-workspace-monty` merge-tier job) is retired,
+  and `examples/codeact_monty_agent` compiles in the PR-tier examples gate. The
+  workspace `Cargo.lock` pins `get-size2` to `0.10.1` — `monty 0.0.21` pulls
+  `ruff_python_ast 0.0.3`, which derives `GetSize` on `compact_str 0.9` fields
+  while `get-size2 0.10.2+` moved to `compact_str 0.10`; the pin keeps the two
+  aligned until monty upgrades past `ruff_python_ast 0.0.3`. Porting to the
+  0.0.21 API: `MontyRuntimeBuilder::max_allocations` is removed (Monty's
+  `ResourceLimits` no longer counts allocations — the time/memory caps remain),
+  and per-step `print()` capture is capped at Monty's 10 MiB collector default
+  (exceeding it raises `MemoryError` in the script). The crate is published on
+  the workspace release train.
+
+### Breaking
+
+Major version bump. The complete list of public API breakage since
+1.0.0, as reported by `cargo semver-checks check-release --release-type minor`
+against the published 1.0.0 baseline, is below. A migration guide with
+before/after code is in
+[docs/official_docs/migration/1.0-to-2.0.md](docs/official_docs/migration/1.0-to-2.0.md).
+
+| Crate | Change | Downstream impact |
+|---|---|---|
+| `adk-acp` | `PermissionDecision::Allow` **removed**, replaced by `Select(String)`, `AllowOnce`, and `AllowAlways` | Code constructing or matching `Allow` must pick the intended variant |
+| `adk-acp` | New public fields: `PermissionRequest::{session_id, tool_call_id, kind, raw_input}`, `AcpAgentConfig::{mcp_servers, filesystem, terminal}`, `PermissionOption::kind` | Struct literals must add the fields; prefer `..Default::default()` |
+| `adk-acp` | New variants: `OutputChunk::{ToolUpdate, Usage}`, `PermissionPolicy::AsyncCustom` | Exhaustive `match` must add arms |
+| `adk-acp` | `AcpAgentConfig` no longer `UnwindSafe`/`RefUnwindSafe` | Affects code storing it across `catch_unwind` |
+| `adk-computer-use` | `ComputerUseRuntime::verify` takes the action postcondition and returns `VerificationOutcome` instead of `bool` | Match the outcome; `is_verified()` is true only when the postcondition was observed, `is_committed()` covers "performed but unverified" |
+| `adk-agent` | `TriggerEvent` gains a public `principal` field | Add `principal: None` to struct literals; webhook events carry the verified principal |
+| `adk-agent` | `WebhookTrigger` binds loopback by default, requires a verifier for any wider address, and rejects non-JSON bodies | Call `with_bind_address` plus `with_verifier` to expose it; `accept_non_json()` restores the old body handling |
+| `adk-agent` | `WebhookTrigger` no longer `UnwindSafe`/`RefUnwindSafe` | It now holds a verifier behind `Arc<dyn ...>`; affects code storing it across `catch_unwind` |
+| `adk-managed` | `ManagedAgentRuntime::start_session` requires a `ManagedOwner`, and rejects an `EnvironmentConfig` it cannot honour | Pass an owner; supply `None` for `env` unless a sandboxed runtime is configured |
+| `adk-anthropic` | New variants: `ContentBlock::WebFetchToolResult`, `ToolUnionParam::WebFetch20250910`, `ServerTool::WebFetch20250910` | Exhaustive `match` must add arms |
+| `adk-core` | New public fields: `RunConfig::{tool_confirmation_handler, runtime_toolsets}` | Struct literals must add the fields; prefer `RunConfig::builder()` |
+| `adk-core` | New variant `Part::EmbeddedResource` (`Part` is not `#[non_exhaustive]`) | Exhaustive `match` must add an arm |
+| `adk-core` | `RunConfig` and `RunConfigBuilder` no longer `UnwindSafe`/`RefUnwindSafe` | Affects code holding them across `catch_unwind` |
+| `adk-core` | `Memory::search_in_project` and `Memory::add_to_project` now return an error by default instead of silently operating globally; new `Memory::supports_project_scoping` | A custom `Memory` that relied on the fallback must implement the project methods or accept the error |
+| `adk-memory` | `MemoryService::{add_session_to_project, add_entry_to_project, delete_entries_in_project}` now return an error by default; new `MemoryService::supports_project_scoping` | A custom backend must implement them; `GraphMemoryService` now refuses project calls it previously answered globally |
+| `adk-core` | `RunConfig::tool_confirmation_decisions` is now keyed by **function call ID** instead of tool name | Approvals keyed by tool name are no longer found, so the call stays unconfirmed; key by `ToolConfirmationRequest::function_call_id` |
+| `adk-core` | New public field `RunConfig::tool_confirmation_fingerprints` | Struct literals must add the field; prefer `RunConfig::builder()` |
+| `adk-graph` | `TimeTravelHandle::replay` renamed to `state_history` | Rename the call; behaviour is unchanged, and it never re-executed anything despite the old name |
+| `adk-graph` | New public field `ExecutionConfig::parent_context` | Struct literals must add the field; prefer `ExecutionConfig::new` plus `with_parent_context` |
+| `adk-graph` | New public field `StateGraph::deferred_configs` | Struct literals must add the field |
+| `adk-runner` | `MutableSession::conversation_history_for_agent_impl` now takes two parameters (an `agent_name` and a `branch`) instead of one | Direct callers must pass the invocation branch; pass `""` for unscoped behaviour |
+| `adk-realtime` | `ClientEvent` and `ServerEvent` are now `#[non_exhaustive]` | Downstream `match` needs a wildcard arm; the enums can no longer be constructed exhaustively outside the crate |
+| `adk-realtime` | `ServerEvent::Unknown` discriminant changed 21 → 23 | Affects code depending on the numeric discriminant |
+| `adk-realtime` | New public field `RealtimeConfig::affective_dialog` | Struct literals must add the field |
+| `adk-sandbox` | `EnforcedLimits::filesystem_isolation` replaced by `filesystem_write_isolation` and `filesystem_read_isolation` | Read the field that matches what you need; the two are not equivalent on macOS |
+| `adk-telemetry` | `AdkSpanLayer::new` now takes one generic type parameter instead of none | Call sites passing explicit generics must be updated |
+| `adk-telemetry` | `AdkSpanLayer` no longer `UnwindSafe`/`RefUnwindSafe` | Affects code holding it across `catch_unwind` |
+
+### Security
+
+- **adk-computer-use: the reference graph now enforces execution-time bindings and
+  deterministic reservation cleanup.** Generic `ComputerUseRuntime` implementations could
+  return a well-formed lease, reservation, or receipt without the graph applying the binding
+  validators used by the MCP adapter. The graph now validates each response before storing it
+  and revalidates the envelope, lease, reservation, approval route, action digest, and policy
+  digest immediately before the single mutation. Reservations bind the exact action intent,
+  active state, expiry, and app/window scope. Every post-reservation terminal path attempts
+  release; a primary failure remains primary, and a cleanup failure is reported alongside it.
+  The checkpointed preview is append-only, so resume input cannot replace it while supplying a
+  matching forged approval. Verification now reads the postcondition from the stored preview
+  envelope rather than a nonexistent `envelope` state channel. The MCP adapter also retains the
+  exact preview envelope and rejects direct execution if it changes.
+
+- **adk-sandbox: the process output cap now bounds memory instead of only the report.**
+  `ProcessBackend::execute` called `child.wait_with_output()`, which buffers a process's entire
+  stdout and stderr, and applied the 1 MiB `MAX_OUTPUT_BYTES` limit afterwards. A sandboxed
+  process writing gigabytes allocated gigabytes; the cap limited only what was returned. Both
+  pipes are now read concurrently with the limit applied as bytes arrive. Reading continues past
+  the cap and discards the excess, because stopping would block the child on a full pipe until
+  the execution timeout. Truncation is logged.
+
+- **adk-computer-use: lease validation enforces expiry, remaining budget, and target
+  boundaries.** `validate_lease` checked session, principal, agent, execution mode, and
+  `state == "active"`, plus `action_budget == 0` — the *total* budget, so a lease with
+  `action_budget: 1, actions_used: 1` passed while authorizing nothing. It never read
+  `expires_at` or `boundaries`, so an expired lease and a lease scoped to a different application
+  were accepted as well. All three are now checked, and an expiry that cannot be parsed is
+  rejected rather than skipped.
+- **adk-awp: subscription HMAC secrets no longer leave the process.** `EventSubscription`
+  serialized `secret` as a plain field and `GET /awp/events/subscriptions` returned
+  `Json(subs)`, so listing subscriptions disclosed every subscriber's signing key — on an
+  endpoint with no authentication, meaning anyone who could reach it could collect the keys and
+  forge signed webhook deliveries. The field is now `skip_serializing`, and a hand-written
+  `Debug` redacts it so capturing a subscription in a `tracing` call cannot write a live
+  credential to the logs. The secret remains available in-process for signing.
+- **adk-awp: public execution and management boundaries now fail closed.** `/awp/a2a` returned
+  `200 acknowledged` without dispatching a message, so callers were told work succeeded when no
+  agent ran. `AwpA2aHandler` now supplies application dispatch; the unconfigured endpoint returns
+  `503`, message IDs and bodies are bounded, and public routes apply the configured rate limiter.
+  `DefaultTrustAssigner` no longer treats an unverified authorization header as known identity.
+  `awp_routes` now returns only public routes; subscription CRUD requires the explicit
+  `awp_management_routes` router and an application auth layer. Malformed version headers return
+  `400` instead of silently becoming the current version. Subscription configuration now requires
+  bounded fields, HTTPS callback URLs, and signing secrets of at least 32 bytes. The no-op
+  `webhook-delivery` feature is removed; the in-memory service signs and logs deliveries, while
+  production HTTP delivery stays behind the `EventSubscriptionService` interface.
+- **adk-server: A2A JSON-RPC routes now sit behind the configured authentication layer.**
+  `/a2a` and `/a2a/stream` were merged at the router root, outside the layer applied to `/api`,
+  in both `create_app_with_a2a` and `ServerBuilder::build`. A deployment that authenticated every
+  other mutation surface still allowed any client that could reach the port to drive the agent,
+  call its tools, and incur the cost. Discovery (`/.well-known/agent.json`) stays public, since
+  peers fetch the card before they hold a credential, and with no extractor configured the routes
+  remain open so existing deployments are unaffected.
+- **adk-server: `A2aServer` binds loopback by default.** The builder defaulted to
+  `0.0.0.0:8080`, publishing an agent-executing server to every interface on `build()`. It now
+  defaults to `127.0.0.1:8080`; `bind_addr` opts into a wider bind. The generated `a2a-server`
+  scaffold does the same and reads `BIND_HOST`.
+- **adk-server: `--features a2a-v1` and `--all-features` compile again.** Two test initializers
+  for `RemoteA2aV1Config` omitted the `streaming` field, so both configurations failed to build —
+  which also meant the A2A v1 surface had no executing test coverage.
+
+- **adk-tool: MCP tool-call replay now requires explicit opt-in.** A transport
+  failure after request transmission can leave a mutating tool's external
+  result uncertain. `ConnectionRefresher` and `McpToolset` no longer replay
+  `tools/call` by default after reconnecting; callers may opt in with
+  `with_tool_call_retries()` for read-only or provider-idempotent operations.
+  Discovery and resource retries retain their existing reconnect behavior.
+- **adk-computer-use: security-relevant MCP responses are bound to the request that produced
+  them.** `ControlLease`, `TargetReservation`, and `ExecutionReceipt` were deserialized and
+  returned straight into graph state. Typed deserialization proves shape, not provenance, and
+  none of these structs has an invariant-enforcing constructor, so a well-formed object
+  belonging to another session, principal, agent, mode, or action parsed cleanly and was
+  accepted. Each is now validated against the requesting envelope — including active lease
+  state, remaining action budget, and the receipt's `action_digest` against the envelope's
+  approval-bound `args_digest` — and a mismatch raises
+  `ComputerUseError::IdentityMismatch` naming the field. The external runtime remains
+  authoritative; this is the local defense that stops a stale or confused response from
+  propagating.
+- **adk-computer-use: verification no longer equates "committed" with "verified".** `verify`
+  returned `receipt.status == ReceiptStatus::Committed`, collapsing two distinct claims: that
+  the runtime performed the action, and that the intended effect occurred. A committed action
+  whose effect did not happen was reported as completed, from the node the reference graph
+  labels "verify". `verify` now receives the envelope's declared `ActionPostcondition` — which
+  the old signature could not even see — and returns `VerificationOutcome::Verified`,
+  `CommittedUnverified { reason }`, or `Failed { reason }`. Verification requires evidence on
+  the receipt bound to the postcondition's digest; absence of evidence is reported as
+  committed-but-unverified rather than treated as success. The graph writes `verified`,
+  `committed`, and `result.verificationDetail` separately.
+- **adk-agent: `WebhookTrigger` has a trust boundary and a bounded lifetime.** The trigger
+  bound `0.0.0.0:<port>` and accepted every POST on its path — no signature check, no
+  authentication hook, no principal, no body policy — so any caller who could reach the port
+  could start application-defined agent work, and a malformed body was wrapped as a JSON
+  string and delivered as a trigger event indistinguishable from a deliberate one. It now
+  binds loopback by default, and serving any wider address requires a `WebhookVerifier`;
+  subscribing without one fails with `agent.ambient.webhook_unauthenticated` rather than
+  exposing an open trigger. Verified requests carry their principal on
+  `TriggerEvent::principal`. Rejections return a bare `401` with the reason logged, so the
+  endpoint cannot be used to probe which part of a credential was wrong. Bodies are capped
+  (1 MiB by default, `with_max_body_bytes`) and non-JSON bodies are rejected with `400`
+  unless `accept_non_json()` is set.
+
+  The HTTP listener also outlived its consumer: `axum::serve` was spawned with no shutdown
+  signal, so dropping the event stream left the port bound, accepting requests it could not
+  deliver and blocking a restart on the same port. The server's lifetime is now tied to the
+  subscription stream, which shuts it down gracefully on drop.
+- **adk-realtime: schema-drift warnings no longer log raw provider frames.** When a
+  recognized OpenAI realtime event failed to deserialize, the warning logged the first 300
+  bytes of the raw WebSocket text with no payload-recording opt-in and no redaction.
+  Realtime frames carry transcripts, tool arguments, tool results, and identifiers, so
+  provider schema drift could push conversation content into warning logs — at exactly the
+  moment operators widen log collection. The warning now reports `event_type`, the parse
+  error, `payload.bytes`, and a correlation `payload.digest`, with `payload.raw` set to
+  `<redacted>`. The new `record-payloads` feature on `adk-realtime` restores bounded raw
+  recording for diagnosis, matching the flag `adk-agent` already uses for trace payloads.
+- **adk-devtools: `bash` no longer inherits the agent's environment, and a timeout takes
+  descendants with it.** `BashTool` ran `sh -c` with only `current_dir` set. It never
+  called `env_clear`, so a model-directed command could read the parent environment — an
+  agent process routinely holds provider API keys — with nothing more than `env`. A
+  timeout called `start_kill` on the direct child, so anything `sh` had started (a
+  background build, a spawned server) kept running after the tool returned.
+
+  The command now receives only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `TERM`,
+  `USER`, and `SHELL`; `Workspace::inherit_env(true)` restores the previous behaviour and
+  `env_allowlist` replaces the set. The child leads its own process group and a timeout
+  signals the group, so descendants are killed too. Goal-mode `--until` checks in the CLI
+  run under the same policy, so a check cannot see credentials the agent cannot.
+
+  The surface is no longer described as sandboxed. A working directory is not an OS
+  boundary: `bash` can still use absolute paths and reach the network, and nothing limits
+  memory or CPU. The CLI help, README, and coding-agent docs now say what is enforced —
+  path containment for file tools, environment isolation, bounded output and time — and
+  what is not.
+- **adk-realtime: integrated ADK tools run through the policy pipeline, and plugin failures
+  fail closed.** The live `next_event` path called `RealtimeRunner::dispatch_tool_call`, which
+  invokes the `ToolBridgeAdapter` directly — the adapter builds a context and calls
+  `Tool::execute` with no plugin pipeline, no callbacks, and no confirmation. A tool controlled
+  in the standard agent loop therefore ran uncontrolled in realtime, and the richer
+  `execute_tool_with_plugins` was unreachable from the live path. ADK tools are now dispatched
+  through it; a name that is not a registered ADK tool falls through to native-handler dispatch,
+  making that bypass explicit rather than universal. The `before_tool_call` error branch also
+  logged "non-fatal" and then executed the tool anyway — authorization, redaction, and policy
+  live in before-tool plugins, so a broken guard became no guard. It now refuses the tool and
+  returns the failure to the model.
+- **adk-realtime: `RealtimeAgent` honours before-tool callback decisions.** The dispatch loop
+  built `(error_result, EventActions::default())` as a discarded expression statement and then
+  fell through to `tool.execute`, so a before-tool callback could neither deny a tool nor
+  substitute a result — it reported a decision that had no effect, which is worse than having
+  no gate, because the gate looked present. `Ok(Some(content))` now substitutes a result and
+  skips execution, `Err` refuses the tool and skips after-callbacks, and after-callback
+  substitutions and errors are applied instead of dropped by `let _ =`. This matches the
+  standard agent loop exactly.
+- **adk-realtime: realtime tools see the caller's scopes, secrets, and shared state.**
+  `RealtimeToolContext` implemented only the required trait methods, so `user_scopes()`
+  returned an empty list, `get_secret()` returned `None`, and `shared_state()` returned
+  `None`. A scope- or secret-checking tool therefore behaved differently in realtime than
+  under a `Runner`, and could not distinguish an unauthenticated caller from a context that
+  simply dropped the scopes. All three now delegate to the parent invocation context.
+- **adk-sandbox: filesystem isolation is reported as read and write separately, and the
+  Windows enforcer reports itself unavailable.** `EnforcedLimits::filesystem_isolation` was
+  set true whenever any enforcer was configured. The macOS Seatbelt profile denies network,
+  fork, and *writes* before re-allowing writes to configured paths — it never denies reads,
+  so sandboxed code could read host files outside the allowed paths while the capability
+  said the filesystem was isolated. Read-only entries in `allowed_paths` were effectively
+  documentation. The field is now `filesystem_write_isolation` and
+  `filesystem_read_isolation`, and macOS reports write isolation without read isolation;
+  the platform table and the Seatbelt description say so.
+
+  The Windows `probe` checked that `CreateAppContainerProfile` links, which proves the
+  platform API exists but not that the enforcer works — `configure_command` still returns
+  `EnforcerFailed` because container creation, ACLs, capabilities, and job-object cleanup
+  are unimplemented. A caller selecting an enforcer by probing would pick it and fail at
+  run time, so `probe` now returns `EnforcerUnavailable` naming AppContainer. The README,
+  sandbox docs, example README, and AGENTS.md no longer list AppContainer as supported.
+
+- **adk-sandbox: Rust compilation runs inside the boundary, policy env is applied, and the
+  isolation class is reported.** `ProcessBackend` compiled Rust source with a command
+  built outside `run_command` and awaited with `output()`, so the compile phase had no
+  enforcer wrapper, no request timeout, and no process group. Compilation is not inert —
+  `include_str!` reads files and procedural macros run arbitrary code — so a configured OS
+  policy did not cover the phase that could already touch the host, and a compiler that
+  blocked ran past the requested timeout. Compilation now goes through the same path as
+  execution.
+
+  `SandboxPolicy::env` was never applied; only `ExecRequest::env` reached the child, so a
+  policy that set variables silently supplied none. The policy now supplies defaults and
+  the request overrides them, which the documentation states.
+
+  New `ProcessBackend::isolation()` returns `IsolationClass::SubprocessOnly` or
+  `OsEnforced`, so a caller can tell what it is getting rather than inferring it from the
+  crate name; `default()` is subprocess-only.
+
+  Programs are also resolved to an absolute path against the caller's `PATH` *before* the
+  environment is cleared. A bare `python3`, `node`, or `rustc` previously required the
+  caller to put `PATH` into `ExecRequest::env`, which also handed the executed code
+  everything else on that `PATH`. The compile phase additionally receives toolchain
+  variables when set, because `rustc` cannot invoke a linker without them; that widening
+  is documented, and an enforcer is what constrains it.
+
+- **adk-core/adk-auth: secret access from tools is authorizable and audited.**
+  `SecretService` and `SecretProvider` received only a secret *name*. Once a provider
+  was attached to an invocation, policy collapsed to whatever the backing cloud
+  credentials could read: nothing distinguished a weather tool requesting its own API
+  key from the same tool requesting a payment or database secret, and the ADK layer kept
+  no record of the access.
+
+  New `adk_core::SecretRequest` carries the requested name plus the identity the
+  framework observed — tool, app, user, session, invocation — and an optional purpose.
+  `SecretService::get_secret_for` and `InvocationContext::get_secret_for` take it, both
+  defaulting to the previous name-only behaviour so existing implementations keep
+  compiling. `ToolContext::get_secret_for_purpose` lets a tool state why it needs a
+  secret.
+
+  The identity is not something a tool asserts: `LlmAgent` stamps the dispatched tool's
+  name onto the request from its own dispatch record, so a tool cannot present another
+  tool's identity. Every workflow wrapper forwards the described access, as with the
+  other context capabilities.
+
+  `adk_auth::secrets::authorizing::AuthorizingSecretService` enforces declarative
+  per-tool grants (exact names or a namespace prefix), denying everything until granted.
+  A denied name never reaches the provider, so it does not even appear as an attempted
+  read in provider-side logs. Every decision goes to `SecretAuditSink` and to tracing
+  with the outcome, name, tool, user, invocation, and reason — never a value.
+
+  One boundary remains: an agent invoked as a tool crosses a `ToolContext`, which
+  carries no identity of its own, so accesses inside that agent present the outer
+  agent's identity rather than the inner tool's. That is documented rather than papered
+  over.
+
+- **adk-auth: the secret cache is now bounded, revocable, and cleared.**
+  `CachedSecretProvider` stored values in an unbounded `HashMap` and checked the TTL
+  only when the same name was read again. Expired entries were never removed, a
+  rotated secret could not be dropped before its TTL elapsed, there was no capacity
+  limit, and values were not cleared on drop. The TTL therefore governed what the
+  cache *returned* while a value requested once stayed resident for the lifetime of
+  the process, and many distinct names could grow the cache without bound.
+
+  New controls: `with_max_entries` (default 128, least-recently-used eviction, `0`
+  disables caching), `invalidate`, `invalidate_all`, and `purge_expired`. Entries are
+  zeroized on drop, and `Debug` for the cache is redacted so a diagnostic print cannot
+  leak a value.
+
+  This shortens residency to roughly the TTL rather than closing the window: a
+  `String` may already have been reallocated, copied by the allocator, swapped, or
+  captured in a core dump. The documentation states that, and also states plainly that
+  the provider interface takes only a secret name — there is no per-tool grant or
+  access audit at the ADK layer, so the cloud credentials remain the real boundary.
+  Secret providers were previously absent from the official documentation entirely.
+- **adk-core/adk-memory: project-scoped memory no longer falls back to global
+  scope.** `add_session_to_project`, `add_entry_to_project`, and
+  `delete_entries_in_project` had default implementations that discarded `project_id`
+  and called their global equivalents, and `Memory::search_in_project` and
+  `Memory::add_to_project` did the same. A backend therefore compiled as
+  project-aware without implementing a single project method: the call succeeded
+  while operating in global scope, and neither the type system nor the return value
+  said so. Data intended for one project became visible to everything under the same
+  app and user, and a project-scoped delete removed entries outside the project.
+
+  Those defaults now return an error naming the method and the reason. Six built-in
+  backends (in-memory, SQLite, PostgreSQL, Redis, MongoDB, Neo4j) implement all four
+  project methods and now advertise `supports_project_scoping() == true`.
+  `GraphMemoryService` implements none of them and therefore refuses project calls it
+  previously answered in global scope — the behaviour change is the fix.
+  `MemoryServiceAdapter` reports the capability of the backend it wraps.
+- **adk-devtools: workspace containment was bypassable through symlinks.**
+  `Workspace::resolve` normalized a requested path lexically and checked
+  `starts_with(root)`. A symlink sitting lexically under the root satisfies that
+  check while pointing anywhere on the host, and ordinary file I/O follows it, so
+  `read_file`, `write_file`, and `edit_file` could reach host files outside the
+  advertised workspace. A symlinked parent directory redirected creation and writes
+  the same way. The existing containment test covered `..` traversal only.
+
+  Containment is now enforced against the resolved path: the deepest existing
+  ancestor of the target is canonicalized, resolving every link along the way, and
+  the result must still be inside the root. That covers both a symlinked final
+  component and a symlinked parent directory, including creation of a file that does
+  not exist yet under a redirected directory. A symlink whose target stays inside the
+  workspace keeps working, because repositories legitimately contain internal links
+  and refusing them would break ordinary work without improving containment.
+
+  This is a check, not a lock. A symlink planted between the check and the
+  subsequent open would still be followed; closing that window needs
+  descriptor-relative traversal with platform no-follow semantics, which the
+  documentation now states plainly.
+- **adk-server: UI routes bypassed configured authentication.** The session,
+  artifact, and debug routers received the authentication layer; `ui_api_router` was
+  merged without it. With an extractor configured, an unauthenticated caller could
+  create and mutate MCP-UI bridge state under any chosen `(app_name, user_id,
+  session_id)` tuple, poll another user's notifications, and list, read, or overwrite
+  globally registered UI resources — including replacing the HTML text of an existing
+  resource URI.
+
+  All `/api/ui/*` routes now carry the same authentication layer as the other
+  routers. Bridge handlers substitute the authenticated user for the user named in
+  the request body, so one authenticated caller can no longer address another's
+  bridge state. A registered UI resource records the user that registered it; only
+  that user may read or replace it, and a read of another user's resource answers 404
+  rather than disclosing that the URI exists.
+
+  Servers with no extractor configured are unchanged: there is no authenticated
+  identity to bind, so routes stay open and resources stay globally visible.
+
+- **Dependency advisories resolved.** Bumped `surrealdb` (optional `adk-rag`
+  backend) to 3.2.1, fixing GHSA-cc8f-fcx3-gpjr (high: arbitrary file read via
+  `DEFINE ANALYZER` mapper filter) plus four related medium advisories. Bumped
+  the OpenTelemetry stack (`opentelemetry`, `opentelemetry_sdk`,
+  `opentelemetry-otlp`) from 0.31 to 0.32 and `tracing-opentelemetry` from 0.32
+  to 0.33 in `adk-telemetry` and `adk-auth`, fixing GHSA-w9wp-h8wv-79jx
+  (unbounded memory allocation in W3C Baggage propagation).
+
+### Added
+
+- **adk-managed: managed state has a store seam that reports its own durability.**
+  `CheckpointManager` held events in a `Vec` and run state in a field while documenting
+  `checkpoint` as "atomically persist" with a guarantee that "replay will see a consistent view
+  after any crash", and describing a load as returning "everything needed to reconstruct a
+  session after a restart". Neither held: both operated on in-memory fields with no transaction
+  against any persistent store, so a crash lost event history, sequence position, parked-tool
+  state, and lifecycle status. The new `ManagedStateStore` trait carries a `Durability`
+  (`ProcessLocal` or `CrashDurable`) that a caller can check instead of inferring durability from
+  the presence of checkpointing. `InMemoryManagedStateStore` is the shipped backend, named as
+  such and reporting `ProcessLocal`; `CheckpointManager::with_store`, `flush`, and `restore`
+  connect a manager to one. A crash-durable implementation is not provided — the seam and the
+  honest reporting come first, so callers requiring resume-after-restart can detect its absence.
+
+- **adk-computer-use: governed computer-use orchestration crate.** First-party
+  ADK-Rust graph, wire contracts, scope authorization, cancellation bridge, and
+  tamper-evident evaluation receipts for the `computer-use-mcp` desktop-automation
+  server (the crate performs no actuation itself). Ships a deterministic
+  reference graph (parallel observation, digest-bound approval interrupts,
+  single-executor mutation, independent verification), a typed
+  `ComputerUseError` with an `AdkError` conversion, a portable `minimal_graph`
+  example, and a cross-platform `live_clipboard` example (macOS, Linux, Windows).
+- **adk-realtime: typed raw-audio submission through `RealtimeRunner`.**
+  `RealtimeRunner::send_audio_chunk` preserves `AudioFormat` through the provider-neutral
+  boundary, and the LiveKit input bridges now use it instead of forcing callers through
+  the base64 compatibility API.
+- **Reconnect-safe MCP resource notifications.** Applications can register a
+  `ResourceNotificationHandler` for resource and catalog updates. `McpToolset`,
+  Streamable HTTP clients, and `McpServerManager` retain the callback and
+  restore active subscriptions after connection or managed-process recovery.
+- **Current MCP client surface.** `McpToolset` now exposes `list_prompts`,
+  `get_prompt`, prompt and resource argument completion, resource subscribe and
+  unsubscribe, and the negotiated MCP task lifecycle. Public MCP catalog types
+  and the exact `rmcp` SDK version used internally are available through
+  `adk_tool::mcp`.
+- **Dynamic local MCP server registry.** `McpServerManager` can add, start,
+  update with rollback, enable, disable, remove, export, and atomically persist
+  local stdio server definitions while the application is running. Tool names
+  are prefixed with the server ID only when two servers publish the same name.
+- **Deterministic MCP manager example.** `examples/mcp_manager` now starts a
+  real Rust MCP child process and verifies discovery, tool execution, runtime
+  registry changes, persistence, and shutdown without Node.js, a model API key,
+  or network access.
+- **Official MCP documentation.** Added dedicated architecture, client,
+  dynamic-manager, server-authoring, security, and testing guides. The crate
+  README now uses versioned local binaries and deployment-owned remote URLs
+  instead of mutable package tags and unverified public endpoints.
+- **adk-acp: complete stable ACP v1 client/host surface.** Applications can now
+  supply opt-in `AcpFileSystem` and `AcpTerminal` callbacks, attach typed MCP
+  server configuration to new sessions, await asynchronous human permission
+  policy, and cancel an in-flight persistent prompt through a cloneable
+  `AcpCancellationHandle`.
+- **adk-acp server: per-session stdio MCP tools.** Client-supplied MCP servers
+  are validated, started in the session workspace with a bounded handshake,
+  exposed to `LlmAgent` and `CodeActAgent` through invocation-scoped toolsets,
+  and cancelled on close, delete, failed startup, or server shutdown.
+- **ACP examples and official documentation.** Added the vendor-neutral
+  `examples/acp_client_host` crate with deterministic workspace-boundary tests;
+  expanded the Kiro and server examples; and added dedicated architecture,
+  client, server, testing, security, and support-matrix documentation.
 - **adk-agent: `CodeAgent` — a CodeAct agent** (`codeact` feature) — a peer to
   `LlmAgent` that acts by writing and executing one code script per turn instead
   of emitting tool calls one at a time. Tools are exposed as callable functions;
@@ -134,16 +2340,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that renders live `bash` output and one-shot tool results (`read_file`, `grep`,
   `glob`) from a single event feed. Also runs as a console demo (`-- cli`).
 
-### Fixed
-
-- **adk-model: `turn_complete` on tool-call responses** (#401) — `deepseek` and
-  `openai_compatible` providers no longer set `turn_complete: true` when a
-  response carries tool calls; the turn continues until tool results are
-  processed. Adds `Content::has_function_calls()` to `adk-core`. Direct
-  `LlmResponseStream` consumers can now rely on `turn_complete` instead of
-  scanning for `Part::FunctionCall`.
-
-### Added
+- **adk-core: embedded-resource content part (issue #400).** New
+  `Part::EmbeddedResource` variant carries a complete resource — a source URI
+  plus inline text or binary contents — mirroring the MCP / ACP embedded-resource
+  block. Adds `EmbeddedResource` (untagged `Text` | `Blob`),
+  `TextResourceContents`, `BlobResourceContents`, and the
+  `Content::with_embedded_resource(..)` helper. `BlobResourceContents::new(..)`
+  is a checked constructor that rejects payloads larger than
+  `MAX_INLINE_DATA_SIZE` instead of truncating. The variant is additive: older
+  serialized `Content` values continue to deserialize unchanged, and existing
+  `Part::InlineData` construction sites are untouched.
+- **adk-acp: embedded-resource prompt content.** A new shared `content` module
+  (`block_to_part` / `part_to_block`) maps ACP `ContentBlock`s to `adk_core::Part`
+  in both directions. The server prompt parser and streamer route through it, so
+  `@`-mentioned file context arrives as a `Part::EmbeddedResource` and ADK
+  embedded-resource content streams back as an ACP embedded-resource block. Text
+  resources are preserved verbatim; binary resources are base64-encoded on the
+  wire and decoded to raw bytes internally. The server now advertises the
+  `embedded_context` prompt capability.
+- **adk-acp: usage updates.** The server emits a `SessionUpdate::UsageUpdate`
+  derived from ADK usage metadata (token counts, and cost in USD when reported).
+  Events without usage metadata produce no update, and counts are never
+  fabricated.
+- **adk-acp: richer tool-call updates.** `ToolCallUpdate` now carries the tool
+  result `content`, affected file `locations` (from a reported `path` string or
+  `paths`/`locations` arrays), and a tool `kind` inferred from the tool name,
+  while preserving the existing tool-call identifier correlation between a
+  `ToolCall` and its later `ToolCallUpdate`.
+- **adk-acp: `session/load` with history replay.** The server implements
+  `session/load`: it reactivates a persisted session (validating the supplied
+  `cwd` like `session/resume`), then reads the stored events and replays each
+  user, agent, thought, and tool event as an ordered `session/update`
+  notification in original chronological order before completing the request.
+  The server advertises the `load_session` capability. A load for an unknown
+  session returns a session-not-found error, and a mismatched working directory
+  is rejected rather than reattached.
+- **adk-acp: multimodal prompt content.** The server accepts image and audio
+  prompt content blocks, mapping each to a `Part::InlineData` that preserves the
+  MIME type and decoded bytes, and advertises the corresponding `image` and
+  `audio` prompt capabilities alongside `embedded_context`. Prompt content of a
+  type the server has not advertised is rejected with a descriptive error. The
+  client prompt path now transmits non-text ADK content (embedded-resource,
+  image, audio) as the matching ACP content block rather than dropping it.
+- **adk-acp: server-side permission bridge.** When the ADK Runner pauses on a
+  `ToolConfirmationRequest` during a prompt turn, the server now maps it to an
+  ACP `session/request_permission` request describing the tool and its
+  arguments, awaits the client's outcome, and resumes execution with the mapped
+  decision fed back through `RunConfig::tool_confirmation_decisions`, correlated
+  by function-call id (allow → approve, deny/cancel → deny). The nested request
+  is issued from the spawned prompt task, so the outer prompt response still
+  completes — the earlier concern that the official Rust SDK loses the outer
+  response after a nested request does not reproduce with this pause/resume
+  flow, and the stale limitation note has been removed.
+- **adk-acp: client-direction tool-update and usage fidelity.** The client
+  streaming surface (`OutputChunk`) now surfaces an External_Agent's
+  `ToolCallUpdate` as `OutputChunk::ToolUpdate` (id-correlated, with status,
+  kind, title, extracted content text, and affected file locations) and its
+  `UsageUpdate` as `OutputChunk::Usage` (tokens used/size, plus cost and
+  currency when reported), in addition to the existing text, thought, and
+  tool-call surfaces. Agent message text is surfaced unchanged.
+- **adk-acp: `examples/acp_full_protocol` reference crate.** A new no-API-key,
+  `Runner`-backed `AcpServer` reference example that exercises the full Phase 2
+  server-direction surface in-process. It ships a deterministic `ScriptedAgent`
+  (no LLM) plus a confirmation-gated `delete_file` tool, and a validating test
+  drives the server through the official `agent-client-protocol` SDK over an
+  `Channel::duplex()` transport — covering embedded-resource prompts,
+  image/audio multimodal prompts, the permission bridge (allow/deny), a
+  `session/load` replay-ordering check, and `UsageUpdate` / `ToolCallUpdate`
+  surfacing — so Phase 2 regressions are caught without a subprocess or model
+  credentials.
+- **adk-acp: session modes and configuration options.** A new `SessionControls`
+  provider trait lets an agent declare session modes (e.g. "ask" / "code") and
+  configuration options (selects, toggles), wired through
+  `AcpServerConfigBuilder::session_controls`. The server advertises the declared
+  modes and options — and only those — in `session/new`, `session/load`,
+  `session/resume`, and `session/fork` responses, and implements `session/set_mode`
+  and `session/set_config_option`: a known value is validated, recorded, and
+  echoed back as a `CurrentModeUpdate` / `ConfigOptionUpdate` notification, while
+  an unknown mode, unknown option, or invalid value is rejected and leaves state
+  unchanged. Selections persist in ADK session state (`acp:mode`,
+  `acp:config:<id>`) so they survive load / resume / fork. An agent that declares
+  no controls advertises no modes and no options, preserving capability accuracy.
+- **adk-acp: `session/fork`.** The server implements `session/fork`, branching a
+  persisted session into a new session id whose stored history is a copy of the
+  source's, carrying over the relevant state (`cwd`, additional directories,
+  mode, config) while leaving the source session's persisted history unchanged.
+  A fork for an unknown session returns a session-not-found error. The server
+  advertises the `session.fork` capability.
+- **adk-acp: available-commands and session-info updates.** On session
+  activation (create / load / resume / fork) the server emits a
+  `SessionUpdate::AvailableCommandsUpdate` for any commands the agent's
+  `SessionControls` declares (and none when it declares none), and a
+  `SessionUpdate::SessionInfoUpdate` carrying the session title when one is
+  recorded (`acp:title`, set via `set_session_title`). A `Plan` `SessionUpdate`
+  mapping exists but stays dormant until an ADK plan primitive surfaces plan
+  entries, so no plan update is emitted today.
 
 - **adk-realtime: GA realtime providers + integration tool dispatch** — OpenAI
   `gpt-realtime` and Gemini Live wired end-to-end through
@@ -253,7 +2544,542 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loop) — each a real agent that self-verifies by running the produced code.
   - Design: `docs/design/coding-agent.md`; guide: `docs/official_docs/coding-agent/`.
 
+### Changed
+
+- **The Runner-level context cache is documented as experimental.**
+  `RunnerConfig::context_cache_config` and `cache_capable` drive Gemini's explicit
+  `cachedContents` API from the Runner. That API requires the cache to **replace**
+  `system_instruction`, `tools`, and `tool_config`; sending a cache alongside any of them
+  is rejected with `INVALID_ARGUMENT`. The Runner selects a cache before the agent
+  resolves its tools, so it cannot assemble that request, and enabling these fields does
+  not produce cache hits. Both default to unset and prompt caching needs no Runner
+  configuration — Anthropic and Bedrock cache by default, OpenAI caches server-side, and
+  Gemini caches implicitly on 2.5/3.x — so no supported configuration changes behavior.
+  The Runner reference now states this, and guaranteed caching for Gemini is deferred to
+  the model integration where the other providers already handle it.
+- **OpenAI integrations now use `async-openai` 0.41.** Chat Completions,
+  Responses, and Realtime integrations adopt the current 0.41 types and
+  transport dependencies.
+- **Toolchain pinned to Rust 1.95.0.** `rust-toolchain.toml` is now the single source: rustup
+  reads it locally and devenv reads the same file through `languages.rust.toolchainFile`, so a
+  devenv shell and a plain `cargo` invocation cannot drift. The workspace resolver moves to `3`
+  and `rust-version` to `1.95`; `Cargo.lock` is unchanged by the resolver bump. Five new 1.95
+  clippy lints are fixed — three `collapsible_match`, one `iter_kv_map`, and one `sort_by_key`
+  that needed `Reverse` because the sort is descending. 1.95 also clears the AWS SDK MSRV floor,
+  so `cargo update` no longer breaks the `bedrock` feature.
+
+- **MCP now uses official `rmcp 2.2` and MCP `2025-11-25` protocol types.**
+  ADK-Rust re-exports its aligned SDK for advanced transports and server
+  authoring. Sampling remains an opt-in deprecated-compatibility feature under
+  upstream SEP-2577. Downstream code that names `rmcp 1.x` content, elicitation,
+  or service types directly must migrate those annotations or import aligned
+  types through `adk_tool::mcp::rmcp`.
+- **MCP HTTP configuration is now effective.** Request timeouts, custom headers,
+  custom API-key headers, bearer or fixed client-credentials tokens, and bounded
+  expired-session recovery are applied to the Streamable HTTP client.
+- **MCP approval semantics are documented precisely.** `autoApprove` remains a
+  round-tripped configuration-compatibility field; it is not interpreted as
+  ADK-Rust authorization or human approval policy.
+- **adk-acp now uses the official `agent-client-protocol` 1.2 SDK while
+  negotiating stable wire protocol v1.** The client and server share the SDK's
+  typed JSON-RPC connection rather than maintaining a parallel wire model.
+- **ACP capability publication is now exact.** Unsupported media, remote
+  transports, and optional protocol features remain unadvertised. Stdio MCP is
+  accepted as required by stable v1; optional HTTP and SSE MCP are sent by the
+  client only when the external agent advertises them.
+- **ADK agent tool confirmation can be resolved live.** `RunConfig` accepts an
+  asynchronous `ToolConfirmationHandler`, and allow-once decisions are keyed by
+  exact function-call ID rather than tool name.
+
 ### Fixed
+
+- **adk-session: the Vertex AI backend follows the Session API wire contract and
+  preserves complete ADK events.** Create and append requests now send the
+  GA `v1` `Session` and `SessionEvent` bodies directly, create/delete operations
+  are polled to completion with bounded backoff, list filtering uses `user_id`,
+  caller-supplied logical session IDs retain the core identity rules, and their
+  deterministic derived remote IDs follow the service validation rules.
+  Canonical Vertex content preserves text, thought signatures, inline/file
+  data, top-level media `displayName`, function calls/responses, and bounded
+  `mediaResolution` objects through its sidecar. GA `v1`
+  function-call/response IDs and empty or noncanonical Base64 thought-signature
+  bytes use lossless raw persistence because their canonical proto messages
+  cannot preserve those values. `rawEvent` exposes Google ADK-compatible replay
+  fields and stores the complete Rust event under the versioned `_adkRust`
+  envelope. Arbitrary Struct values remain opaque and retain every original
+  key/value when the reserved envelope is removed; malformed pre-existing
+  `_adkRust` values fail closed, and incompatible Google-shaped projections
+  fall back to opaque preservation. Logical session IDs are isolated by the
+  complete app/user/session identity through deterministic remote IDs and a
+  protected state marker.
+  Without a fixed engine, `app_name` must be a canonical nonzero numeric engine
+  ID; fixed shared engines require an explicit per-app opt-in before accessing
+  unmarked pre-v2 sessions. Vertex user IDs are limited to 128 Unicode scalar
+  values. Global and multi-region locations use their documented endpoints,
+  custom endpoints are origin-only and redirect-disabled, and create/delete
+  long-running-operation responses validate their GA protobuf `Any` type URLs.
+  Encoded request bodies, decoded response bodies, and aggregate pagination
+  default to 64 MiB byte budgets, complete pagination has a 120-second deadline,
+  nested JSON/Vertex Struct values are bounded, and recent-event
+  limits/timestamp filters are applied server-side. Transport failures and
+  unresolved polling or successful-response validation after mutation
+  transmission return non-retryable create/delete/append outcome-ambiguity
+  codes with reconciliation guidance. Terminal LRO errors remain known
+  `operation_failed` results with category-derived retry hints. Proto3-omitted
+  empty optional scalars and Struct-normalized schema version `1.0` restore
+  exact private scalar presence; safe integer/double-normalized Vertex Struct
+  values compare semantically without discarding preserved canonical
+  extensions.
+  **Breaking:** `VertexAiSessionService::with_credentials()` now returns
+  `Result<Self>` because endpoint validation and bounded HTTP-client construction
+  can fail.
+  `vertex-session` is now available through the `adk-rust` umbrella crate and
+  joins the PR feature-coverage gate.
+- **adk-acp: session replay preserves message roles and multimodal content.**
+  `session/load` now emits stored user content as `UserMessageChunk` and
+  model/agent content as `AgentMessageChunk`. Image and audio bytes, file
+  references, embedded resources, and multimodal function results use their
+  native ACP content blocks instead of disappearing during replay. Inbound
+  Base64 binary content is bounded before decode allocation and checked against
+  the core 10 MiB limit after decoding. Outbound URI-less inline data maps only to
+  matching `image/*` and `audio/*` ACP blocks instead of mislabeling other MIME
+  types as images. The load regression test specifies expected roles and
+  ordering independently of the production mapper.
+- **adk-agent: automatic tool dispatch now requires both safety signals.**
+  `ToolExecutionStrategy::Auto` previously ran every read-only tool concurrently
+  without consulting `is_concurrency_safe()`. A read-only tool backed by a
+  stateful cursor, cache, or non-thread-safe client could therefore race. `Auto`
+  now includes a call in its concurrent subset only when the selected tool is
+  both read-only and concurrency-safe, then executes the remaining calls
+  sequentially. `Parallel` remains an explicit caller override that bypasses
+  metadata, with caller-owned safety.
+- **adk-runner: `SandboxRunner::run` runs the agent instead of reporting a completed run that
+  did nothing.** The method provisioned the workspace, started a session, bound tools, then
+  executed a placeholder future and returned `Ok`. It now drives the inner `Runner` with the
+  bound sandbox tools injected through `RunConfig::runtime_toolsets`, returns the buffered events,
+  snapshots the live workspace when configured, and always stops the sandbox before returning.
+  Identity validation happens before side effects; session creation occurs only for a structured
+  not-found result; and execution, snapshot, and stop failures follow deterministic precedence
+  with later cleanup failures retained as error metadata. **Breaking:** `SandboxRunner::run` takes
+  a `user_content: Content` argument — an agent loop cannot run without input — and
+  `SandboxRunResult` now includes the emitted events.
+- **adk-runner: `Runner::run_with_config` supplies a per-invocation `RunConfig`.** Needed for
+  tools that exist only for the duration of one run. `Runner::run` delegates to it with `None`.
+  New accessors expose the runner's application name, session service, and base run config.
+- **adk-session: missing sessions have one structured contract across every backend.**
+  `SessionService::get` returns `session.not_found` with the `NotFound` category only when a
+  valid `(app_name, user_id, session_id)` identity has no matching record. SQLite and PostgreSQL
+  use `fetch_optional`, so query failures are no longer misreported as missing sessions. The
+  Firestore backend also verifies the stored user before returning a session.
+- **adk-server: `message/stream` drives the agent instead of emitting synthetic events.**
+  The handler created a task, transitioned `Working` then `Completed`, and never invoked the
+  Runner, so a streaming client received a task that reported success and produced no output.
+  It now streams `TaskArtifactUpdateEvent`s as the agent produces them, keyed to one artifact ID
+  with `append`/`lastChunk` derived from each event's `partial` flag, and reports `Failed` when
+  the agent errors. The joined text is persisted so a later `tasks/get` returns what was
+  streamed. `tasks/resubscribe` is documented as the snapshot it is rather than implying a live
+  re-attach.
+- **adk-server: `--features a2a-v1` passes clippy and is gated by CI.** No workflow built the
+  feature, so 11 `collapsible_if` failures had accumulated in the A2A v1 surface unseen.
+  `adk-server --features a2a-v1` joins the feature-coverage matrix.
+
+- **adk-auth: the `sso` feature compiles and is gated by CI again.** No workflow built
+  `adk-auth --features sso`, so its SSO/OAuth surface had drifted out of the clippy gate and
+  failed `-D warnings` on four `collapsible_if` lints. `jsonwebtoken` moves to 11, whose
+  `Algorithm` is `#[non_exhaustive]`; the validator now rejects unrecognised algorithms rather
+  than matching exhaustively. `adk-auth --features sso` joins the feature-coverage matrix.
+
+- **adk-sandbox: sandboxed compilation uses the caller's toolchain.** The compile phase passed
+  `RUSTUP_HOME` and `CARGO_HOME` into the sandbox but not `RUSTUP_TOOLCHAIN`. `rustc` on `PATH` is
+  usually a rustup shim, so without it the shim ignored the caller's selection and resolved
+  `rust-toolchain.toml` instead — compiling with a different toolchain than intended, or, when the
+  pinned one is not installed, attempting a download that the sandbox's network denial blocks. That
+  surfaced as `info: syncing channel updates for …` reported as a compile failure.
+
+- **adk-sandbox: the Linux bubblewrap enforcer is selectable again.** `LinuxEnforcer::probe` ran
+  `bwrap --unshare-user -- /bin/true` with no bind mounts. bwrap gives the new namespace an empty
+  root, so `/bin/true` did not exist inside it and `execvp` failed — which the probe reported as
+  "user namespaces are not available. Check that `kernel.unprivileged_userns_clone` sysctl is set
+  to 1". The check therefore failed on **every** host, including hosts where bubblewrap works
+  perfectly, so `get_enforcer()` never returned the bubblewrap enforcer: Linux ran with no
+  OS-level sandbox while the documentation advertised one, and the diagnostic pointed operators at
+  a sysctl that was never the cause. The probe now binds the root filesystem, so it tests what it
+  claims to.
+- **adk-sandbox: the bubblewrap argument property tests compile.** `bwrap_args_property_tests.rs`
+  used an inline `{args:?}` capture inside `prop_assert_eq!`, which expands through `concat!` and
+  cannot capture. The file is both `cfg(target_os = "linux")` and behind the `sandbox-linux`
+  feature, so no build ever compiled it and the failure went unnoticed; the bwrap argument
+  construction had no executing test coverage on the only platform where it runs.
+- **adk-graph: functional `TaskContext::interrupt` can be resumed with a typed value.** The method
+  emitted an event, saved a checkpoint, recorded an `__interrupt__` task, and then always returned
+  `InterruptTypeMismatch { message: "workflow interrupted" }` — its own comment deferred
+  suspension and resumption to future work, and nothing outside the method consumed a resume
+  value. The signature promised typed resumption that could not occur. Each interrupt site now
+  gets a continuation key from its position in the run (`interrupt-1`, `interrupt-2`, …), reported
+  in the new `FunctionalError::Suspended` and written to the checkpoint as `continuation_key`.
+  `TaskContext::with_resume_values` supplies values by key, and an interrupt whose key is present
+  returns the deserialized value at the call site. `InterruptTypeMismatch` now means what its name
+  says: the supplied value did not deserialize into the expected type.
+- **adk-agent: an ambient agent invokes the agent, delivers its output, and does not serialize
+  triggers.** `AmbientAgent::start` succeeded without a trigger handler and then only logged each
+  event, so `AmbientAgent::new(..).start()` appeared to run an agent that was never invoked; it
+  now fails with an error naming what is missing. Events and errors the agent produces are
+  delivered through `take_output(capacity)` instead of being logged at debug level and dropped.
+  Triggers are dispatched under `with_max_concurrent_triggers` (default 4) rather than one at a
+  time — the loop previously drained a handler's entire event stream before polling the source
+  again, so one slow trigger blocked every later one. Durable offsets, dead letters, and retry
+  remain the caller's responsibility and are documented as such.
+- **Release statements are checked against one source.** The workspace version, the changelog
+  heading, the README release banner, and the README roadmap's "current" marker were
+  maintained independently. `scripts/check-doc-versions.sh` skips `CHANGELOG.md` and never
+  looked at the banner or the roadmap, so nothing detected drift between them. The new
+  `scripts/check-release-consistency.sh` derives all three from the workspace version and runs
+  in the PR-tier `templates` job. Its `--release` mode additionally requires a `v<version>` tag so a
+  published artifact can be attributed to an exact commit; outside release mode it reports the
+  commit a release would be cut from. There is currently **no `v2.0.0` tag**, which is why a
+  defect cannot be attributed to the published artifact from this repository alone.
+- **adk-managed no longer described as durable.** The crate README, crate docs, root README,
+  and AGENTS.md called managed execution durable, and the README claimed sessions "survive
+  process crashes with zero event loss". Checkpoints, the agent registry, and active sessions
+  are held in memory: they support replay and resume within a process and do not survive
+  process loss. The "atomic checkpoint persistence" wording is corrected too — it is a single
+  assignment under a lock, not a transaction with a persistent store.
+- **adk-model: content parts a provider cannot carry are recorded, not silently dropped.**
+  The Bedrock converter returned `None` at five sites — one carrying the comment
+  `// Unsupported MIME type — skip silently` — so audio, video, arbitrary binary, some file
+  references, unsupported embedded blobs, and Gemini-specific server-tool parts vanished on
+  the way to the model. A request could reach the provider without material the caller
+  supplied, and the model could answer as though it had seen a document it never received.
+  The new `adk_model::part_conversion` module classifies every part as `Converted`,
+  `Downgraded`, or `Omitted`, warns as each loss is recorded, and offers
+  `ConversionReport::into_error` for callers that must fail before dispatch rather than send
+  an incomplete request. `adk_model::bedrock::convert::report_for_contents` exposes the
+  outcome without issuing a request. Accounting is complete by construction: a part that
+  leaves an adapter with no recorded fate is reported as an unexplained omission.
+- **adk-graph: an action node whose backend does not exist is rejected when the graph is
+  built.** Database actions validated a connection and then returned an error explaining
+  that no driver is integrated; email monitor and send did the same; JavaScript and
+  TypeScript code execution is a placeholder; and a node needing an unenabled feature
+  failed the same way. A workflow could deserialize, validate, and compile, then fail
+  only when that node executed — after earlier nodes had already had their side effects.
+
+  `Node::validate` is a new defaulted trait method, and `StateGraph::compile` calls it
+  for every node, so an unavailable configuration is refused up front with the node name
+  and the reason. `ActionNodeExecutor` reports database nodes, email nodes, JS/TS code
+  nodes, and feature-gated nodes whose feature is off. Rust code nodes and every
+  implemented action are unaffected. A custom node can take part by overriding
+  `validate`. The node-type table in the docs now marks what is not implemented instead
+  of listing it as available.
+- **adk-graph: an agent inside a graph keeps the caller's runtime.** `AgentNode` built a
+  `GraphInvocationContext` from scratch for every run: it hardcoded
+  `user_id = "graph_user"`, `app_name = "graph_app"`, and branch `main`, used a default
+  `RunConfig`, returned `None` for artifacts and memory, and let every optional
+  capability fall back to its default — so secrets, shared state, cancellation, scopes,
+  and request metadata all disappeared. An identity-dependent tool saw a synthetic
+  principal inside a graph and the real one outside it, and `Runner::interrupt` could
+  not reach an agent running as a node.
+
+  `ExecutionConfig::with_parent_context` carries the invocation into the graph, and
+  `GraphAgent` sets it automatically, so identity, scopes, request metadata, secrets,
+  memory, artifacts, shared state, cancellation, and `RunConfig` all reach the agent.
+  The branch is deliberately *derived* as `{caller_branch}.{agent_name}` so a node's
+  events stay attributable. A graph invoked directly, with no parent, keeps the
+  synthetic identity — that is now an explicit standalone mode rather than the only
+  behaviour. Node conversation history remains scoped to the node's own graph session.
+
+- **adk-graph: `TimeTravelHandle::replay` is renamed to `state_history`.** Its rustdoc
+  said it "re-executes the graph", and the module described replaying. The
+  implementation listed checkpoints, sorted and filtered them, and returned stored
+  `(step, state)` pairs — it never invoked a node. Callers could have treated stored
+  snapshots as a fresh replay. The method now says what it does: it reads checkpoints
+  and executes nothing, and `fork_at` plus a normal invoke is the way to actually re-run
+  from a point in history. `adk graph replay` keeps its name but no longer claims to
+  replay; its output states that nothing was re-executed.
+- **adk-managed: sessions belong to an owner, and ignored environment configuration is
+  refused.** `start_session` named its environment argument `_env` and never read it, so a
+  caller supplying environment variables or a working directory received a session that
+  silently ignored them. Every session was also persisted under the constants `managed` /
+  `managed_user`, and the session loop repeated them for each Runner call, so all managed
+  sessions shared one logical namespace: lookup, memory, and deletion could not be scoped to a
+  caller and no session could be attributed to one. `start_session` now requires a validated
+  `ManagedOwner`, persists the session under it, and makes Runner calls with it;
+  `EnvironmentConfig` requesting anything is rejected with an explanation, because sessions run
+  in-process and applying it would mutate state shared with every other session.
+- **adk-managed: deleting a session now deletes its persisted conversation.**
+  `delete_session` archived the session, cancelled its loop, and dropped the in-memory
+  handle, but never called `SessionService::delete` — even though `start_session` had seeded a
+  persistent session that the Runner appended every turn to. The API reported deletion while
+  the conversation remained in the configured backend, outliving the process that deleted it.
+  The identity used at creation is now recorded on the session and used for deletion, so a
+  change to session addressing cannot orphan data. If backend deletion fails, the error names
+  the app, user, and session that still hold data.
+- **adk-managed: session status reflects normal execution, not only control-plane calls.**
+  `ActiveSession` owned the `Arc<RwLock<SessionStatus>>` that `ManagedAgentRuntime::status`
+  reads, while `SessionLoop` owned a separate plain field, despite a comment claiming the two
+  were shared. Queued → running → idle transitions updated only the loop's copy, so a session
+  actively executing turns kept reporting `Queued`; only pause, resume, archive, and deletion
+  moved the public value. The loop now writes to the caller's handle via
+  `SessionLoop::with_shared_status`.
+
+- **adk-realtime: integrated sessions actually receive the history and memory they load.**
+  `IntegratedRealtimeRunner::connect` fetched the prior session into `_session` and dropped it,
+  and the memory branch logged "injecting memory entries into session context" next to a
+  comment saying injection was a future enhancement. A resumed session began with neither the
+  history nor the memory the builder implies, while the logs reported otherwise. Both are now
+  rendered into one bounded block and prepended to the system instruction before the provider
+  session is created, governed by `max_memory_injection` and the new `max_history_injection`.
+  `IntegratedRealtimeRunner::instruction()` and `RealtimeRunner::instruction()` expose what a
+  session was created with, so carried context can be asserted instead of inferred from logs.
+- **adk-realtime: `max_concurrent_tools` is enforced, and tools no longer stall the event
+  loop.** The field defaulted to 4 and was read by nothing — no semaphore, no scheduler.
+  `FunctionCallDone` was awaited inline in `handle_event`, which the run loop awaited before
+  reading the next event, so tool calls ran strictly one at a time and blocked audio,
+  transcripts, and interruptions for the full duration of each call. Tool calls are now
+  dispatched onto the run loop under a semaphore sized by `max_concurrent_tools`, so event
+  intake continues while tools run. The single follow-up `create_response` owed after
+  automatic tool output is now issued once both the dispatching response has closed and
+  every dispatched tool has reported, in either order — previously the ordering was implicit
+  in the inline await and would have been lost.
+- **adk-realtime: transport loss is distinguishable from a graceful close.**
+  `EventHandler::on_disconnect` is called when the provider transport ends, before `run`
+  returns. `run` returns `Ok(())` for both cases, so a caller previously could not tell
+  them apart. The runner still does not reconnect automatically; the policy is documented.
+
+- **adk-server: background runs execute a workflow instead of reporting success.**
+  `BackgroundRunner::run_with_timeout` received neither the workflow ID nor the input. It
+  checked cancellation and returned `Completed` with an empty object, so a client got a
+  completed status for work that never ran — and because the placeholder could not fail,
+  the retry budget was never exercised by anything.
+
+  A run now goes through a `WorkflowExecutor`, which resolves the `workflow_id` and
+  receives the input and the cancellation token. `WorkflowRegistry` provides a
+  closure-based implementation. Submitting an unregistered workflow returns 404 instead
+  of queuing a run that can never execute, and a run submitted with no executor
+  configured **fails** rather than reporting completion. Retry re-executes from the
+  beginning with the original input; the documentation previously claimed it resumed from
+  the last checkpoint, which nothing implemented, and now says what it does. Run records
+  remain in-memory and are lost on restart, which the docs now state rather than implying
+  durability.
+
+- **adk-server: a cron occurrence is claimed once.** Due detection used
+  `last_execution.unwrap_or(created_at)`, and under the `Queue` policy scheduling state
+  advanced only when a run *started*. An occurrence waiting behind an active run
+  therefore stayed due and was enqueued again on every one-second poll, turning one
+  schedule point into many runs. When the active run finished, its monitor started one
+  queued run without creating a monitor for it, so `active_run_count` stayed nonzero for
+  good and every later `Skip` and `Queue` decision was stuck.
+
+  `due_occurrences` now reports the exact schedule point, `claim_occurrence` takes it
+  atomically under one write lock, and the scheduler acts only on a won claim. Every run
+  — including one taken off the queue — goes through the same monitored path, which now
+  follows the whole chain and releases the active slot even if a run record disappears.
+
+- **adk-server: `GET /cron/{job_id}` is mounted.** The module documented the endpoint and
+  a store `get` existed, but only PATCH and DELETE were routed, so clients had to list
+  every job and filter locally.
+- **adk-model: DeepSeek requests now carry a response format when a schema is set.**
+  `DeepSeekClient::build_request` read temperature, top-p, token limits, tools,
+  thinking, and reasoning effort, but always sent `response_format: None` — even with
+  `GenerateContentConfig::response_schema` present — while the provider module
+  advertised structured JSON output. Native enforcement was never requested, so
+  structured turns relied entirely on the agent's textual instruction and could cost
+  extra retries.
+
+  A response schema now enables DeepSeek's JSON Output
+  (`response_format: {"type": "json_object"}`), which is the only mode the API
+  supports; there is no `json_schema` variant, so the schema itself remains enforced
+  by the agent's validation and the module documentation now says so rather than
+  implying provider-side schema enforcement. DeepSeek also requires the word "json"
+  to appear in the prompt when JSON Output is on, or the API can return empty
+  content, so the adapter adds that mention when the conversation does not already
+  contain it.
+- **adk-agent: tool progress is bounded.** Each tool batch created a
+  `tokio::sync::mpsc::unbounded_channel`, and `emit_progress` sent into it with no
+  backpressure and no aggregate limit. A tool producing output faster than the
+  client consumed it — a compiler log, a shell command, a runaway loop — grew the
+  queue until it was drained or the process ran out of memory, and a slow SSE
+  consumer made it worse.
+
+  The queue is now bounded at 256 events, a chunk is capped at 8 KiB (truncated on
+  a character boundary, so multi-byte text is never split), and a call may forward
+  1 MiB of progress in total. A tool that outruns its consumer waits up to 100 ms
+  for space and then drops the chunk, so a stalled consumer slows the tool briefly
+  but can never stall it indefinitely. Whenever output is dropped, exactly one
+  progress event carrying `[adk: tool progress truncated]` is emitted for that
+  call, so a gap is visible rather than silent. Final tool results are unaffected.
+- **adk-core/adk-agent: tool approvals are scoped to one exact call.** Live
+  decisions from a `ToolConfirmationHandler` were tracked by function-call ID, but
+  static decisions in `RunConfig::tool_confirmation_decisions` were looked up by
+  **tool name**. One `delete_file` approval therefore authorized every
+  `delete_file` call evaluated against that map, whatever its arguments, and two
+  calls to the same tool in one turn could not receive different decisions. A
+  decision intended for one action could be replayed onto a materially different
+  one, which weakens the authorization boundary precisely in the resumed and
+  web-driven flows that rely on the static map.
+
+  Static decisions are now keyed by function-call ID, matching the live path and
+  the ID already reported on `ToolConfirmationRequest`. An unrecognized key means
+  "no decision", so the call stays pending rather than executing.
+
+  The new `RunConfig::tool_confirmation_fingerprints` optionally binds a decision
+  to the arguments it was granted for, using the new
+  `adk_core::tool_call_fingerprint`. This defends the case where a call ID is
+  replayed with different arguments after a round trip through something
+  untrusted, such as a browser. A mismatch is treated as unconfirmed. The
+  fingerprint is canonical over object key order, so re-serialized arguments still
+  match.
+
+  Consumers updated to the call-keyed contract: `adk-acp`'s permission bridge
+  (whose own module documentation already claimed call-level correlation while the
+  code keyed by name), and both confirmation gates in `adk-agent`'s CodeAct agent.
+- **adk-runner: runs and persistence writes are keyed by full identity.** Two
+  defects with the same root cause — the identity triple was resolved and then
+  discarded.
+
+  Active runs were tracked in a `HashMap<String, CancellationToken>` keyed by the
+  raw session ID. Because a session ID is only unique within an app and user,
+  `(app-a, user-a, shared-id)` and `(app-b, user-b, shared-id)` collided inside one
+  `Runner`, and two concurrent runs for one identity overwrote each other's token.
+  The drop guard then removed the key unconditionally, so a finishing run could
+  deregister a different run that was still going. Runs are now keyed by a unique
+  run ID carrying the full identity, and cleanup removes only the entry it
+  inserted. `Runner::interrupt(session_id)` now cancels every run for that session
+  rather than whichever registered last; the new `Runner::interrupt_identity`
+  targets one exact identity, and `Runner::active_runs` reports identities.
+  Registration was also eager while cleanup was lazy inside the stream generator,
+  so a stream dropped before its first poll leaked its registration permanently;
+  the guard is now created eagerly.
+
+  Separately, the Runner resolved sessions with the full triple but persisted every
+  event through `append_event(session_id, event)`. All five write sites now use
+  `append_event_for_identity`, so a backend whose natural key is composite can bind
+  each event to its tenant.
+- **adk-graph: checkpoints recorded finished work as pending, and streamed runs
+  never checkpointed at all.** Three defects in `PregelExecutor`:
+
+  1. `run` saved its checkpoint *before* advancing the frontier, so the stored
+     `pending_nodes` were the nodes that had just completed. Resuming re-executed
+     them and re-applied their updates, which is wrong for any node that is not
+     idempotent — counters, accumulators, appends, and external side effects.
+     Checkpoints are now written after the frontier advances, and a finished run
+     records an empty frontier so resuming a completed thread returns the final
+     state instead of restarting the graph. Interrupts deliberately keep saving
+     the executing frontier, because an interrupted node still owes its updates.
+  2. `run_stream` saved no checkpoints, and its interrupt path returned without
+     saving one — so a streamed run could not be resumed and a streamed
+     human-in-the-loop interrupt was unrecoverable. Streamed runs now checkpoint
+     on the same schedule as blocking runs, including on interrupt.
+  3. In `StreamMode::Messages` the executor drained `execute_stream` for events
+     and then called `execute` again to obtain state updates, running every node
+     twice per super-step. For `AgentNode` that meant two billed model calls per
+     node, and the streamed tokens came from a different execution than the state
+     that was kept. Nodes now report their updates on the stream as
+     `StreamEvent::Updates`, and the executor applies those from the single
+     execution.
+
+  `Node::execute_stream` therefore carries a new contract: an implementation must
+  yield a `StreamEvent::Updates` event with its state updates. The default
+  implementation does this, so nodes built from closures are unaffected. A custom
+  override that does not will stream events but contribute no state in `Messages`
+  mode. `AgentNode::execute_stream` now applies its output mapper, which it
+  previously never did. Timeout policies now apply to the streamed execution
+  itself, where `idle_timeout` means no event was produced within the limit.
+- **adk-agent: provider errors are no longer reported as successful turns.**
+  `LlmResponse` carries `interrupted`, `error_code`, and `error_message`, and a
+  provider adapter can report a terminal failure inside an otherwise successful
+  stream item — `adk-anthropic`'s `from_stream_error`, the OpenAI Responses error
+  event, and the OpenAI websocket transport all do. `LlmAgent` copied content,
+  finish reason, usage, and provider metadata onto its events but not those three
+  fields, and never inspected them, so a failed turn arrived as an ordinary event
+  with no content and the run completed successfully. Callers, persistence, retry
+  policy, and telemetry could not distinguish a provider failure from a model that
+  simply said nothing.
+
+  Those fields now travel with both partial and final events, and a terminal
+  `error_code` ends the run with an `AdkError` coded `model.provider_error`,
+  carrying the provider's own code in the error details under
+  `provider_error_code`. The event is emitted *before* the failure so the failed
+  turn stays observable and persisted rather than vanishing into an error.
+  `interrupted` is recorded but is not treated as terminal, and truncation is
+  unaffected: a response cut short by a token limit reports
+  `finish_reason: MaxTokens` and no error code.
+
+- **adk-agent/adk-tool: workflow context wrappers no longer drop cancellation,
+  secrets, and shared state.** Each wrapper re-implements `InvocationContext` and
+  delegates to an inner context, but most capability methods have permissive trait
+  defaults — `is_cancelled()` returns `false`, `get_secret()` returns `None`,
+  `shared_state()`/`user_scopes()`/`request_metadata()` return empty — so a
+  wrapper that omitted one still compiled and silently lost it. Capabilities
+  therefore depended on which workflow agent a sub-agent happened to run under:
+  `LoopAgent`'s history wrapper dropped cancellation, secrets, and shared state;
+  the skill-injection wrapper dropped all five; `ParallelAgent`'s shared-state
+  wrapper dropped cancellation and secrets. Most visibly, `Runner::interrupt` did
+  not reach an LLM agent nested under any of them, because the agent's
+  `is_cancelled()` checks read `false` through the wrapper.
+
+  All wrappers now forward every capability. `adk-tool`'s agent-as-tool context
+  additionally forwards `user_scopes`, `get_secret`, and `shared_state`, so a
+  scope-guarded tool invoked by an agent-as-tool sees the caller's grants. A
+  conformance suite pushes a sentinel context with a non-default value for every
+  capability through each wrapper — and through a composed stack, since an inner
+  wrapper that drops a capability defeats a correct outer one.
+
+  Known remaining gap: `is_cancelled` and `request_metadata` are not part of the
+  `ToolContext` surface that the agent-as-tool wrapper is built from, so
+  cancellation still does not reach an agent invoked as a tool. Closing that needs
+  those methods added to `ToolContext`.
+
+- **adk-agent/adk-core/adk-runner: `ParallelAgent` sub-agents no longer read each
+  other's output.** Concurrent branches all read the full session history, so an
+  analyst in a fan-out could see a sibling's answer before forming its own — while
+  the docs described sub-agents as working independently. `ParallelAgent` now
+  places each sub-agent on its own conversation branch
+  (`{parent}.{parallel_agent}.{sub_agent}`) and stamps emitted events with it, and
+  history reads are scoped to that branch: an event is visible when its branch
+  equals the reader's or is an *ancestor* of it, so the conversation leading to
+  the fan-out stays visible while siblings and nested descendants do not. This
+  mirrors ADK Python's `_is_event_belongs_to_branch` and ADK Go's
+  `eventBelongsToBranch`, including the delimiter guard that stops `agent_0` from
+  matching `agent_00`.
+
+  The mechanism is additive and opt-in by construction: an empty branch on either
+  side matches everything, so events written without a branch stay globally
+  visible and agents outside a fan-out are unaffected. New API:
+  `Session::conversation_history_scoped` (defaulted, so existing `Session`
+  implementations keep compiling) and `adk_core::event_belongs_to_branch`. A
+  branch already carrying a deeper path is preserved, so nested workflows compose
+  rather than the outer agent overwriting the inner one.
+
+- **adk-agent: `ParallelAgent` branches now actually run in parallel.** The
+  previous implementation resolved every sub-agent's `run()` future together but
+  then drained each returned `EventStream` to completion in turn. Since
+  `Agent::run` only *builds* a stream — the work happens when the stream is
+  polled — branches executed one at a time, so latency was additive and a slow
+  branch blocked every later one (two 300 ms branches took 604 ms; they now take
+  302 ms). Branch streams are merged with `select_all`, matching the ADK Python
+  (`_merge_agent_run`) and ADK Go (`parallelagent`) designs, including their
+  per-branch backpressure: a branch cannot run ahead while an event it already
+  produced is still being consumed, so the runner's per-event persistence stays
+  in step with execution. Dropping the merged stream now tears down in-flight
+  branches instead of leaving them running. Error handling is unchanged — every
+  branch still drains and a single terminal error is surfaced — except that the
+  reported error is now chosen by sub-agent declaration order rather than by
+  whichever branch failed first, which concurrency would otherwise make a race.
+
+- **adk-runner/adk-agent: workflow agents are resumed at the root across turns**
+  (#419) — in a session that persists across turns, `find_agent_to_run` no
+  longer routes a follow-up user message to a single sub-agent that responded
+  last when that sub-agent lives under a workflow agent (parallel, sequential,
+  loop, conditional). A new `Agent::supports_agent_transfer` hook (default
+  `true`, overridden to `false` by workflow agents) makes the runner resume the
+  workflow root so every sub-agent runs again. Mirrors Google ADK's
+  `_is_transferable_across_agent_tree`.
+- **adk-model: `turn_complete` on tool-call responses** (#401) — `deepseek` and
+  `openai_compatible` providers no longer set `turn_complete: true` when a
+  response carries tool calls; the turn continues until tool results are
+  processed. Adds `Content::has_function_calls()` to `adk-core`. Direct
+  `LlmResponseStream` consumers can now rely on `turn_complete` instead of
+  scanning for `Part::FunctionCall`.
 
 - **adk-realtime: one `response.create` per turn for parallel tool calls** — the
   runner fired a response per tool, so two tools in one turn hit OpenAI's
@@ -294,6 +3120,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and clippy violations across feature-gated and test code fixed —
   adk-model now passes `--all-features --all-targets -D warnings`.
 
+- **MCP tasks now use the official request flow.** Tool calls send task metadata,
+  receive `CreateTaskResult`, poll `tasks/get`, fetch `tasks/result`, and cancel
+  the remote task when local bounds are exceeded. Required and optional task
+  behavior follows negotiated server and tool capabilities.
+- **MCP manager supervision and locking.** Failed restart attempts remain eligible
+  until the configured limit, duplicate monitors are prevented, monitoring can
+  restart after being stopped, disabled servers cannot be started directly, and
+  tool discovery no longer holds the registry lock during network calls.
+- **MCP HTTP authentication and session handling.** API-key headers and caller
+  headers now reach the wire, OAuth client-credentials tokens are attached as
+  bearer credentials, configured request timeouts are honored, and one bounded
+  reinitialization can recover an expired Streamable HTTP session.
+- **adk-acp permission decisions no longer trust menu order or fabricated
+  option IDs.** Allow and reject choices are matched by protocol semantics and
+  the original opaque ID is returned; invalid selections cancel the request.
+- **ACP cancellation now cleans up the active turn without poisoning the next
+  prompt.** Both `session/cancel` and JSON-RPC request cancellation are covered
+  by official-SDK interoperability tests.
+- **adk-core: Event serialization no longer produces duplicate `"provider_metadata"` keys.**
+  `Event.provider_metadata` is now serialized as `"event_metadata"` to avoid collision
+  with `LlmResponse.provider_metadata` (which is flattened into the same JSON object).
+  Regression test added. (`#414`)
+
+- **adk-realtime: preserve split PCM16 samples in the LiveKit audio bridge.**
+  Incomplete channel frames are retained only for the matching response item and cleared at
+  response and error boundaries, preventing malformed samples, stereo channel-phase shifts,
+  data loss, and cross-item audio contamination.
+
+- **adk-model: preserve whitespace-only text deltas when streaming through OpenAI-compatible providers.**
+  Whitespace-only stream deltas and boundary whitespace are no longer dropped, so concatenating
+  the emitted `Part::Text` reconstructs the source byte-exactly (Markdown, indentation, tables,
+  and prose spacing are preserved). (`#441`)
+
 ## [1.0.0] - 2026-06-07
 
 > **Note:** 0.10.0 was an internal-only release and was never published to crates.io. All changes below were shipped as part of 1.0.0.
@@ -319,6 +3178,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **First stable release.** All 39 workspace crates promoted to 1.0.0, committing to semantic versioning guarantees. This milestone marks ADK-Rust as production-ready with a stable public API.
+
+- **adk-bench: benchmarking framework** — measures framework-level runtime
+  performance against real LLM APIs and supports cross-framework comparison with
+  the Python ADK (e.g., cold-start and simple-tool-call scenarios). Ships
+  Criterion benchmarks and reproducible result tables.
 
 - **adk-eval: Competitive parity features** — 10 new capabilities bringing the
   evaluation framework to parity with Braintrust, LangSmith, and Inspect AI:
@@ -2368,7 +5232,11 @@ Initial release - Published to crates.io.
 - Tokio async runtime
 - Google API key for Gemini
 
-[Unreleased]: https://github.com/zavora-ai/adk-rust/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/zavora-ai/adk-rust/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/zavora-ai/adk-rust/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/zavora-ai/adk-rust/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/zavora-ai/adk-rust/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/zavora-ai/adk-rust/compare/v1.0.0...v2.0.0
 [0.3.0]: https://github.com/zavora-ai/adk-rust/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zavora-ai/adk-rust/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/zavora-ai/adk-rust/compare/v0.1.7...v0.1.9

@@ -157,6 +157,213 @@ ADK-Rust provides multiple session service implementations:
 | `FirestoreSessionService` | `firestore` | Google Cloud Firestore |
 | `VertexAiSessionService` | `vertex-session` | Vertex AI Session API |
 
+`vertex-session` is also forwarded by the `adk-rust` umbrella crate:
+
+```toml
+[dependencies]
+adk-rust = { version = "2.3.0", features = ["vertex-session"] }
+```
+
+### VertexAiSessionService
+
+`VertexAiSessionService` persists sessions through the GA `v1` Vertex AI Agent
+Engine Session API. It uses Application Default Credentials and accepts either
+a numeric reasoning-engine ID or its complete resource name:
+
+```rust
+use adk_session::{VertexAiSessionConfig, VertexAiSessionService};
+
+let config = VertexAiSessionConfig::new("my-project", "us-central1")
+    .with_reasoning_engine("1234567890");
+let service = VertexAiSessionService::new_with_adc(config)?;
+```
+
+Inside a deployed Vertex AI Agent Engine container the platform provides the
+configuration as environment variables, and `VertexAiSessionConfig::from_env()`
+reads them:
+
+| Variable | Meaning |
+|----------|---------|
+| `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID |
+| `GOOGLE_CLOUD_LOCATION` | GCP region |
+| `GOOGLE_CLOUD_AGENT_ENGINE_ID` | Bare numeric agent engine ID (not a full resource name) |
+
+```rust
+use adk_session::{VertexAiSessionConfig, VertexAiSessionService};
+
+let config = VertexAiSessionConfig::from_env()?;
+let service = VertexAiSessionService::new_with_adc(config)?;
+```
+
+Missing or blank variables produce an invalid-input error naming each one.
+
+#### Session expiration
+
+`ttl` and `expireTime` are the `Session.expiration` oneof members
+(`google/cloud/aiplatform/v1beta1/session.proto`). The config sends at most
+one on session create: `ttl` is input-only, serialized as a JSON duration
+string (e.g. `"86400s"`), with a 24-hour minimum; `expireTime` is an RFC 3339
+timestamp. Setting both members, or a TTL below 24 hours, fails at service
+construction.
+
+```rust
+use adk_session::VertexAiSessionConfig;
+use std::time::Duration;
+
+let config = VertexAiSessionConfig::new("my-project", "us-central1")
+    .with_reasoning_engine("1234567890")
+    .with_ttl(Duration::from_secs(86_400)); // sent as "86400s"
+```
+
+#### Identity isolation
+
+The public session ID is always the ID supplied to `CreateRequest`, or a locally
+generated UUID when no ID is supplied. The backend derives the Vertex resource
+ID from the complete `(app_name, user_id, session_id)` tuple and persists a
+versioned identity marker in session state.
+
+| Property | Behavior |
+|----------|----------|
+| Logical ID | Preserved across create, get, list, append, and delete |
+| Remote ID | Deterministic 63-character `adk1-…` ID derived from the complete identity |
+| Identity marker | Stored as protected state and removed from public session state |
+| Shared reasoning engine | Sessions with the same logical ID remain isolated by app and user |
+| Reserved state | Create state and event state deltas cannot set the identity marker |
+
+The backend verifies both the marker and the computed resource ID before every
+identity-scoped operation. A missing or mismatched marker on a computed resource
+is treated as corruption rather than as another tenant's session.
+
+#### Legacy session migration
+
+Python ADK and pre-v2 sessions may use their logical ID directly and omit the
+identity marker. Compatibility depends on how the reasoning-engine parent is
+selected:
+
+| Configuration | Unmarked-session behavior |
+|---------------|---------------------------|
+| No fixed reasoning engine | Enabled only when `app_name` is the canonical nonzero numeric reasoning-engine ID without leading zeros |
+| Fixed reasoning engine | Disabled by default |
+| Fixed engine plus `allow_unmarked_sessions_for_app("app")` | Enabled only for that app |
+
+```rust
+use adk_session::{VertexAiSessionConfig, VertexAiSessionService};
+
+let config = VertexAiSessionConfig::new("my-project", "us-central1")
+    .with_reasoning_engine("1234567890");
+let service = VertexAiSessionService::new_with_adc(config)?
+    .allow_unmarked_sessions_for_app("legacy-app");
+```
+
+> **Important:** An unmarked session does not prove app ownership. Enable the
+> fixed-engine compatibility option only when the named app exclusively owns
+> the legacy sessions in that reasoning engine. Exact `user_id` matching still
+> applies. Marked-direct resources, the reserved `adk1-` namespace, and
+> computed/direct ambiguities fail closed.
+
+The legacy `append_event(session_id, event)` API also requires exactly one
+cached app/user scope. Call create, get, or list first, or use
+`append_event_for_identity()` directly. The cache is bounded, so a long-running
+process must get or list an older session again after its scope is evicted.
+
+#### Endpoints and event fidelity
+
+| Location | Default endpoint |
+|----------|------------------|
+| `global` | `https://aiplatform.googleapis.com` |
+| `us` | `https://aiplatform.us.rep.googleapis.com` |
+| `eu` | `https://aiplatform.eu.rep.googleapis.com` |
+| Regional location | `https://LOCATION-aiplatform.googleapis.com` |
+
+Custom endpoints must be trusted origins because they receive Google
+authorization headers and complete session/event payloads. Construction fails
+unless the endpoint is an HTTPS origin without userinfo, a path, query, or
+fragment; loopback HTTP is allowed for tests. Redirects are disabled.
+
+#### Production bounds
+
+| Boundary | Default |
+|----------|---------|
+| Vertex `user_id` | At most 128 Unicode scalar values |
+| Connect deadline | 10 seconds |
+| Credential-header deadline | 30 seconds |
+| HTTP request deadline | 120 seconds |
+| Long-running-operation polling | 120 seconds |
+| Encoded request body | 64 MiB per create/append request |
+| Decoded response body | 64 MiB per response and in aggregate across one paginated list operation |
+| Pagination elapsed time | 120 seconds for the complete list operation |
+| Page token | 64 KiB |
+| JSON and Vertex Struct nesting | 64 levels |
+
+`with_max_request_bytes()` changes the outbound body budget,
+`with_max_response_bytes()` changes both inbound body budgets, and
+`with_pagination_timeout()` changes the total list deadline. A high body limit
+weakens the default allocation protection; these limits apply independently to
+each request, response, or list operation rather than globally across
+concurrent calls. They are byte budgets, not total process-memory ceilings
+after JSON parsing and base64 decoding.
+`with_credentials()` is fallible because it validates the endpoint and builds
+the bounded, redirect-disabled HTTP client.
+
+Recent-event limits and timestamp lower bounds are pushed into `events.list`.
+The backend requests descending pages only until the recent-event bound is
+satisfied, then restores ascending chronological order. `num_recent_events = 0`
+does not call the event-list endpoint.
+
+Create, delete, and append HTTP `408`/`5xx`, transport/body, malformed `2xx`,
+or invalid successful-result failures can occur after the service commits the
+mutation. They return
+`session.vertex.{create,delete,append}_outcome_ambiguous` with
+`retry.should_retry = false`. After create or delete returns an operation name,
+poll transport/status failures and malformed or invalid successful responses
+use the same non-retryable ambiguity contract and include the operation name.
+Inspect the target session, operation, or event list before any manual retry.
+A terminal `done: true` operation error is a known failed result instead: it
+retains `session.vertex.operation_failed` and its category-derived retry hint.
+
+Direct HTTP `4xx` rejections other than `408` remain definitive; `429` is
+retryable. Any poll failure after an operation is accepted, including `429`, is
+ambiguous and non-retryable. The backend does not throttle or retry internally;
+use the current [Vertex AI
+quotas](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/quotas)
+to size application-level concurrency and retry policy.
+
+Run the ignored GA `v1` canary only against an existing reasoning engine with
+Application Default Credentials configured. It creates and deletes one session
+and one representative event; it never creates or deletes the engine.
+
+```bash
+ADK_VERTEX_LIVE_TEST=1 \
+GOOGLE_CLOUD_PROJECT=PROJECT_ID \
+GOOGLE_CLOUD_LOCATION=LOCATION \
+GOOGLE_CLOUD_REASONING_ENGINE_ID=REASONING_ENGINE_ID \
+cargo test -p adk-session --features vertex-session \
+  --test session_contract_vertex test_vertex_live_ga_v1_canary \
+  -- --ignored --exact --nocapture
+```
+
+Canonical Vertex content, Google ADK `rawEvent` fields, and arbitrary
+`rawEvent` Struct values round-trip without silent data loss. Arbitrary Struct
+values remain opaque: reappend preserves every original key and value and adds
+the reserved `_adkRust` envelope, so removing that envelope yields the original
+Struct. A pre-existing malformed `_adkRust` key fails closed. Google ADK
+projection is best-effort even when a Struct has a non-empty string `id`,
+numeric `timestamp`, and string `invocationId` and `author`; incompatible
+content, actions, metadata, or optional fields do not reject the canonical
+SessionEvent.
+
+The GA `v1` `FunctionCall` and `FunctionResponse` wire messages have no `id`.
+ID-bearing ADK function parts and empty or noncanonical Base64 thought-signature
+bytes use the lossless private `rawEvent` path. `Part.mediaResolution` accepts a
+bounded JSON object on any otherwise-valid canonical part. Top-level
+`inlineData`/`fileData` `displayName` values are accepted from the deployed GA
+wire. ADK projection omits these provider-only fields, while the canonical
+sidecar preserves them across reappend. Private-envelope validation accepts
+integer or Struct-normalized `1.0` schema versions, treats omitted proto3
+default scalar fields as equivalent to their empty private values, compares
+safe integer/double-normalized Vertex Struct values semantically, and restores
+exact private scalar presence.
+
 ### InMemorySessionService
 
 Stores sessions in memory. Ideal for development, testing, and single-instance deployments.
@@ -218,7 +425,7 @@ async fn main() -> anyhow::Result<()> {
 
 > **Note**: The `SqliteSessionService` requires the `sqlite` feature flag:
 > ```toml
-> adk-session = { version = "2.0.0", features = ["sqlite"] }
+> adk-session = { version = "2.3.0", features = ["sqlite"] }
 > ```
 
 ### PostgresSessionService
@@ -251,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
 
 > **Note**: Requires the `postgres` feature flag:
 > ```toml
-> adk-session = { version = "2.0.0", features = ["postgres"] }
+> adk-session = { version = "2.3.0", features = ["postgres"] }
 > ```
 
 ### MongoSessionService
@@ -296,7 +503,7 @@ async fn main() -> anyhow::Result<()> {
 
 > **Note**: Requires the `mongodb` feature flag:
 > ```toml
-> adk-session = { version = "2.0.0", features = ["mongodb"] }
+> adk-session = { version = "2.3.0", features = ["mongodb"] }
 > ```
 
 #### MongoDB deployment modes
@@ -350,7 +557,7 @@ async fn main() -> anyhow::Result<()> {
 
 > **Note**: Requires the `neo4j` feature flag:
 > ```toml
-> adk-session = { version = "2.0.0", features = ["neo4j"] }
+> adk-session = { version = "2.3.0", features = ["neo4j"] }
 > ```
 
 ### RedisSessionService
@@ -366,7 +573,44 @@ let session_service = RedisSessionService::new(config).await?;
 
 > **Note**: Requires the `redis` feature flag:
 > ```toml
-> adk-session = { version = "2.0.0", features = ["redis"] }
+> adk-session = { version = "2.3.0", features = ["redis"] }
+> ```
+
+### FirestoreSessionService
+
+Stores sessions in Google Cloud Firestore using Application Default Credentials.
+
+```rust
+use adk_session::{FirestoreSessionConfig, FirestoreSessionService};
+
+let config = FirestoreSessionConfig {
+    project_id: "my-gcp-project".to_string(),
+    root_collection: None, // defaults to "adk_sessions"
+};
+let session_service = FirestoreSessionService::new(config).await?;
+```
+
+| Data | Document path |
+|------|---------------|
+| Session | `{root}/{app_name}/sessions/{session_id}` |
+| Event | `{root}/{app_name}/sessions/{session_id}/events/{event_id}` |
+| App state | `{root}/{app_name}/app_state/current` |
+| User state | `{root}/{app_name}/users/{user_id}/state/current` |
+
+A session ID is unique within an app, and the owning `user_id` is a field of the session document. Every write re-reads that document inside its transaction and applies only when the app, user, and session ID match the request:
+
+| Operation | Session missing, or owned by another user |
+|-----------|-------------------------------------------|
+| `create` | Fails with `session.already_exists` when the ID is taken in the app |
+| `get`, `append_event_for_identity` | Fails with `session.not_found` |
+| `delete` | No-op, identical to deleting a missing session |
+| `list`, `delete_all_sessions` | Only the caller's own sessions are returned or removed |
+
+A new session never inherits events left under its path. App names, user IDs, and session IDs are document IDs, so they must not contain `/`.
+
+> **Note**: Requires the `firestore` feature flag:
+> ```toml
+> adk-session = { version = "2.3.0", features = ["firestore"] }
 > ```
 
 ## Schema Migrations
@@ -375,10 +619,10 @@ All database-backed session services (SQLite, PostgreSQL, MongoDB, Neo4j) includ
 
 ### Encrypted Sessions
 
-Wrap any `SessionService` with `EncryptedSession` to encrypt session state at rest using AES-256-GCM. Requires the `encrypted-session` feature flag.
+Wrap any `SessionService` with `EncryptedSession` to encrypt session state and event payloads at rest using AES-256-GCM. Requires the `encrypted-session` feature flag.
 
 ```toml
-adk-session = { version = "2.0.0", features = ["encrypted-session"] }
+adk-session = { version = "2.3.0", features = ["encrypted-session"] }
 ```
 
 #### Basic Usage
@@ -400,7 +644,18 @@ let service = EncryptedSession::new(inner, key, vec![]);
 let session = service.create(CreateRequest { /* ... */ }).await?;
 ```
 
-State is serialized to JSON, encrypted with a random 96-bit nonce, and stored as `[nonce || ciphertext]` in the inner service. Decryption happens transparently on read.
+Each value is serialized to JSON, encrypted with a random 96-bit nonce, and stored as an `adk-enc:v1:` envelope (base64 of `[nonce || ciphertext]`). Decryption happens transparently on `create`, `get`, and `list`.
+
+| Data | Stored in the inner service as |
+|------|--------------------------------|
+| State values (create state and event `state_delta`) | Encrypted per value; key names stay in plaintext |
+| Event content, LLM response metadata, actions, long-running tool IDs | One encrypted envelope in the event content |
+| Event ID, timestamp, invocation ID, branch, author | Plaintext, so the inner service can order and filter events |
+| `llm_request`, event `provider_metadata` | Not persisted |
+
+- **Identity binding**: the associated data of each ciphertext names its app, user, session, and state key or event ID. A value or event copied to another session fails with `session.encryption.decrypt_failed`.
+- **State tiers**: `app:` and `user:` values are stored encrypted in the shared app and user tiers, so they stay visible to every session of that app or user. `temp:` keys are dropped before encryption.
+- **Addressing**: `append_event(session_id, ..)` returns `session.encryption.identity_required` because a bare session ID does not identify the ciphertext binding. Use `append_event_for_identity()`, which the runner uses.
 
 #### Key Rotation
 
@@ -413,7 +668,23 @@ let old_key = EncryptionKey::from_env("OLD_SESSION_KEY")?;
 let service = EncryptedSession::new(inner, new_key, vec![old_key]);
 ```
 
-On read, the current key is tried first. If decryption fails, each previous key is tried in order. On success with a previous key, the data is automatically re-encrypted with the current key.
+On read, the current key is tried first, then each previous key in order. When `get` finds state values under a previous key, it re-encrypts them with the current key by appending a state-only event (hidden from returned events) and returns any failure.
+
+> **Note:** `SessionService` cannot rewrite stored events, so events written under a previous key stay readable only while that key remains in `previous_keys`. Keep a retired key until the sessions that used it are deleted or expire. In a rolling deployment, first add the new key to `previous_keys` everywhere, then make it the current key.
+
+#### Migrating Data From Earlier Releases
+
+Releases before the per-value format stored `create` state as one `__encrypted_state` blob and passed event content and state deltas through in plaintext. Reads reject such data with `session.encryption.unencrypted_data`. Enable migration while existing sessions are converted:
+
+```rust
+use adk_session::{EncryptedSession, EncryptionKey, InMemorySessionService};
+
+let key = EncryptionKey::from_env("SESSION_ENCRYPTION_KEY")?;
+let service = EncryptedSession::new(InMemorySessionService::new(), key, vec![])
+    .with_legacy_migration(true);
+```
+
+`get` then decrypts the legacy blob, accepts plaintext values and events, and re-encrypts the state into the current format. Plaintext events stay plaintext in the inner service, so a session that holds them stays readable only with migration enabled.
 
 #### Key Management
 
@@ -573,7 +844,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     let agent = LlmAgentBuilder::new("assistant")
         .model(model)
@@ -630,11 +901,11 @@ service.append_event_for_identity(AppendEventRequest {
 }).await?;
 
 // Typed get and delete
-let session = service.get_for_identity(&identity, None, None).await?;
+let session = service.get_for_identity(&identity).await?;
 service.delete_for_identity(&identity).await?;
 ```
 
-All session backends (in-memory, SQLite, PostgreSQL, Redis, MongoDB, Firestore, Neo4j, Vertex) support the typed identity path. The legacy `append_event(&str, ...)` method remains available for backward compatibility.
+All session backends (in-memory, SQLite, PostgreSQL, Redis, MongoDB, Firestore, Neo4j, Vertex) support the typed identity path. The legacy `append_event(&str, ...)` method remains available for backward compatibility, except on `EncryptedSession`, which binds ciphertext to the full identity and requires `append_event_for_identity()`.
 
 For new code, prefer `append_event_for_identity()` and the other typed identity helpers. The legacy `append_event(&str, ...)` path is retained only for migration and is the first legacy identity API intended for future deprecation once internal callers have fully moved to `AdkIdentity`.
 

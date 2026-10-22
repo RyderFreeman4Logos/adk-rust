@@ -98,6 +98,20 @@ pub trait CodeExecutor: Send + Sync {
     async fn is_running(&self) -> bool {
         true
     }
+
+    /// A prose snippet describing this backend's execution environment and
+    /// built-in capabilities, suitable for appending to an LLM-facing tool
+    /// description.
+    ///
+    /// `None` (the default) means the backend has nothing to add. Backends
+    /// whose behavior depends on construction-time configuration (granted
+    /// filesystem roots, environment variables, registered host functions,
+    /// state persistence semantics) should override this so tools composed
+    /// over `Arc<dyn CodeExecutor>` can surface an accurate environment
+    /// description to the model without downcasting.
+    fn prompt_snippet(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Validates that the backend can enforce the requested sandbox policy.
@@ -110,8 +124,16 @@ pub trait CodeExecutor: Send + Sync {
 ///
 /// - Network policy: if disabled, backend must be able to enforce it
 /// - Filesystem policy: if any access is requested, backend must enforce it
-/// - Environment policy: if any variables are exposed, backend must enforce it
+/// - Environment policy: backend must always enforce it — both
+///   [`EnvironmentPolicy::None`] and [`EnvironmentPolicy::AllowList`] restrict
+///   what the code sees, and a backend that cannot enforce either passes the
+///   host environment through
 /// - Timeout: backend must always be able to enforce timeouts
+///
+/// # Errors
+///
+/// Returns [`ExecutionError::UnsupportedPolicy`] naming the first control the
+/// backend cannot enforce.
 pub fn validate_policy(
     capabilities: &BackendCapabilities,
     policy: &SandboxPolicy,
@@ -128,12 +150,15 @@ pub fn validate_policy(
             "backend cannot enforce filesystem restrictions".to_string(),
         ));
     }
-    if !matches!(policy.environment, EnvironmentPolicy::None)
-        && !capabilities.enforce_environment_policy
-    {
-        return Err(ExecutionError::UnsupportedPolicy(
-            "backend cannot enforce environment variable restrictions".to_string(),
-        ));
+    if !capabilities.enforce_environment_policy {
+        let requested = match &policy.environment {
+            EnvironmentPolicy::None => "no environment variables",
+            EnvironmentPolicy::AllowList(_) => "an environment allowlist",
+        };
+        return Err(ExecutionError::UnsupportedPolicy(format!(
+            "backend cannot enforce environment variable restrictions: the policy requests \
+             {requested}, but executed code would inherit the host environment"
+        )));
     }
     if !capabilities.enforce_timeout {
         return Err(ExecutionError::UnsupportedPolicy(

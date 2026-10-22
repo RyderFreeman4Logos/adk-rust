@@ -63,7 +63,7 @@ if let Some(content) = &event.llm_response.content {
 
 - **invocation_id**: Groups events that belong to the same agent invocation. When an agent processes a message, all events generated (agent response, tool calls, sub-agent calls) share the same invocation_id.
 
-- **branch**: Reserved for future branching functionality. Currently unused but allows for conversation branching in future versions.
+- **branch**: The conversation branch the event was produced on. `ParallelAgent` places each sub-agent on its own branch (`{parent}.{parallel_agent}.{sub_agent}`) and stamps the events it emits, so history reads scoped to a branch exclude what sibling branches produced. An event is visible from a branch when its own branch equals that branch or is an *ancestor* of it; siblings and nested descendants are not. An empty branch means "unscoped" and stays visible everywhere, so events written without one are unaffected. See [Workflow Agents](../agents/workflow-agents.md#parallelagent).
 
 - **author**: Identifies who created the event:
   - User messages: typically "user" or a user identifier
@@ -72,6 +72,20 @@ if let Some(content) = &event.llm_response.content {
   - System events: "system"
 
 - **llm_response**: Contains the message content and LLM metadata. Access content via `event.llm_response.content`. The `Content` type can contain text, multimodal parts (images, audio), or structured data. Some events (like pure state updates) may have `content: None`.
+
+- **llm_response.error_code / error_message**: Set when the provider reported a terminal failure for the turn. Providers can report a failure inside an otherwise successful stream item — `adk-anthropic`'s stream errors, the OpenAI Responses error event, and the OpenAI websocket transport all do — so these fields are how a failed turn is distinguished from an empty one. `LlmAgent` emits the event carrying them *and then* ends the run with an `AdkError` whose code is `model.provider_error`, with the provider's own code in the error details under `provider_error_code`. The event is emitted first so the failed turn is still observable and persisted rather than disappearing into an error.
+
+  Truncation is **not** reported this way: a response cut short by a token limit carries `finish_reason: FinishReason::MaxTokens` and no error code.
+
+- **llm_response.interrupted**: The generation was interrupted (for example a realtime turn cut off by the user, or a tool confirmation pausing the turn). This is recorded on the event but is **not** a terminal error on its own, so the run does not fail.
+
+```rust
+// Distinguishing a failed turn from an empty one
+if let Some(code) = &event.llm_response.error_code {
+    let detail = event.llm_response.error_message.as_deref().unwrap_or("no message");
+    eprintln!("provider reported {code}: {detail}");
+}
+```
 
 ## EventActions
 
@@ -496,6 +510,44 @@ render — not just `bash`-style tools.
 **Correlation.** Use `call_id` to attach a result (and any progress chunks, see
 below) back to its originating call. Providers that omit call ids (e.g. Gemini)
 leave it `None`; fall back to `name` in that case.
+
+### Complete response snapshots
+
+Partial model events carry live deltas. A terminal event marked with
+`llm_response.provider_metadata.content_complete = true` contains the complete
+response for the same event ID, including text already streamed. Persist the
+original terminal event, or replace the matching partial projection with it.
+
+Append-only consumers can keep one `adk_core::EventTextDeltas` per stream and
+call `push(&event)` before rendering. The adapter removes previously emitted
+text and thinking prefixes while preserving tool parts, signatures, actions,
+and usage. It leaves unmarked deltas unchanged. A corrected snapshot that no
+longer starts with the emitted prefix is returned in full; append-only output
+cannot retract earlier content.
+
+### Lifecycle markers
+
+Two markers describe work in progress rather than a response. Neither event is
+a final response, so `is_final_response()` returns `false` for both.
+
+| Marker | Location | Meaning |
+|--------|----------|---------|
+| `adk_tool_started` | `event.provider_metadata` (event-level) | A tool call began executing. The value is a JSON string `{"id": <call id or null>, "name": <tool name>}`. The event has no content and is `partial = true`, so the runner does not persist it. |
+| `continue_turn` | `llm_response.provider_metadata` | A provider-native tool paused the turn without a client function call. `LlmAgent` sends another model request within the same `max_iterations` budget, skips output guardrails and `output_key` for the paused response, and keeps it in conversation history. |
+
+Tool-result events are emitted as each call completes, so with parallel dispatch
+they arrive in completion order. The model receives the results in call order.
+
+```rust
+use adk_core::Event;
+
+fn tool_started(event: &Event) -> Option<serde_json::Value> {
+    event
+        .provider_metadata
+        .get("adk_tool_started")
+        .and_then(|value| serde_json::from_str(value).ok())
+}
+```
 
 ### Streaming Tool Progress
 

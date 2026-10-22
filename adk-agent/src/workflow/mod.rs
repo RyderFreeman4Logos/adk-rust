@@ -1,10 +1,13 @@
+pub(crate) mod branch_context;
 mod conditional_agent;
 mod llm_conditional_agent;
 mod loop_agent;
 mod parallel_agent;
 mod sequential_agent;
-pub(crate) mod shared_state_context;
+mod shared_state_context;
 mod skill_context;
+#[cfg(test)]
+mod wrapper_conformance_tests;
 
 pub use conditional_agent::ConditionalAgent;
 pub use llm_conditional_agent::{LlmConditionalAgent, LlmConditionalAgentBuilder};

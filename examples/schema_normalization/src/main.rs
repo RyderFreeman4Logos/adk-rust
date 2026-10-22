@@ -25,6 +25,7 @@ use adk_gemini::schema_adapter::GeminiSchemaAdapter;
 use adk_model::anthropic::AnthropicSchemaAdapter;
 use adk_model::openai::{OpenAiSchemaAdapter, OpenAiStrictSchemaAdapter};
 use serde_json::json;
+use std::sync::Arc;
 
 fn main() {
     tracing_subscriber::fmt().with_env_filter("info").with_target(false).init();
@@ -184,19 +185,18 @@ fn main() {
     // --- Schema Cache Demo ---
     println!("\n━━━ Schema Cache ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-    let cache = SchemaCache::new();
-    let adapter = GeminiSchemaAdapter::new();
+    let cache = SchemaCache::for_adapter(Arc::new(GeminiSchemaAdapter::new()));
 
     println!("  Cache empty: {} entries", cache.len());
 
-    let _result1 = cache.get_or_normalize(&raw_schema, &adapter);
+    let _result1 = cache.normalize(&raw_schema);
     println!("  After first normalize: {} entry (computed)", cache.len());
 
-    let _result2 = cache.get_or_normalize(&raw_schema, &adapter);
+    let _result2 = cache.normalize(&raw_schema);
     println!("  After second normalize: {} entry (cache hit!)", cache.len());
 
     let different_schema = json!({"type": "string", "format": "email"});
-    let _result3 = cache.get_or_normalize(&different_schema, &adapter);
+    let _result3 = cache.normalize(&different_schema);
     println!("  After different schema: {} entries", cache.len());
 
     cache.clear();

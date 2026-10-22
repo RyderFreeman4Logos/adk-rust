@@ -174,7 +174,7 @@ fn test_png_image_from_bytes() {
 #[test]
 fn test_image_part_to_mistralrs_with_png() {
     let png_data = generate_minimal_png();
-    let part = Part::InlineData { mime_type: "image/png".to_string(), data: png_data };
+    let part = Part::inline_data("image/png", png_data);
 
     let result = image_part_to_mistralrs(&part);
     assert!(result.is_some(), "PNG part should convert to image");
@@ -182,10 +182,7 @@ fn test_image_part_to_mistralrs_with_png() {
 
 #[test]
 fn test_image_part_to_mistralrs_with_unsupported_mime() {
-    let part = Part::InlineData {
-        mime_type: "application/octet-stream".to_string(),
-        data: vec![0, 1, 2, 3],
-    };
+    let part = Part::inline_data("application/octet-stream", vec![0, 1, 2, 3]);
 
     let result = image_part_to_mistralrs(&part);
     assert!(result.is_none(), "Unsupported MIME type should return None");
@@ -198,7 +195,7 @@ fn test_extract_images_from_content() {
         role: "user".to_string(),
         parts: vec![
             Part::Text { text: "Describe this image".to_string() },
-            Part::InlineData { mime_type: "image/png".to_string(), data: png_data },
+            Part::inline_data("image/png", png_data),
         ],
     };
 
@@ -256,6 +253,7 @@ fn test_file_data_part_with_image_mime() {
     let part = Part::FileData {
         mime_type: "image/jpeg".to_string(),
         file_uri: "https://example.com/image.jpg".to_string(),
+        annotations: None,
     };
 
     // FileData with image MIME type should be recognized as media
@@ -269,6 +267,7 @@ fn test_file_data_part_with_audio_mime() {
     let part = Part::FileData {
         mime_type: "audio/wav".to_string(),
         file_uri: "https://example.com/audio.wav".to_string(),
+        annotations: None,
     };
 
     assert!(part.is_media());
@@ -290,7 +289,7 @@ fn test_content_with_file_uri() {
     // Second part is FileData
     assert!(matches!(
         &content.parts[1],
-        Part::FileData { mime_type, file_uri }
+        Part::FileData { mime_type, file_uri, .. }
         if mime_type == "image/jpeg" && file_uri == "https://example.com/photo.jpg"
     ));
 }
@@ -301,7 +300,7 @@ fn test_part_constructors() {
     let file_part = Part::file_data("image/png", "https://example.com/img.png");
     assert!(matches!(
         file_part,
-        Part::FileData { mime_type, file_uri }
+        Part::FileData { mime_type, file_uri, .. }
         if mime_type == "image/png" && file_uri == "https://example.com/img.png"
     ));
 
@@ -309,7 +308,7 @@ fn test_part_constructors() {
     let inline_part = Part::inline_data("image/jpeg", vec![1, 2, 3]);
     assert!(matches!(
         inline_part,
-        Part::InlineData { mime_type, data }
+        Part::InlineData { mime_type, data, .. }
         if mime_type == "image/jpeg" && data == vec![1, 2, 3]
     ));
 }

@@ -13,17 +13,19 @@ use tokio::time::sleep;
 
 use crate::AccumulatingStream;
 use crate::backoff::ExponentialBackoff;
+use crate::base_url::{InsecureHttp, validate_base_url};
 use crate::client_logger::ClientLogger;
 use crate::error::{Error, Result};
 use crate::observability::{
     CLIENT_REQUEST_DURATION, CLIENT_REQUEST_ERRORS, CLIENT_REQUEST_RETRIES, CLIENT_REQUESTS,
     CLIENT_RETRY_BACKOFF,
 };
-use crate::sse::process_sse;
+use crate::sse::{process_json_sse, process_sse};
 use crate::types::{
     BatchRequest, BatchResultItem, FileObject, Message, MessageBatch, MessageCountTokensParams,
     MessageCreateParams, MessageStreamEvent, MessageTokensCount, ModelInfo, ModelListParams,
-    ModelListResponse, PaginatedList, SkillObject, ThinkingConfig,
+    ModelListResponse, PaginatedList, ServerFallbackMessage, ServerFallbackRequest,
+    ServerFallbackStreamEvent, SkillObject, ThinkingConfig,
 };
 
 use base64::Engine as _;
@@ -84,22 +86,82 @@ const DEFAULT_API_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const STRUCTURED_OUTPUTS_BETA: &str = "structured-outputs-2025-11-13";
+const SERVER_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// Opt-in named when a base URL given in code is rejected for plain HTTP.
+const CODE_INSECURE_HTTP_OPT_IN: &str =
+    "call `allow_insecure_http()` on the client before setting the base URL";
+/// Opt-in named when `ANTHROPIC_BASE_URL` is rejected for plain HTTP.
+const ENV_INSECURE_HTTP_OPT_IN: &str =
+    "set ANTHROPIC_ALLOW_INSECURE_HTTP=1 alongside ANTHROPIC_BASE_URL";
 
 /// Client for the Anthropic API with performance optimizations.
-#[derive(Debug, Clone)]
+///
+/// # Timeouts
+///
+/// | Request kind | Bound |
+/// |--------------|-------|
+/// | Non-streaming | [`with_timeout`](Self::with_timeout) covers the whole request (default 60 seconds) |
+/// | Streaming, until response headers | the same timeout |
+/// | Streaming body | a 30-second inactivity timeout between chunks, plus the optional total bound from [`with_stream_timeout`](Self::with_stream_timeout) |
+///
+/// The `Debug` output redacts the API key.
+#[derive(Clone)]
 pub struct Anthropic {
     api_key: String,
     client: ReqwestClient,
+    /// Client without a total timeout, so long streams are not cut off mid-body.
+    stream_client: ReqwestClient,
     base_url: String,
     timeout: Duration,
+    stream_timeout: Option<Duration>,
     max_retries: usize,
     throughput_ops_sec: f64,
     reserve_capacity: f64,
     /// Cached headers for performance - Arc for cheap cloning
     cached_headers: Arc<HeaderMap>,
+    /// Whether `with_base_url` accepts `http://` to a non-loopback host.
+    allow_insecure_http: bool,
+}
+
+impl std::fmt::Debug for Anthropic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Anthropic")
+            .field("api_key", &"[REDACTED]")
+            .field("client", &self.client)
+            .field("stream_client", &self.stream_client)
+            .field("base_url", &self.base_url)
+            .field("timeout", &self.timeout)
+            .field("stream_timeout", &self.stream_timeout)
+            .field("max_retries", &self.max_retries)
+            .field("throughput_ops_sec", &self.throughput_ops_sec)
+            .field("reserve_capacity", &self.reserve_capacity)
+            .field("cached_headers", &self.cached_headers)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
 }
 
 impl Anthropic {
+    /// Build the HTTP client. `total_timeout` of `None` leaves response bodies
+    /// unbounded, which the streaming client relies on.
+    fn build_http_client(
+        total_timeout: Option<Duration>,
+        connect_timeout: Duration,
+    ) -> Result<ReqwestClient> {
+        let mut builder = ReqwestClient::builder()
+            .connect_timeout(connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(10) // Connection pooling optimization
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60));
+        if let Some(timeout) = total_timeout {
+            builder = builder.timeout(timeout);
+        }
+        builder.build().map_err(|e| {
+            Error::http_client(format!("Failed to build HTTP client: {e}"), Some(Box::new(e)))
+        })
+    }
+
     /// Resolve an API key value, handling file:// URLs
     fn resolve_api_key(key_value: &str) -> Result<String> {
         if let Some(stripped) = key_value.strip_prefix("file://") {
@@ -124,6 +186,43 @@ impl Anthropic {
         }
     }
 
+    /// Resolve the effective base URL from optional `ANTHROPIC_BASE_URL` and
+    /// `ANTHROPIC_ALLOW_INSECURE_HTTP` values.
+    ///
+    /// A value supplied through the environment is held to the same rule as one
+    /// supplied through [`Anthropic::with_base_url`]: every request attaches the
+    /// API key, so an unencrypted endpoint would leak the credential. The
+    /// acknowledgement for plain HTTP comes from the same source as the URL, so
+    /// an `insecure_http_env` of `1` or `true` (case-insensitive) admits a
+    /// non-loopback `http://` value. When no URL is supplied the default
+    /// Anthropic API URL is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the supplied value is not `https://`, not
+    /// `http://` with a loopback host, and not acknowledged `http://`.
+    fn resolve_base_url(
+        env_value: Option<String>,
+        insecure_http_env: Option<String>,
+    ) -> Result<String> {
+        match env_value {
+            Some(value) => {
+                let acknowledged = insecure_http_env
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|flag| flag == "1" || flag.eq_ignore_ascii_case("true"));
+                let insecure_http = if acknowledged {
+                    InsecureHttp::Acknowledged
+                } else {
+                    InsecureHttp::Rejected { opt_in: Some(ENV_INSECURE_HTTP_OPT_IN) }
+                };
+                validate_base_url(&value, insecure_http)?;
+                Ok(value)
+            }
+            None => Ok(DEFAULT_API_URL.to_string()),
+        }
+    }
+
     /// Create a new Anthropic client.
     ///
     /// The API key can be provided directly or read from the `ANTHROPIC_API_KEY`
@@ -132,6 +231,22 @@ impl Anthropic {
     ///
     /// The base URL is resolved from the `ANTHROPIC_BASE_URL` environment
     /// variable. If not set, the default Anthropic API URL is used.
+    ///
+    /// `ANTHROPIC_BASE_URL` may name a plain `http://` endpoint on a non-loopback
+    /// host, such as an internal gateway, only when `ANTHROPIC_ALLOW_INSECURE_HTTP`
+    /// is set to `1` or `true` (case-insensitive). The client then logs a warning
+    /// and sends the API key unencrypted. `ANTHROPIC_ALLOW_INSECURE_HTTP` applies
+    /// to the environment URL only; a URL given in code needs
+    /// [`allow_insecure_http`](Self::allow_insecure_http).
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `ANTHROPIC_BASE_URL` is set to an
+    /// endpoint that would transmit the API key in cleartext — anything other
+    /// than `https://`, or `http://` with a loopback host (`localhost`,
+    /// `127.0.0.1`, `[::1]`), unless `ANTHROPIC_ALLOW_INSECURE_HTTP`
+    /// acknowledges an `http://` endpoint. A misconfigured environment fails
+    /// loudly rather than silently falling back to the default URL.
     pub fn new(api_key: Option<String>) -> Result<Self> {
         let api_key = match api_key {
             Some(key) => Self::resolve_api_key(&key)?,
@@ -145,34 +260,175 @@ impl Anthropic {
             }
         };
 
+        let base_url = Self::resolve_base_url(
+            env::var("ANTHROPIC_BASE_URL").ok(),
+            env::var("ANTHROPIC_ALLOW_INSECURE_HTTP").ok(),
+        )?;
+        Self::from_values(api_key, base_url)
+    }
+
+    /// Create a client with an explicit API key and base URL.
+    ///
+    /// Unlike [`Anthropic::new`], this constructor reads neither `ANTHROPIC_API_KEY`
+    /// nor `ANTHROPIC_BASE_URL`. A `file://` API key is read from that file, as in
+    /// [`Anthropic::new`].
+    ///
+    /// The base URL is validated here, so this constructor cannot take a plain
+    /// `http://` URL to a non-loopback host. For one, construct the client with an
+    /// `https://` URL, then call [`allow_insecure_http`](Self::allow_insecure_http)
+    /// followed by [`with_base_url`](Self::with_base_url).
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `base_url` is not `https://` and not
+    /// `http://` with a loopback host, or when a `file://` API key cannot be read.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_anthropic::Anthropic;
+    ///
+    /// let client = Anthropic::new_with_base_url("sk-ant-key", "https://proxy.example.com")?;
+    /// # Ok::<(), adk_anthropic::Error>(())
+    /// ```
+    pub fn new_with_base_url(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Result<Self> {
+        let base_url = base_url.into();
+        validate_base_url(
+            &base_url,
+            InsecureHttp::Rejected { opt_in: Some(CODE_INSECURE_HTTP_OPT_IN) },
+        )?;
+        Self::from_values(Self::resolve_api_key(&api_key.into())?, base_url)
+    }
+
+    fn from_values(api_key: String, base_url: String) -> Result<Self> {
         let timeout = DEFAULT_TIMEOUT;
-        let client = ReqwestClient::builder()
-            .timeout(timeout)
-            .pool_max_idle_per_host(10) // Connection pooling optimization
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60))
-            .build()
-            .map_err(|e| {
-                Error::http_client(format!("Failed to build HTTP client: {e}"), Some(Box::new(e)))
-            })?;
+        let client = Self::build_http_client(Some(timeout), timeout)?;
+        let stream_client = Self::build_http_client(None, timeout)?;
 
         // Pre-build headers for performance
         let cached_headers = Arc::new(Self::build_default_headers(&api_key)?);
 
-        // Resolve base URL from environment variable, defaulting to the API URL
-        let base_url =
-            env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
-
         Ok(Self {
             api_key,
             client,
+            stream_client,
             base_url,
             timeout,
+            stream_timeout: None,
             max_retries: 3,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
             cached_headers,
+            allow_insecure_http: false,
         })
+    }
+
+    /// Create an Anthropic client authenticated with a bearer token.
+    ///
+    /// Unlike [`Anthropic::new`], this constructor does not require an API key or
+    /// the `ANTHROPIC_API_KEY` environment variable. Requests carry
+    /// `Authorization: Bearer <token>` and omit `x-api-key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the token is empty or cannot be encoded
+    /// as an HTTP header value.
+    pub fn new_with_auth_token(auth_token: impl Into<String>) -> Result<Self> {
+        Self::new(Some(String::new()))?.with_auth_token(auth_token)
+    }
+
+    /// Replace API-key authentication with a bearer token.
+    ///
+    /// The resulting client omits `x-api-key` from every request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the token is empty or cannot be encoded
+    /// as an HTTP header value.
+    pub fn with_auth_token(mut self, auth_token: impl Into<String>) -> Result<Self> {
+        let auth_token = auth_token.into();
+        if auth_token.trim().is_empty() {
+            return Err(Error::validation(
+                "Auth token cannot be empty".to_string(),
+                Some("auth_token".to_string()),
+            ));
+        }
+
+        let mut headers = (*self.cached_headers).clone();
+        headers.remove("x-api-key");
+        let mut value =
+            HeaderValue::from_str(&format!("Bearer {auth_token}")).map_err(|error| {
+                Error::validation(
+                    format!("Invalid auth token format: {error}"),
+                    Some("auth_token".to_string()),
+                )
+            })?;
+        value.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, value);
+        self.api_key.clear();
+        self.cached_headers = Arc::new(headers);
+        Ok(self)
+    }
+
+    /// Override the `anthropic-version` header used by this client.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the version is empty or cannot be
+    /// encoded as an HTTP header value.
+    pub fn with_api_version(mut self, api_version: impl Into<String>) -> Result<Self> {
+        let api_version = api_version.into();
+        if api_version.trim().is_empty() {
+            return Err(Error::validation(
+                "API version cannot be empty".to_string(),
+                Some("api_version".to_string()),
+            ));
+        }
+
+        let mut headers = (*self.cached_headers).clone();
+        let value = HeaderValue::from_str(&api_version).map_err(|error| {
+            Error::validation(
+                format!("Invalid API version format: {error}"),
+                Some("api_version".to_string()),
+            )
+        })?;
+        headers.insert("anthropic-version", value);
+        self.cached_headers = Arc::new(headers);
+        Ok(self)
+    }
+
+    /// Allow a plain `http://` base URL on a non-loopback host.
+    ///
+    /// Use this for a trusted internal gateway that is reachable only over plain
+    /// HTTP. Every request attaches the API key, which then crosses the network
+    /// unencrypted. Loopback `http://` URLs and `https://` URLs need no opt-in.
+    ///
+    /// [`with_base_url`](Self::with_base_url) and
+    /// [`with_base_url_and_timeout`](Self::with_base_url_and_timeout) validate the
+    /// URL when they are called, so this method must be called **before** them.
+    /// Accepting a non-loopback `http://` URL logs a warning with the host.
+    ///
+    /// The opt-in applies to URLs given in code. A URL from `ANTHROPIC_BASE_URL`
+    /// is acknowledged by `ANTHROPIC_ALLOW_INSECURE_HTTP` instead; see
+    /// [`new`](Self::new).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_anthropic::Anthropic;
+    ///
+    /// let client = Anthropic::new(Some("placeholder-api-key".to_string()))?
+    ///     .allow_insecure_http()
+    ///     .with_base_url("http://10.60.1.20:8080/api/v1/llm/anthropic".to_string())?;
+    /// assert_eq!(client.base_url(), "http://10.60.1.20:8080/api/v1/llm/anthropic");
+    /// # Ok::<(), adk_anthropic::Error>(())
+    /// ```
+    pub fn allow_insecure_http(mut self) -> Self {
+        self.allow_insecure_http = true;
+        self
     }
 
     /// Set a custom base URL for this client.
@@ -181,50 +437,86 @@ impl Anthropic {
     /// The base URL should be the root URL without the `/v1/` suffix - this will
     /// be added automatically when constructing request URLs.
     ///
+    /// The URL is validated when this method is called. To use a plain `http://`
+    /// URL on a non-loopback host, call
+    /// [`allow_insecure_http`](Self::allow_insecure_http) first.
+    ///
+    /// # Errors
+    ///
+    /// Every request made by this client attaches the Anthropic API key, so the
+    /// base URL must be encrypted. Returns a validation error unless the URL uses
+    /// `https://`, or `http://` with a loopback host (`localhost`, `127.0.0.1`,
+    /// `[::1]`) for local development, or `http://` after
+    /// [`allow_insecure_http`](Self::allow_insecure_http).
+    ///
     /// # Examples
     ///
     /// ```
     /// # use adk_anthropic::Anthropic;
     /// // For Anthropic's API (default)
-    /// let client = Anthropic::new(Some("api-key".to_string()))?
-    ///     .with_base_url("https://api.anthropic.com".to_string());
+    /// let client = Anthropic::new(Some("placeholder-api-key".to_string()))?
+    ///     .with_base_url("https://api.anthropic.com".to_string())?;
     ///
     /// // For Minimax (international)
-    /// let client = Anthropic::new(Some("api-key".to_string()))?
-    ///     .with_base_url("https://api.minimax.io/anthropic".to_string());
+    /// let client = Anthropic::new(Some("placeholder-api-key".to_string()))?
+    ///     .with_base_url("https://api.minimax.io/anthropic".to_string())?;
     ///
     /// // For Minimax (China)
-    /// let client = Anthropic::new(Some("api-key".to_string()))?
-    ///     .with_base_url("https://api.minimaxi.com/anthropic".to_string());
+    /// let client = Anthropic::new(Some("placeholder-api-key".to_string()))?
+    ///     .with_base_url("https://api.minimaxi.com/anthropic".to_string())?;
     /// # Ok::<(), adk_anthropic::Error>(())
     /// ```
-    pub fn with_base_url(mut self, base_url: String) -> Self {
+    pub fn with_base_url(mut self, base_url: String) -> Result<Self> {
+        let insecure_http = if self.allow_insecure_http {
+            InsecureHttp::Acknowledged
+        } else {
+            InsecureHttp::Rejected { opt_in: Some(CODE_INSECURE_HTTP_OPT_IN) }
+        };
+        validate_base_url(&base_url, insecure_http)?;
         self.base_url = base_url;
-        self
+        Ok(self)
+    }
+
+    /// Return the effective API base URL used for message requests.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Set a custom timeout for this client.
     ///
-    /// This method allows you to specify a different timeout for API requests.
+    /// The timeout bounds a whole non-streaming request, and the wait for the
+    /// response headers of a streaming request. A streamed body is not bounded
+    /// by it — see [`with_stream_timeout`](Self::with_stream_timeout).
+    ///
+    /// # Errors
+    ///
+    /// Returns an HTTP client error when the underlying client cannot be built.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.timeout = timeout;
-
-        // Recreate the client with the new timeout and performance optimizations
-        let client = ReqwestClient::builder()
-            .timeout(timeout)
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60))
-            .build()
-            .map_err(|e| {
-                Error::http_client(
-                    "Failed to build HTTP client with new timeout",
-                    Some(Box::new(e)),
-                )
-            })?;
-
-        self.client = client;
+        self.client = Self::build_http_client(Some(timeout), timeout)?;
+        self.stream_client = Self::build_http_client(None, timeout)?;
         Ok(self)
+    }
+
+    /// Bound the total duration of each streaming request, body included.
+    ///
+    /// Streams have no total bound by default: a long generation keeps running
+    /// for as long as the server keeps sending data, and a stalled stream fails
+    /// after 30 seconds without data. `None` restores that default.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use adk_anthropic::Anthropic;
+    ///
+    /// let client = Anthropic::new(Some("placeholder-api-key".to_string()))?
+    ///     .with_stream_timeout(Some(Duration::from_secs(600)));
+    /// # Ok::<(), adk_anthropic::Error>(())
+    /// ```
+    pub fn with_stream_timeout(mut self, stream_timeout: Option<Duration>) -> Self {
+        self.stream_timeout = stream_timeout;
+        self
     }
 
     /// Set the maximum number of retries for this client.
@@ -251,9 +543,34 @@ impl Anthropic {
 
     /// Set both a custom base URL and timeout for this client.
     ///
-    /// This is a convenience method that chains with_base_url and with_timeout.
+    /// This is a convenience method that chains [`with_base_url`](Self::with_base_url)
+    /// and [`with_timeout`](Self::with_timeout). The URL is validated when this
+    /// method is called, so a plain `http://` URL on a non-loopback host needs
+    /// [`allow_insecure_http`](Self::allow_insecure_http) to be called first.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation error of [`with_base_url`](Self::with_base_url), or
+    /// an HTTP client error when the underlying client cannot be built.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use adk_anthropic::Anthropic;
+    ///
+    /// let client = Anthropic::new(Some("placeholder-api-key".to_string()))?
+    ///     .allow_insecure_http()
+    ///     .with_base_url_and_timeout(
+    ///         "http://gateway.corp.internal/anthropic".to_string(),
+    ///         Duration::from_secs(30),
+    ///     )?;
+    /// # let _ = client;
+    /// # Ok::<(), adk_anthropic::Error>(())
+    /// ```
     pub fn with_base_url_and_timeout(self, base_url: String, timeout: Duration) -> Result<Self> {
-        self.with_base_url(base_url).with_timeout(timeout)
+        self.with_base_url(base_url)?.with_timeout(timeout)
     }
 
     /// Build default headers for API requests (static method for initialization).
@@ -261,15 +578,12 @@ impl Anthropic {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(api_key).map_err(|e| {
-                Error::validation(
-                    format!("Invalid API key format: {e}"),
-                    Some("api_key".to_string()),
-                )
-            })?,
-        );
+        let mut api_key_value = HeaderValue::from_str(api_key).map_err(|e| {
+            Error::validation(format!("Invalid API key format: {e}"), Some("api_key".to_string()))
+        })?;
+        // Keeps the key out of `Debug` output of the header map and of request logs.
+        api_key_value.set_sensitive(true);
+        headers.insert("x-api-key", api_key_value);
         headers.insert("anthropic-version", HeaderValue::from_static(ANTHROPIC_API_VERSION));
         Ok(headers)
     }
@@ -277,6 +591,39 @@ impl Anthropic {
     /// Get cached headers for performance (no allocation needed).
     fn default_headers(&self) -> HeaderMap {
         (*self.cached_headers).clone()
+    }
+
+    /// Adds default HTTP headers, replacing defaults with the same name.
+    ///
+    /// Per-request replacement headers still take precedence. Automatically
+    /// selected beta headers continue to be derived from message parameters. The
+    /// headers are stored on the existing client rather than rebuilding it, so this
+    /// method cannot fail and returns `Self`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use adk_anthropic::Anthropic;
+    /// use reqwest::header::{HeaderMap, HeaderValue};
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("x-session-id", HeaderValue::from_static("conversation-1"));
+    /// let client = Anthropic::new(Some("api-key".into()))?.with_default_headers(headers);
+    /// # Ok::<(), adk_anthropic::Error>(())
+    /// ```
+    #[must_use]
+    pub fn with_default_headers(mut self, headers: HeaderMap) -> Self {
+        Arc::make_mut(&mut self.cached_headers).extend(headers);
+        self
+    }
+
+    /// Return a copy of the headers this client normally sends.
+    ///
+    /// Callers can modify this map and pass it to
+    /// [`Anthropic::send_with_headers`] or [`Anthropic::stream_with_headers`].
+    /// Those methods use replacement semantics, so the supplied map is sent
+    /// instead of these defaults.
+    pub fn default_headers_for_request(&self) -> HeaderMap {
+        self.default_headers()
     }
 
     /// Build a full endpoint URL from the base URL and endpoint path.
@@ -459,6 +806,41 @@ impl Anthropic {
         })
     }
 
+    /// Send a streaming POST request on the client that has no total timeout.
+    ///
+    /// The configured timeout bounds the wait for the response headers, the SSE
+    /// layer bounds inactivity in the body, and `stream_timeout`, when set,
+    /// bounds the whole request.
+    async fn send_stream_request(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: &impl serde::Serialize,
+    ) -> Result<Response> {
+        let mut request = self.stream_client.post(url).headers(headers).json(body);
+        if let Some(stream_timeout) = self.stream_timeout {
+            request = request.timeout(stream_timeout);
+        }
+
+        let response = tokio::time::timeout(self.timeout, request.send())
+            .await
+            .map_err(|_| {
+                Error::timeout(
+                    format!(
+                        "Timed out after {} seconds waiting for the streaming response headers",
+                        self.timeout.as_secs_f64()
+                    ),
+                    Some(self.timeout.as_secs_f64()),
+                )
+            })?
+            .map_err(|e| self.map_request_error(e))?;
+
+        if !response.status().is_success() {
+            return Err(Self::process_error_response(response).await);
+        }
+        Ok(response)
+    }
+
     /// Execute a GET request with error handling
     async fn execute_get_request<T: serde::de::DeserializeOwned>(
         &self,
@@ -484,8 +866,70 @@ impl Anthropic {
         })
     }
 
-    /// Send a message to the API and get a non-streaming response.
-    pub async fn send(&self, mut params: MessageCreateParams) -> Result<Message> {
+    fn append_beta_header(headers: &mut HeaderMap, beta: &str) -> Result<()> {
+        if beta.trim().is_empty() {
+            return Err(Error::validation(
+                "Beta identifier cannot be empty".to_string(),
+                Some("anthropic-beta".to_string()),
+            ));
+        }
+        let existing = headers
+            .get("anthropic-beta")
+            .map(HeaderValue::to_str)
+            .transpose()
+            .map_err(|error| {
+                Error::validation(
+                    format!("Invalid existing anthropic-beta header: {error}"),
+                    Some("anthropic-beta".to_string()),
+                )
+            })?
+            .unwrap_or_default();
+        if existing.split(',').any(|value| value.trim() == beta) {
+            return Ok(());
+        }
+
+        let combined =
+            if existing.is_empty() { beta.to_string() } else { format!("{existing},{beta}") };
+        let value = HeaderValue::from_str(&combined).map_err(|error| {
+            Error::validation(
+                format!("Invalid anthropic-beta header: {error}"),
+                Some("anthropic-beta".to_string()),
+            )
+        })?;
+        headers.insert("anthropic-beta", value);
+        Ok(())
+    }
+
+    fn message_headers(
+        &self,
+        params: &MessageCreateParams,
+        extra_betas: &[&str],
+        streaming: bool,
+    ) -> Result<HeaderMap> {
+        let mut headers = self.default_headers();
+        if streaming {
+            headers.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+        }
+        if params.requires_structured_outputs_beta() {
+            Self::append_beta_header(&mut headers, STRUCTURED_OUTPUTS_BETA)?;
+        }
+        if params.context_management.is_some() {
+            Self::append_beta_header(&mut headers, "context-management-2025-06-27")?;
+        }
+        if params.speed.is_some() {
+            Self::append_beta_header(&mut headers, "fast-mode-2026-02-01")?;
+        }
+        for beta in extra_betas {
+            Self::append_beta_header(&mut headers, beta)?;
+        }
+        Ok(headers)
+    }
+
+    async fn send_with_resolved_headers(
+        &self,
+        mut params: MessageCreateParams,
+        replacement_headers: Option<HeaderMap>,
+    ) -> Result<Message> {
         let start = Instant::now();
         CLIENT_REQUESTS.click();
 
@@ -504,45 +948,10 @@ impl Anthropic {
             params.temperature = Some(1.0);
         }
 
-        // Build headers
-        let mut headers = self.default_headers();
-
-        // Check if structured outputs beta header is needed
-        if params.requires_structured_outputs_beta() {
-            headers.insert("anthropic-beta", HeaderValue::from_static(STRUCTURED_OUTPUTS_BETA));
-        }
-
-        // When context_management is set, add the beta header
-        if params.context_management.is_some() {
-            let existing =
-                headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or("");
-            let new_val = if existing.is_empty() {
-                "context-management-2025-06-27".to_string()
-            } else {
-                format!("{existing},context-management-2025-06-27")
-            };
-            headers.insert(
-                "anthropic-beta",
-                HeaderValue::from_str(&new_val)
-                    .unwrap_or_else(|_| HeaderValue::from_static("context-management-2025-06-27")),
-            );
-        }
-
-        // When speed is set, add the fast-mode beta header
-        if params.speed.is_some() {
-            let existing =
-                headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or("");
-            let new_val = if existing.is_empty() {
-                "fast-mode-2026-02-01".to_string()
-            } else {
-                format!("{existing},fast-mode-2026-02-01")
-            };
-            headers.insert(
-                "anthropic-beta",
-                HeaderValue::from_str(&new_val)
-                    .unwrap_or_else(|_| HeaderValue::from_static("fast-mode-2026-02-01")),
-            );
-        }
+        let headers = match replacement_headers {
+            Some(headers) => headers,
+            None => self.message_headers(&params, &[], false)?,
+        };
 
         let result = self
             .retry_with_backoff(|| async {
@@ -556,6 +965,50 @@ impl Anthropic {
             CLIENT_REQUEST_ERRORS.click();
         }
         result
+    }
+
+    /// Send a message to the API and get a non-streaming response.
+    pub async fn send(&self, params: MessageCreateParams) -> Result<Message> {
+        self.send_with_resolved_headers(params, None).await
+    }
+
+    /// Send a message using an exact replacement header map.
+    ///
+    /// The supplied headers replace all client defaults and automatically
+    /// generated beta headers. This permits per-request bearer authentication,
+    /// API versions, beta selection, and deliberate beta suppression. Start
+    /// from [`Anthropic::default_headers_for_request`] when only a small change
+    /// is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parameters are invalid, a header is invalid,
+    /// or the request fails.
+    pub async fn send_with_headers(
+        &self,
+        params: MessageCreateParams,
+        headers: HeaderMap,
+    ) -> Result<Message> {
+        self.send_with_resolved_headers(params, Some(headers)).await
+    }
+
+    /// Send a message with caller-selected Anthropic beta versions.
+    ///
+    /// Caller-selected betas are de-duplicated with beta headers required by
+    /// the request's typed features. They are sent only as headers and never
+    /// serialized into the JSON body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a beta identifier or message parameter is invalid,
+    /// or the request fails.
+    pub async fn send_with_betas(
+        &self,
+        params: MessageCreateParams,
+        betas: &[&str],
+    ) -> Result<Message> {
+        let headers = self.message_headers(&params, betas, false)?;
+        self.send_with_resolved_headers(params, Some(headers)).await
     }
 
     /// Send a message to the API with logging and get a non-streaming response.
@@ -577,9 +1030,10 @@ impl Anthropic {
     /// Send a message to the API and get a streaming response.
     ///
     /// Returns a stream of MessageStreamEvent objects that can be processed incrementally.
-    pub async fn stream(
+    async fn stream_with_resolved_headers(
         &self,
         params: &MessageCreateParams,
+        replacement_headers: Option<HeaderMap>,
     ) -> Result<impl Stream<Item = Result<MessageStreamEvent>> + use<>> {
         let start = Instant::now();
         CLIENT_REQUESTS.click();
@@ -600,56 +1054,15 @@ impl Anthropic {
             params.temperature = Some(1.0);
         }
 
-        // Check if structured outputs beta header is needed
-        let needs_beta = params.requires_structured_outputs_beta();
-
-        // Check if context_management beta header is needed
-        let needs_context_mgmt = params.context_management.is_some();
-
-        // Check if fast-mode beta header is needed
-        let needs_fast_mode = params.speed.is_some();
+        let headers = match replacement_headers {
+            Some(headers) => headers,
+            None => self.message_headers(&params, &[], true)?,
+        };
 
         let response = self
             .retry_with_backoff(|| async {
                 let url = self.build_url("messages");
-
-                let mut headers = self.default_headers();
-                headers.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
-
-                // Build anthropic-beta header combining all needed betas
-                let mut betas = Vec::new();
-                if needs_beta {
-                    betas.push(STRUCTURED_OUTPUTS_BETA);
-                }
-                if needs_context_mgmt {
-                    betas.push("context-management-2025-06-27");
-                }
-                if needs_fast_mode {
-                    betas.push("fast-mode-2026-02-01");
-                }
-                if !betas.is_empty() {
-                    let beta_val = betas.join(",");
-                    headers.insert(
-                        "anthropic-beta",
-                        HeaderValue::from_str(&beta_val)
-                            .unwrap_or_else(|_| HeaderValue::from_static(STRUCTURED_OUTPUTS_BETA)),
-                    );
-                }
-
-                let response = self
-                    .client
-                    .post(&url)
-                    .headers(headers)
-                    .json(&params)
-                    .send()
-                    .await
-                    .map_err(|e| self.map_request_error(e))?;
-
-                if !response.status().is_success() {
-                    return Err(Self::process_error_response(response).await);
-                }
-
-                Ok(response)
+                self.send_stream_request(&url, headers.clone(), &params).await
             })
             .await;
 
@@ -667,6 +1080,133 @@ impl Anthropic {
 
         // Create an SSE processor
         Ok(process_sse(stream))
+    }
+
+    /// Send a message to the API and stream response events.
+    pub async fn stream(
+        &self,
+        params: &MessageCreateParams,
+    ) -> Result<impl Stream<Item = Result<MessageStreamEvent>> + use<>> {
+        self.stream_with_resolved_headers(params, None).await
+    }
+
+    /// Stream a message using an exact replacement header map.
+    ///
+    /// The supplied headers replace all defaults, including `Accept`,
+    /// authentication, API-version, and generated beta headers. Callers should
+    /// normally include `Accept: text/event-stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parameters are invalid, a header is invalid,
+    /// or the request fails.
+    pub async fn stream_with_headers(
+        &self,
+        params: &MessageCreateParams,
+        headers: HeaderMap,
+    ) -> Result<impl Stream<Item = Result<MessageStreamEvent>> + use<>> {
+        self.stream_with_resolved_headers(params, Some(headers)).await
+    }
+
+    /// Stream a message with caller-selected Anthropic beta versions.
+    ///
+    /// Caller-selected betas are de-duplicated with beta headers required by
+    /// the request's typed features. They are sent only as headers and never
+    /// serialized into the JSON body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a beta identifier or message parameter is invalid,
+    /// or the request fails.
+    pub async fn stream_with_betas(
+        &self,
+        params: &MessageCreateParams,
+        betas: &[&str],
+    ) -> Result<impl Stream<Item = Result<MessageStreamEvent>> + use<>> {
+        let headers = self.message_headers(params, betas, true)?;
+        self.stream_with_resolved_headers(params, Some(headers)).await
+    }
+
+    /// Send a message with Claude server-side refusal fallback enabled.
+    ///
+    /// The beta API retries only safety-classifier refusals. Rate limits,
+    /// overloads, and server failures are returned without fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request or fallback configuration is invalid,
+    /// or the request fails.
+    pub async fn send_with_server_fallbacks(
+        &self,
+        mut request: ServerFallbackRequest,
+    ) -> Result<ServerFallbackMessage> {
+        let start = Instant::now();
+        CLIENT_REQUESTS.click();
+        if let Err(error) = request.validate() {
+            CLIENT_REQUEST_ERRORS.click();
+            CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+            return Err(error);
+        }
+
+        request.params.stream = false;
+        if matches!(request.params.thinking, Some(ThinkingConfig::Enabled { .. })) {
+            request.params.temperature = Some(1.0);
+        }
+        let headers = self.message_headers(&request.params, &[SERVER_FALLBACK_BETA], false)?;
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = self.build_url("messages");
+                self.execute_post_request(&url, &request, Some(headers.clone())).await
+            })
+            .await;
+
+        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+        if result.is_err() {
+            CLIENT_REQUEST_ERRORS.click();
+        }
+        result
+    }
+
+    /// Stream a message with Claude server-side refusal fallback enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request or fallback configuration is invalid,
+    /// or the request fails.
+    pub async fn stream_with_server_fallbacks(
+        &self,
+        request: &ServerFallbackRequest,
+    ) -> Result<impl Stream<Item = Result<ServerFallbackStreamEvent>> + use<>> {
+        let start = Instant::now();
+        CLIENT_REQUESTS.click();
+        if let Err(error) = request.validate() {
+            CLIENT_REQUEST_ERRORS.click();
+            CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+            return Err(error);
+        }
+
+        let mut request = request.clone();
+        request.params.stream = true;
+        if matches!(request.params.thinking, Some(ThinkingConfig::Enabled { .. })) {
+            request.params.temperature = Some(1.0);
+        }
+        let headers = self.message_headers(&request.params, &[SERVER_FALLBACK_BETA], true)?;
+        let response = self
+            .retry_with_backoff(|| async {
+                let url = self.build_url("messages");
+                self.send_stream_request(&url, headers.clone(), &request).await
+            })
+            .await;
+
+        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                CLIENT_REQUEST_ERRORS.click();
+                return Err(error);
+            }
+        };
+        Ok(process_json_sse(response.bytes_stream()))
     }
 
     /// Send a message to the API with logging and get a streaming response.
@@ -1182,17 +1722,39 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn debug_output_redacts_api_key_and_bearer_token() {
+        let client = Anthropic::new(Some("sk-ant-secret-key-value".to_string())).unwrap();
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("sk-ant-secret-key-value"), "api key leaked: {debug}");
+        assert!(debug.contains("[REDACTED]"));
+
+        let client = Anthropic::new_with_auth_token("secret-bearer-token").unwrap();
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("secret-bearer-token"), "bearer token leaked: {debug}");
+    }
+
+    #[test]
+    fn api_key_header_is_marked_sensitive() {
+        let headers = Anthropic::build_default_headers("sk-ant-secret-key-value").unwrap();
+
+        assert!(headers.get("x-api-key").unwrap().is_sensitive());
+    }
+
     #[tokio::test]
     async fn retry_logic_with_backoff() {
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
+            stream_timeout: None,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
+            allow_insecure_http: false,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1221,12 +1783,15 @@ mod tests {
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
+            stream_timeout: None,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
+            allow_insecure_http: false,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1253,12 +1818,15 @@ mod tests {
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
+            stream_timeout: None,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
+            allow_insecure_http: false,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1286,12 +1854,15 @@ mod tests {
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
+            stream_timeout: None,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
+            allow_insecure_http: false,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1334,6 +1905,41 @@ mod tests {
         // Test that rate_limit error (which 529 now maps to) is also retryable
         let rate_limit_error = Error::rate_limit("Overloaded", Some(5));
         assert!(rate_limit_error.is_retryable());
+    }
+
+    #[test]
+    fn explicit_configuration() {
+        if std::env::var_os("ADK_EXPLICIT_CONFIG_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::tests::explicit_configuration"])
+                .env("ADK_EXPLICIT_CONFIG_CHILD", "1")
+                .env("ANTHROPIC_BASE_URL", "invalid-environment-url")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let key = "sk-explicit-key";
+        let client = Anthropic::new_with_base_url(key, "http://127.0.0.1:12345").unwrap();
+        assert_eq!(client.api_key, key);
+        assert_eq!(client.cached_headers["x-api-key"], key);
+        assert_eq!(client.base_url, "http://127.0.0.1:12345");
+        assert!(Anthropic::new_with_base_url(key, "invalid-explicit-url").is_err());
+
+        let dir =
+            std::env::temp_dir().join(format!("adk_anthropic_explicit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("key.txt");
+        std::fs::write(&file, "sk-from-file\n").unwrap();
+        let client =
+            Anthropic::new_with_base_url(format!("file://{}", file.display()), "https://a.example")
+                .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(client.api_key, "sk-from-file");
+        assert!(
+            Anthropic::new_with_base_url("file:///adk-missing-key-file", "https://a.example")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1405,6 +2011,7 @@ mod tests {
         // Test builder pattern methods
         let configured_client = client
             .with_base_url("https://custom.api.com".to_string())
+            .unwrap()
             .with_max_retries(5)
             .with_backoff_params(2.0, 1.0);
 
@@ -1430,7 +2037,8 @@ mod tests {
     fn build_url_custom_base_without_trailing_slash() {
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url("https://api.minimax.io/anthropic".to_string());
+            .with_base_url("https://api.minimax.io/anthropic".to_string())
+            .unwrap();
         assert_eq!(client.build_url("messages"), "https://api.minimax.io/anthropic/v1/messages");
     }
 
@@ -1438,7 +2046,8 @@ mod tests {
     fn build_url_custom_base_with_trailing_slash() {
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url("https://api.minimax.io/anthropic/".to_string());
+            .with_base_url("https://api.minimax.io/anthropic/".to_string())
+            .unwrap();
         assert_eq!(client.build_url("messages"), "https://api.minimax.io/anthropic/v1/messages");
     }
 
@@ -1446,12 +2055,243 @@ mod tests {
     fn build_url_minimax_china() {
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url("https://api.minimaxi.com/anthropic".to_string());
+            .with_base_url("https://api.minimaxi.com/anthropic".to_string())
+            .unwrap();
         assert_eq!(client.build_url("messages"), "https://api.minimaxi.com/anthropic/v1/messages");
         assert_eq!(
             client.build_url(&format!("models/{}", "claude-3-opus")),
             "https://api.minimaxi.com/anthropic/v1/models/claude-3-opus"
         );
+    }
+
+    #[test]
+    fn with_base_url_accepts_https() {
+        let client = Anthropic::new(Some("placeholder-api-key".to_string()))
+            .unwrap()
+            .with_base_url("https://gateway.example.com/anthropic".to_string())
+            .unwrap();
+        assert_eq!(client.base_url, "https://gateway.example.com/anthropic");
+    }
+
+    #[test]
+    fn with_base_url_allows_loopback_http_for_local_dev() {
+        for url in ["http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"] {
+            let client = Anthropic::new(Some("placeholder-api-key".to_string()))
+                .unwrap()
+                .with_base_url(url.to_string())
+                .unwrap_or_else(|e| panic!("loopback url {url} should be accepted: {e}"));
+            assert_eq!(client.base_url, url);
+        }
+    }
+
+    #[test]
+    fn with_base_url_rejects_cleartext_http() {
+        let err = Anthropic::new(Some("placeholder-api-key".to_string()))
+            .unwrap()
+            .with_base_url("http://gateway.internal.example.com".to_string())
+            .expect_err("a non-loopback http base URL must be rejected");
+
+        assert!(err.is_validation(), "expected a validation error, got {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("unencrypted"),
+            "error should explain the cleartext risk, got: {message}"
+        );
+        assert!(message.contains("'http'"), "error should name the scheme, got: {message}");
+        assert!(
+            message.contains("allow_insecure_http"),
+            "error should name the opt-in, got: {message}"
+        );
+    }
+
+    #[test]
+    fn allow_insecure_http_before_with_base_url_accepts_cleartext_http() {
+        let client = Anthropic::new(Some("placeholder-api-key".to_string()))
+            .unwrap()
+            .allow_insecure_http()
+            .with_base_url("http://10.60.1.20:8080/api/v1/llm/anthropic".to_string())
+            .unwrap();
+        assert_eq!(client.base_url, "http://10.60.1.20:8080/api/v1/llm/anthropic");
+        assert_eq!(
+            client.build_url("messages"),
+            "http://10.60.1.20:8080/api/v1/llm/anthropic/v1/messages"
+        );
+
+        let client = Anthropic::new_with_base_url("placeholder-api-key", DEFAULT_API_URL)
+            .unwrap()
+            .allow_insecure_http()
+            .with_base_url_and_timeout(
+                "http://gateway.corp.internal".to_string(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(client.base_url, "http://gateway.corp.internal");
+        assert_eq!(client.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn allow_insecure_http_after_with_base_url_is_too_late() {
+        let err = Anthropic::new(Some("placeholder-api-key".to_string()))
+            .unwrap()
+            .with_base_url("http://10.60.1.20:8080".to_string())
+            .map(Anthropic::allow_insecure_http)
+            .expect_err("with_base_url validates before the opt-in is set");
+        assert!(err.is_validation(), "expected a validation error, got {err}");
+        assert!(
+            err.to_string().contains("allow_insecure_http"),
+            "error should name the opt-in, got: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_insecure_http_admits_http_only() {
+        for url in ["ftp://files.example.com", "ws://gateway.example.com", "not-a-url"] {
+            let err = Anthropic::new(Some("placeholder-api-key".to_string()))
+                .unwrap()
+                .allow_insecure_http()
+                .with_base_url(url.to_string())
+                .expect_err("the opt-in must not admit other schemes");
+            assert!(err.is_validation(), "expected a validation error for {url}, got {err}");
+        }
+    }
+
+    #[test]
+    fn new_with_base_url_rejection_names_the_opt_in() {
+        let err = Anthropic::new_with_base_url("placeholder-api-key", "http://10.60.1.20:8080")
+            .expect_err("a non-loopback http base URL must be rejected");
+        assert!(
+            err.to_string().contains("allow_insecure_http"),
+            "error should name the opt-in, got: {err}"
+        );
+    }
+
+    #[test]
+    fn insecure_http_environment() {
+        const GATEWAY: &str = "http://10.60.1.20:8080/api/v1/llm/anthropic";
+        if std::env::var_os("ADK_INSECURE_HTTP_ENV_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::tests::insecure_http_environment"])
+                .env("ADK_INSECURE_HTTP_ENV_CHILD", "1")
+                .env("ANTHROPIC_BASE_URL", GATEWAY)
+                .env("ANTHROPIC_ALLOW_INSECURE_HTTP", "true")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let client = Anthropic::new(Some("placeholder-api-key".to_string()))
+            .expect("ANTHROPIC_ALLOW_INSECURE_HTTP admits the ANTHROPIC_BASE_URL gateway");
+        assert_eq!(client.base_url(), GATEWAY);
+
+        // The environment acknowledges the environment URL only, not URLs given in code.
+        assert!(!client.allow_insecure_http);
+        let err = client
+            .with_base_url("http://gateway.corp.internal".to_string())
+            .expect_err("a URL given in code needs allow_insecure_http()");
+        assert!(err.to_string().contains("allow_insecure_http"), "got: {err}");
+        assert!(Anthropic::new_with_base_url("placeholder-api-key", GATEWAY).is_err());
+    }
+
+    #[test]
+    fn with_base_url_rejects_non_http_schemes_and_garbage() {
+        for url in ["ftp://files.example.com", "ws://gateway.example.com", "not-a-url"] {
+            let err = Anthropic::new(Some("placeholder-api-key".to_string()))
+                .unwrap()
+                .with_base_url(url.to_string())
+                .expect_err("non-https, non-loopback base URL must be rejected");
+            assert!(err.is_validation(), "expected a validation error for {url}, got {err}");
+        }
+    }
+
+    // The `ANTHROPIC_BASE_URL` tests exercise `resolve_base_url` directly instead
+    // of mutating the process environment. The environment is process-global, so
+    // setting an intentionally-rejected value would race against every other test
+    // in this binary that calls `Anthropic::new`. `resolve_base_url` is the exact
+    // code path `Anthropic::new` uses for the env value, so nothing is lost.
+
+    #[test]
+    fn env_base_url_absent_falls_back_to_default() {
+        let resolved = Anthropic::resolve_base_url(None, None).unwrap();
+        assert_eq!(resolved, DEFAULT_API_URL);
+        let resolved = Anthropic::resolve_base_url(None, Some("1".to_string())).unwrap();
+        assert_eq!(resolved, DEFAULT_API_URL);
+    }
+
+    #[test]
+    fn env_base_url_accepts_https() {
+        let resolved = Anthropic::resolve_base_url(
+            Some("https://gateway.example.com/anthropic".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved, "https://gateway.example.com/anthropic");
+    }
+
+    #[test]
+    fn env_base_url_allows_loopback_http_for_local_dev() {
+        for url in ["http://localhost:11434", "http://127.0.0.1:11434", "http://[::1]:11434"] {
+            let resolved = Anthropic::resolve_base_url(Some(url.to_string()), None)
+                .unwrap_or_else(|e| panic!("loopback url {url} should be accepted: {e}"));
+            assert_eq!(resolved, url);
+        }
+    }
+
+    #[test]
+    fn env_base_url_rejects_cleartext_http() {
+        for flag in [None, Some("0"), Some("false"), Some("yes"), Some("")] {
+            let err = Anthropic::resolve_base_url(
+                Some("http://gateway.internal.example.com".to_string()),
+                flag.map(str::to_string),
+            )
+            .expect_err("a non-loopback http ANTHROPIC_BASE_URL must be rejected");
+
+            assert!(err.is_validation(), "expected a validation error, got {err}");
+            let message = err.to_string();
+            assert!(
+                message.contains("unencrypted"),
+                "error should explain the cleartext risk, got: {message}"
+            );
+            assert!(message.contains("'http'"), "error should name the scheme, got: {message}");
+            assert!(
+                message.contains("ANTHROPIC_ALLOW_INSECURE_HTTP=1"),
+                "error should name the environment opt-in for {flag:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_base_url_accepts_cleartext_http_when_acknowledged() {
+        for flag in ["1", "true", "TRUE", " True "] {
+            let resolved = Anthropic::resolve_base_url(
+                Some("http://10.60.1.20:8080/api/v1/llm/anthropic".to_string()),
+                Some(flag.to_string()),
+            )
+            .unwrap_or_else(|e| {
+                panic!("ANTHROPIC_ALLOW_INSECURE_HTTP={flag:?} should admit http: {e}")
+            });
+            assert_eq!(resolved, "http://10.60.1.20:8080/api/v1/llm/anthropic");
+        }
+    }
+
+    #[test]
+    fn env_base_url_rejects_non_http_schemes_and_garbage() {
+        for url in ["ftp://files.example.com", "ws://gateway.example.com", "not-a-url"] {
+            let err = Anthropic::resolve_base_url(Some(url.to_string()), Some("1".to_string()))
+                .expect_err("non-https, non-loopback ANTHROPIC_BASE_URL must be rejected");
+            assert!(err.is_validation(), "expected a validation error for {url}, got {err}");
+        }
+    }
+
+    #[test]
+    fn with_base_url_and_timeout_rejects_cleartext_http() {
+        let err = Anthropic::new(Some("placeholder-api-key".to_string()))
+            .unwrap()
+            .with_base_url_and_timeout(
+                "http://gateway.internal.example.com".to_string(),
+                Duration::from_secs(5),
+            )
+            .expect_err("a non-loopback http base URL must be rejected");
+        assert!(err.is_validation(), "expected a validation error, got {err}");
     }
 
     #[test]
@@ -1495,12 +2335,15 @@ mod tests {
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
+            stream_timeout: None,
             max_retries: 1,
             throughput_ops_sec: 1.0,
             reserve_capacity: 1.0,
             cached_headers: Arc::new(HeaderMap::new()),
+            allow_insecure_http: false,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));

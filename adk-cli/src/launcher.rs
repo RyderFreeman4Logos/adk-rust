@@ -365,6 +365,7 @@ impl Launcher {
                         )
                         .await?;
                     let mut printer = StreamPrinter::new(thinking_mode);
+                    let mut text_deltas = adk_core::EventTextDeltas::default();
                     let mut current_agent = String::new();
                     let mut printed_header = false;
                     let mut interrupted = false;
@@ -378,6 +379,7 @@ impl Launcher {
 
                                 match event {
                                     Ok(evt) => {
+                                        let evt = text_deltas.push(&evt);
                                         // Track agent switches in multi-agent workflows
                                         if !evt.author.is_empty()
                                             && evt.author != "user"
@@ -653,7 +655,8 @@ impl StreamPrinter {
                 self.handle_text_chunk(text);
             }
             Part::Thinking { thinking, .. } => {
-                if matches!(self.thinking_mode, ThinkingDisplayMode::Hide) {
+                // A snapshot reduced to its unseen suffix can leave an empty thinking part.
+                if thinking.is_empty() || matches!(self.thinking_mode, ThinkingDisplayMode::Hide) {
                     return;
                 }
                 if !self.in_thinking_part_stream {
@@ -674,12 +677,12 @@ impl StreamPrinter {
                 self.flush_pending_thinking();
                 self.print_tool_response(&function_response.name, &function_response.response);
             }
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 self.flush_pending_thinking();
                 print!("\n[inline-data] mime={mime_type} bytes={}\n", data.len());
                 let _ = io::stdout().flush();
             }
-            Part::FileData { mime_type, file_uri } => {
+            Part::FileData { mime_type, file_uri, .. } => {
                 self.flush_pending_thinking();
                 print!("\n[file-data] mime={mime_type} uri={file_uri}\n");
                 let _ = io::stdout().flush();
@@ -692,6 +695,26 @@ impl StreamPrinter {
             Part::ServerToolResponse { server_tool_response } => {
                 self.flush_pending_thinking();
                 print!("\n[server-tool-response] {}B\n", server_tool_response.to_string().len());
+                let _ = io::stdout().flush();
+            }
+            Part::EmbeddedResource { resource } => {
+                self.flush_pending_thinking();
+                match resource {
+                    adk_core::EmbeddedResource::Text(text) => {
+                        print!(
+                            "\n[embedded-resource] uri={} text-len={}\n",
+                            text.uri,
+                            text.text.len()
+                        );
+                    }
+                    adk_core::EmbeddedResource::Blob(blob) => {
+                        print!(
+                            "\n[embedded-resource] uri={} bytes={}\n",
+                            blob.uri,
+                            blob.data.len()
+                        );
+                    }
+                }
                 let _ = io::stdout().flush();
             }
         }
@@ -942,16 +965,17 @@ mod tests {
                 serde_json::json!({"temp": 72}),
             ),
             id: None,
+            annotations: None,
         });
 
         // InlineData
-        printer
-            .handle_part(&Part::InlineData { mime_type: "image/png".into(), data: vec![0u8; 100] });
+        printer.handle_part(&Part::inline_data("image/png", vec![0u8; 100]));
 
         // FileData
         printer.handle_part(&Part::FileData {
             mime_type: "audio/wav".into(),
             file_uri: "gs://bucket/file.wav".into(),
+            annotations: None,
         });
 
         // No panics, no state corruption
@@ -964,6 +988,14 @@ mod tests {
         let mut printer = StreamPrinter::new(ThinkingDisplayMode::Auto);
         printer.handle_text_chunk("just plain text with no tags");
         assert!(!printer.in_think_block);
+        assert!(printer.think_buffer.is_empty());
+    }
+
+    #[test]
+    fn stream_printer_ignores_an_empty_thinking_part() {
+        let mut printer = StreamPrinter::new(ThinkingDisplayMode::Auto);
+        printer.handle_part(&Part::Thinking { thinking: String::new(), signature: None });
+        assert!(!printer.in_thinking_part_stream);
         assert!(printer.think_buffer.is_empty());
     }
 

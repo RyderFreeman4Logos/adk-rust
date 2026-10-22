@@ -85,6 +85,13 @@ impl Agent for SequentialAgent {
         self.loop_agent.sub_agents()
     }
 
+    fn supports_agent_transfer(&self) -> bool {
+        // Deterministic workflow agent: on cross-turn resumption the runner
+        // must restart from this root so every sub-agent runs again in order,
+        // rather than resuming a single sub-agent that responded last.
+        false
+    }
+
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
         self.loop_agent.run(ctx).await
     }

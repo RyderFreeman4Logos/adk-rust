@@ -1,6 +1,6 @@
 //! Time-travel debugging for graph execution history.
 //!
-//! This module provides [`TimeTravelHandle`] for navigating, replaying, and forking
+//! This module provides [`TimeTravelHandle`] for navigating, inspecting, and forking
 //! graph execution history. It works with any [`Checkpointer`] implementation to
 //! inspect past execution steps, resume from arbitrary points, and create divergent
 //! execution branches.
@@ -27,7 +27,7 @@
 //!     .compile(Some(checkpointer.clone()));
 //!
 //! // Get a time-travel handle for a thread
-//! let handle = graph.time_travel("thread_1");
+//! let handle = graph.time_travel("thread_1").unwrap();
 //!
 //! // List all steps
 //! let steps = handle.steps().await?;
@@ -39,7 +39,7 @@
 //! handle.fork_at(2, "thread_1_fork").await?;
 //!
 //! // Replay steps 0 through 3
-//! let states = handle.replay(0, Some(3)).await?;
+//! let states = handle.state_history(0, Some(3)).await?;
 //! ```
 
 use std::sync::Arc;
@@ -162,7 +162,7 @@ impl<'g> TimeTravelHandle<'g> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let handle = graph.time_travel("thread_1");
+    /// let handle = graph.time_travel("thread_1").unwrap();
     /// let steps = handle.steps().await?;
     ///
     /// for step in &steps {
@@ -207,7 +207,7 @@ impl<'g> TimeTravelHandle<'g> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let handle = graph.time_travel("thread_1");
+    /// let handle = graph.time_travel("thread_1").unwrap();
     ///
     /// // Resume from step 3
     /// let config = ExecutionConfig::new("thread_1");
@@ -255,7 +255,7 @@ impl<'g> TimeTravelHandle<'g> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let handle = graph.time_travel("thread_1");
+    /// let handle = graph.time_travel("thread_1").unwrap();
     ///
     /// // Fork at step 2 to explore an alternative execution path
     /// handle.fork_at(2, "thread_1_experiment").await?;
@@ -288,38 +288,40 @@ impl<'g> TimeTravelHandle<'g> {
         Ok(())
     }
 
-    /// Replay execution between two steps, returning intermediate states.
+    /// Returns the stored state at each checkpointed step in a range.
     ///
-    /// Re-executes the graph from `from_step` to `to_step` (inclusive),
-    /// collecting the state at each step. If `to_step` is `None`, replays
-    /// to the last available step.
+    /// This **reads** checkpoints; it does not execute anything. No node runs, no
+    /// event is regenerated, and no side effect is repeated — the states returned are
+    /// the snapshots that were saved when the graph originally ran. Use it to inspect
+    /// how state evolved, not to reproduce a decision.
+    ///
+    /// To re-run from a point in history, fork that checkpoint with `fork_at`
+    /// and invoke the graph on the forked thread.
     ///
     /// # Arguments
     ///
-    /// * `from_step` - The step number to start replaying from
-    /// * `to_step` - The step number to stop at (inclusive), or `None` for the last step
+    /// * `from_step` - First step to include
+    /// * `to_step` - Last step to include, or `None` for the last checkpointed step
     ///
     /// # Errors
     ///
-    /// Returns [`GraphError`] if:
-    /// - No checkpoint exists at `from_step`
-    /// - The replay execution fails
+    /// Returns [`GraphError`] when no checkpoint exists at `from_step`.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let handle = graph.time_travel("thread_1");
+    /// let handle = graph.time_travel("thread_1").unwrap();
     ///
-    /// // Replay steps 1 through 4
-    /// let transitions = handle.replay(1, Some(4)).await?;
+    /// // The stored state at steps 1 through 4
+    /// let transitions = handle.state_history(1, Some(4)).await?;
     /// for (step, state) in &transitions {
     ///     println!("Step {}: {:?}", step, state.keys().collect::<Vec<_>>());
     /// }
     ///
-    /// // Replay from step 2 to the end
-    /// let all_remaining = handle.replay(2, None).await?;
+    /// // From step 2 to the last checkpoint
+    /// let all_remaining = handle.state_history(2, None).await?;
     /// ```
-    pub async fn replay(
+    pub async fn state_history(
         &self,
         from_step: usize,
         to_step: Option<usize>,
@@ -375,15 +377,21 @@ impl CompiledGraph {
     ///     .add_edge("process", END)
     ///     .compile(Some(checkpointer));
     ///
-    /// let handle = graph.time_travel("thread_1");
+    /// let handle = graph.time_travel("thread_1").unwrap();
     /// let steps = handle.steps().await?;
     /// ```
-    pub fn time_travel(&self, thread_id: &str) -> TimeTravelHandle<'_> {
-        let checkpointer = self
-            .checkpointer
-            .clone()
-            .expect("time_travel requires a checkpointer to be configured");
-        TimeTravelHandle::new(self, thread_id, checkpointer)
+    /// # Errors
+    ///
+    /// Returns [`GraphError::CheckpointError`] when the graph has no
+    /// checkpointer, because every operation on the handle reads checkpoints.
+    pub fn time_travel(&self, thread_id: &str) -> Result<TimeTravelHandle<'_>> {
+        let checkpointer = self.checkpointer.clone().ok_or_else(|| {
+            GraphError::CheckpointError(
+                "time travel needs a checkpointer. Add one with with_checkpointer before calling time_travel"
+                    .to_string(),
+            )
+        })?;
+        Ok(TimeTravelHandle::new(self, thread_id, checkpointer))
     }
 }
 
@@ -431,7 +439,7 @@ mod tests {
         let (graph, checkpointer) = build_test_graph();
         seed_checkpoints(&checkpointer, "thread_1", 5).await;
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
         // Fork at step 2
         handle.fork_at(2, "thread_1_fork").await.unwrap();
@@ -452,7 +460,7 @@ mod tests {
         let (graph, checkpointer) = build_test_graph();
         seed_checkpoints(&checkpointer, "thread_1", 3).await;
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
         let result = handle.fork_at(99, "new_thread").await;
         assert!(result.is_err());
@@ -461,14 +469,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_replay_returns_states_in_range() {
+    async fn test_state_history_returns_states_in_range() {
         let (graph, checkpointer) = build_test_graph();
         seed_checkpoints(&checkpointer, "thread_1", 5).await;
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
         // Replay steps 1 through 3
-        let results = handle.replay(1, Some(3)).await.unwrap();
+        let results = handle.state_history(1, Some(3)).await.unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(
             results[0],
@@ -483,14 +491,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_replay_to_end() {
+    async fn test_state_history_to_end() {
         let (graph, checkpointer) = build_test_graph();
         seed_checkpoints(&checkpointer, "thread_1", 5).await;
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
         // Replay from step 2 to end (None)
-        let results = handle.replay(2, None).await.unwrap();
+        let results = handle.state_history(2, None).await.unwrap();
         assert_eq!(results.len(), 3); // steps 2, 3, 4
         assert_eq!(results[0].0, 2);
         assert_eq!(results[1].0, 3);
@@ -502,9 +510,9 @@ mod tests {
         let (graph, checkpointer) = build_test_graph();
         seed_checkpoints(&checkpointer, "thread_1", 3).await;
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
-        let result = handle.replay(99, None).await;
+        let result = handle.state_history(99, None).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("no checkpoint found at step 99"));
@@ -520,7 +528,7 @@ mod tests {
         let cp = Checkpoint::new("thread_1", state, 0, vec!["increment".to_string()]);
         checkpointer.save(&cp).await.unwrap();
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
         // Resume from step 0 — the graph should execute "increment" and produce count=6
         let config = ExecutionConfig::new("thread_1");
@@ -533,7 +541,7 @@ mod tests {
         let (graph, checkpointer) = build_test_graph();
         seed_checkpoints(&checkpointer, "thread_1", 3).await;
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
         let config = ExecutionConfig::new("thread_1");
         let result = handle.resume_from(99, config).await;
@@ -547,7 +555,7 @@ mod tests {
         let (graph, checkpointer) = build_test_graph();
         seed_checkpoints(&checkpointer, "thread_1", 5).await;
 
-        let handle = graph.time_travel("thread_1");
+        let handle = graph.time_travel("thread_1").unwrap();
 
         // Fork at step 2
         handle.fork_at(2, "forked").await.unwrap();

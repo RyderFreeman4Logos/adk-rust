@@ -143,6 +143,39 @@ pub trait SchemaAdapter: Send + Sync + std::fmt::Debug {
     fn empty_schema(&self) -> Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
+
+    /// The function-declaration field this adapter's output must be posted under.
+    ///
+    /// A provider may accept more than one schema dialect on different fields —
+    /// Gemini takes an OpenAPI subset on `parameters` and standard JSON Schema
+    /// on `parametersJsonSchema`, and the two are mutually exclusive. The
+    /// reduction and the field name are therefore **one decision**: a schema
+    /// reduced for one dialect but posted under the other's field is either
+    /// rejected outright, or silently accepted carrying constraints the model
+    /// was never shown.
+    ///
+    /// Returning the field from the adapter keeps that decision in the one place
+    /// that already knows which dialect it produced, so a caller cannot pick the
+    /// wrong one. Defaults to `"parameters"`, which is correct for every
+    /// provider having only one such field.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::SchemaAdapter;
+    /// use serde_json::Value;
+    ///
+    /// #[derive(Debug)]
+    /// struct TestAdapter;
+    /// impl SchemaAdapter for TestAdapter {
+    ///     fn normalize_schema(&self, schema: Value) -> Value { schema }
+    /// }
+    ///
+    /// assert_eq!(TestAdapter.parameters_field(), "parameters");
+    /// ```
+    fn parameters_field(&self) -> &'static str {
+        "parameters"
+    }
 }
 
 /// Default schema adapter for providers with no specific requirements (Ollama, etc.).

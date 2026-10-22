@@ -1,6 +1,6 @@
 use adk_core::{
     AdkIdentity, Agent, AppName, Artifacts, CallbackContext, Content, Event, ExecutionIdentity,
-    InvocationContext as InvocationContextTrait, InvocationId, Memory, ReadonlyContext,
+    InvocationContext as InvocationContextTrait, InvocationId, Memory, Part, ReadonlyContext,
     RequestContext, RunConfig, SecretService, SessionId, UserId,
 };
 use adk_session::Session as AdkSession;
@@ -106,9 +106,15 @@ impl MutableSession {
     /// already done.
     ///
     /// When `agent_name` is `None`, all events are included (backward-compatible).
+    ///
+    /// `branch` additionally scopes history to a conversation branch: an event is
+    /// kept when its branch equals `branch` or is an ancestor of it, so
+    /// concurrent `ParallelAgent` branches do not read each other's output. An
+    /// empty `branch`, or an event without one, matches everything.
     pub fn conversation_history_for_agent_impl(
         &self,
         agent_name: Option<&str>,
+        branch: &str,
     ) -> Vec<adk_core::Content> {
         let Ok(events) = self.events.read() else {
             tracing::error!("events RwLock poisoned in conversation_history — returning empty");
@@ -122,7 +128,10 @@ impl MutableSession {
         let mut compaction_boundary = None;
         for event in events.iter().rev() {
             if let Some(ref compaction) = event.actions.compaction {
-                history.push(compaction.compacted_content.clone());
+                history.push(HistoryContent {
+                    content: compaction.compacted_content.clone(),
+                    invocation_id: None,
+                });
                 compaction_boundary = Some(compaction.end_timestamp);
                 break;
             }
@@ -134,10 +143,23 @@ impl MutableSession {
                 continue;
             }
 
+            // Streamed deltas are superseded by their terminal event, which carries the
+            // complete response; the persisted session holds only that terminal event.
+            if event.llm_response.partial {
+                continue;
+            }
+
             // Skip events that were already compacted
             if let Some(boundary) = compaction_boundary
                 && event.timestamp <= boundary
             {
+                continue;
+            }
+
+            // Skip events from sibling branches (and from branches nested below
+            // this one). Ancestor branches stay visible so a sub-agent still sees
+            // the conversation that led to it.
+            if !adk_core::event_belongs_to_branch(branch, &event.branch) {
                 continue;
             }
 
@@ -161,12 +183,165 @@ impl MutableSession {
                     _ => "model",
                 }
                 .to_string();
-                history.push(mapped_content);
+                history.push(HistoryContent {
+                    content: mapped_content,
+                    invocation_id: Some(event.invocation_id.clone()),
+                });
             }
         }
 
-        history
+        close_interrupted_tool_calls(history)
     }
+}
+
+struct HistoryContent {
+    content: Content,
+    invocation_id: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PartLocation {
+    content: usize,
+    part: usize,
+}
+
+struct PendingFunctionCall {
+    location: PartLocation,
+    id: Option<String>,
+    name: String,
+    user_turn: usize,
+    invocation_id: Option<String>,
+}
+
+/// Makes persisted conversation history valid for the next model turn without
+/// rewriting the source events.
+///
+/// A runner interruption can happen after a model function call is persisted
+/// but before its tool response is available. Responses from overlapping runs
+/// may also be persisted after a later user message, so known responses are
+/// paired first. An unmatched call is closed only when a later user turn exists
+/// and has no durable response in the retained history. Such calls are omitted
+/// from the model projection rather than assigned a result that did not occur.
+fn close_interrupted_tool_calls(history: Vec<HistoryContent>) -> Vec<Content> {
+    let mut pending = Vec::<PendingFunctionCall>::new();
+    let mut removed_parts = std::collections::HashSet::<PartLocation>::new();
+    let mut responses_after = HashMap::<usize, Vec<(usize, String, Part)>>::new();
+    let mut user_turn = 0;
+
+    // Reconcile against the complete retained history first. Concurrent runs can
+    // persist a response after another run's user event, and that response still
+    // completes the original call.
+    for (content_index, history_content) in history.iter().enumerate() {
+        let content = &history_content.content;
+        for (part_index, part) in content.parts.iter().enumerate() {
+            match part {
+                Part::FunctionCall { name, id, .. } => {
+                    pending.push(PendingFunctionCall {
+                        location: PartLocation { content: content_index, part: part_index },
+                        id: id.clone(),
+                        name: name.clone(),
+                        user_turn,
+                        invocation_id: history_content.invocation_id.clone(),
+                    });
+                }
+                Part::FunctionResponse { function_response, id, .. } => {
+                    // Idless responses prefer their own invocation. Fall back
+                    // by name only when provenance is missing and unambiguous.
+                    let matching_index = match id.as_deref() {
+                        Some(response_id) => {
+                            pending.iter().position(|call| call.id.as_deref() == Some(response_id))
+                        }
+                        None => pending
+                            .iter()
+                            .position(|call| {
+                                call.name == function_response.name
+                                    && history_content.invocation_id.is_some()
+                                    && call.invocation_id.as_deref()
+                                        == history_content.invocation_id.as_deref()
+                            })
+                            .or_else(|| {
+                                let mut same_name =
+                                    pending.iter().enumerate().filter(|(_, call)| {
+                                        call.name == function_response.name
+                                            && (call.invocation_id.is_none()
+                                                || history_content.invocation_id.is_none())
+                                    });
+                                let first = same_name.next().map(|(index, _)| index);
+                                match (first, same_name.next()) {
+                                    (Some(index), None) => Some(index),
+                                    _ => None,
+                                }
+                            }),
+                    };
+                    if let Some(index) = matching_index {
+                        let call = pending.remove(index);
+                        if call.user_turn < user_turn {
+                            removed_parts
+                                .insert(PartLocation { content: content_index, part: part_index });
+                            let mut insertion_index = call.location.content;
+                            while let Some(next) = history.get(insertion_index + 1) {
+                                if next.content.parts.is_empty()
+                                    || !next
+                                        .content
+                                        .parts
+                                        .iter()
+                                        .all(|part| matches!(part, Part::FunctionResponse { .. }))
+                                {
+                                    break;
+                                }
+                                insertion_index += 1;
+                            }
+                            responses_after.entry(insertion_index).or_default().push((
+                                call.location.part,
+                                content.role.clone(),
+                                part.clone(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if content.role == "user"
+            && content.parts.iter().any(|part| !matches!(part, Part::FunctionResponse { .. }))
+        {
+            user_turn += 1;
+        }
+    }
+
+    for call in pending {
+        if call.user_turn == user_turn {
+            continue;
+        }
+        removed_parts.insert(call.location);
+    }
+
+    let mut normalized = Vec::with_capacity(history.len());
+    for (content_index, history_content) in history.into_iter().enumerate() {
+        let mut content = history_content.content;
+        content.parts = content
+            .parts
+            .into_iter()
+            .enumerate()
+            .filter(|(part_index, _)| {
+                !removed_parts.contains(&PartLocation { content: content_index, part: *part_index })
+            })
+            .map(|(_, part)| part)
+            .collect();
+        if !content.parts.is_empty() {
+            normalized.push(content);
+        }
+        if let Some(mut responses) = responses_after.remove(&content_index) {
+            responses.sort_by_key(|(call_part, _, _)| *call_part);
+            normalized.extend(
+                responses
+                    .into_iter()
+                    .map(|(_, role, response)| Content { role, parts: vec![response] }),
+            );
+        }
+    }
+
+    normalized
 }
 
 impl adk_core::Session for MutableSession {
@@ -187,11 +362,19 @@ impl adk_core::Session for MutableSession {
     }
 
     fn conversation_history(&self) -> Vec<adk_core::Content> {
-        self.conversation_history_for_agent_impl(None)
+        self.conversation_history_for_agent_impl(None, "")
     }
 
     fn conversation_history_for_agent(&self, agent_name: &str) -> Vec<adk_core::Content> {
-        self.conversation_history_for_agent_impl(Some(agent_name))
+        self.conversation_history_for_agent_impl(Some(agent_name), "")
+    }
+
+    fn conversation_history_scoped(
+        &self,
+        agent_name: Option<&str>,
+        branch: &str,
+    ) -> Vec<adk_core::Content> {
+        self.conversation_history_for_agent_impl(agent_name, branch)
     }
 }
 
@@ -251,6 +434,14 @@ pub struct InvocationContext {
     /// Optional secret service for retrieving secrets at runtime.
     /// When present, `get_secret()` delegates to this service.
     secret_service: Option<Arc<dyn SecretService>>,
+    /// Optional cooperative cancellation token.
+    ///
+    /// When present, `is_cancelled()` reflects this token, letting agents and
+    /// tools detect external cancellation (`Runner::interrupt()` or
+    /// `RunConfig::cancellation_token`) during long-running work.
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// Stable root invocation for a multi-hop orchestration tree.
+    orchestration_root_invocation_id: String,
 }
 
 impl InvocationContext {
@@ -264,6 +455,7 @@ impl InvocationContext {
         user_content: Content,
         session: Arc<dyn AdkSession>,
     ) -> adk_core::Result<Self> {
+        let orchestration_root_invocation_id = invocation_id.clone();
         let identity = ExecutionIdentity {
             adk: AdkIdentity { app_name, user_id, session_id },
             invocation_id: InvocationId::try_from(invocation_id)?,
@@ -282,6 +474,8 @@ impl InvocationContext {
             request_context: None,
             shared_state: None,
             secret_service: None,
+            cancellation_token: None,
+            orchestration_root_invocation_id,
         })
     }
 
@@ -320,6 +514,7 @@ impl InvocationContext {
         user_content: Content,
         session: Arc<MutableSession>,
     ) -> adk_core::Result<Self> {
+        let orchestration_root_invocation_id = invocation_id.clone();
         let identity = ExecutionIdentity {
             adk: AdkIdentity { app_name, user_id, session_id },
             invocation_id: InvocationId::try_from(invocation_id)?,
@@ -338,6 +533,8 @@ impl InvocationContext {
             request_context: None,
             shared_state: None,
             secret_service: None,
+            cancellation_token: None,
+            orchestration_root_invocation_id,
         })
     }
 
@@ -416,6 +613,22 @@ impl InvocationContext {
         self
     }
 
+    /// Attach a cooperative cancellation token.
+    ///
+    /// When set, [`is_cancelled`](adk_core::InvocationContext::is_cancelled)
+    /// reflects this token, so agents and tools can detect external
+    /// cancellation during long-running work.
+    pub fn with_cancellation_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    /// Preserve the stable orchestration root across a Runner handoff.
+    pub fn with_orchestration_root_invocation_id(mut self, invocation_id: String) -> Self {
+        self.orchestration_root_invocation_id = invocation_id;
+        self
+    }
+
     /// Get a reference to the mutable session.
     /// This allows the Runner to apply state deltas when events are processed.
     pub fn mutable_session(&self) -> &Arc<MutableSession> {
@@ -457,6 +670,12 @@ impl ReadonlyContext for InvocationContext {
     fn user_content(&self) -> &Content {
         &self.user_content
     }
+
+    fn state(&self) -> Option<&dyn adk_core::State> {
+        // Expose the runner's mutable session view so a toolset can observe a
+        // state delta emitted by an earlier tool result on the next model turn.
+        Some(adk_core::Session::state(self.session.as_ref()))
+    }
 }
 
 #[async_trait]
@@ -496,6 +715,12 @@ impl InvocationContextTrait for InvocationContext {
         self.ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.cancellation_token
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+
     fn user_scopes(&self) -> Vec<String> {
         self.request_context.as_ref().map_or_else(Vec::new, |rc| rc.scopes.clone())
     }
@@ -509,9 +734,23 @@ impl InvocationContextTrait for InvocationContext {
         })
     }
 
+    fn orchestration_root_invocation_id(&self) -> &str {
+        &self.orchestration_root_invocation_id
+    }
+
     async fn get_secret(&self, name: &str) -> adk_core::Result<Option<String>> {
+        let request = adk_core::SecretRequest::new(name)
+            .with_identity(self.app_name(), self.user_id(), self.session_id())
+            .with_invocation_id(self.invocation_id());
+        self.get_secret_for(&request).await
+    }
+
+    async fn get_secret_for(
+        &self,
+        request: &adk_core::SecretRequest,
+    ) -> adk_core::Result<Option<String>> {
         match &self.secret_service {
-            Some(service) => service.get_secret(name).await.map(Some),
+            Some(service) => service.get_secret_for(request).await.map(Some),
             None => Ok(None),
         }
     }

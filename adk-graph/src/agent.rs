@@ -11,7 +11,10 @@ use crate::node::{ExecutionConfig, FunctionNode, Node, NodeContext, NodeOutput};
 use crate::state::{State, StateSchema};
 use crate::stream::{StreamEvent, StreamMode};
 use crate::timeout::TimeoutPolicy;
-use adk_core::{Agent, Content, Event, EventStream, InvocationContext};
+use adk_core::{
+    Agent, AgentCapabilities, AgentRelationshipKind, AgentTopology, AgentTopologyMember,
+    AgentTopologyRelationship, Content, Event, EventStream, InvocationContext,
+};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
@@ -42,6 +45,21 @@ pub type InputMapper = Arc<dyn Fn(&dyn InvocationContext) -> State + Send + Sync
 pub type OutputMapper = Arc<dyn Fn(&State) -> Vec<Event> + Send + Sync>;
 
 /// GraphAgent wraps a CompiledGraph as an ADK Agent
+///
+/// # Turns and checkpoints
+///
+/// Each [`Agent::run`] call is one turn on a thread whose id is the session id.
+/// With a checkpointer configured:
+///
+/// | Thread's latest checkpoint | What the turn does |
+/// |----------------------------|--------------------|
+/// | None | Runs the graph from its entry nodes. |
+/// | Paused (non-empty frontier) | Resumes the paused run, with the turn's input merged into its state. |
+/// | Finished (empty frontier) | Runs the graph again from its entry nodes, starting from the previous turn's final state with the turn's input merged on top. |
+///
+/// The recursion limit applies to each turn separately. [`GraphAgent::invoke`]
+/// keeps the direct-graph behaviour, where re-invoking a finished thread returns
+/// its final state without running anything.
 pub struct GraphAgent {
     name: String,
     description: String,
@@ -122,6 +140,77 @@ impl Agent for GraphAgent {
         &[]
     }
 
+    fn supports_agent_transfer(&self) -> bool {
+        false
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            checkpoint_resume: self.graph.has_checkpointer(),
+            shared_state: true,
+            invocation_metadata: true,
+            ..AgentCapabilities::default()
+        }
+    }
+
+    fn topology(&self) -> Option<AgentTopology> {
+        let mut nodes = self.graph.nodes.values().collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.name().to_string());
+        let mut members = vec![AgentTopologyMember {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            coordinator: true,
+            capabilities: self.capabilities(),
+        }];
+        members.extend(nodes.into_iter().map(|node| AgentTopologyMember {
+            name: node.name().to_string(),
+            description: node.description().to_string(),
+            coordinator: false,
+            capabilities: node.capabilities(),
+        }));
+
+        let mut relationships = self
+            .graph
+            .get_entry_nodes()
+            .into_iter()
+            .map(|entry| AgentTopologyRelationship {
+                from: self.name.clone(),
+                to: entry,
+                kind: AgentRelationshipKind::Flow,
+            })
+            .collect::<Vec<_>>();
+        for edge in &self.graph.edges {
+            match edge {
+                Edge::Direct { source, target: EdgeTarget::Node(target) } => {
+                    relationships.push(AgentTopologyRelationship {
+                        from: source.clone(),
+                        to: target.clone(),
+                        kind: AgentRelationshipKind::Flow,
+                    });
+                }
+                Edge::Conditional { source, targets, .. } => {
+                    relationships.extend(targets.values().filter_map(|target| {
+                        target.node_name().map(|target| AgentTopologyRelationship {
+                            from: source.clone(),
+                            to: target.to_string(),
+                            kind: AgentRelationshipKind::Flow,
+                        })
+                    }));
+                }
+                Edge::Direct { target: EdgeTarget::End, .. } | Edge::Entry { .. } => {}
+            }
+        }
+        relationships.sort_by(|left, right| (&left.from, &left.to).cmp(&(&right.from, &right.to)));
+        relationships.dedup_by(|left, right| left.from == right.from && left.to == right.to);
+
+        Some(AgentTopology {
+            root: self.name.clone(),
+            coordinator: self.name.clone(),
+            members,
+            relationships,
+        })
+    }
+
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> adk_core::Result<EventStream> {
         // Call before callback
         if let Some(callback) = &self.before_callback {
@@ -131,8 +220,10 @@ impl Agent for GraphAgent {
         // Map context to input state
         let input = (self.input_mapper)(ctx.as_ref());
 
-        // Create execution config from context
-        let config = ExecutionConfig::new(ctx.session_id());
+        // Create execution config from context, carrying the invocation so an
+        // `AgentNode` inside the graph presents this run's identity, services, and
+        // cancellation rather than a synthetic standalone context.
+        let config = ExecutionConfig::new(ctx.session_id()).with_parent_context(ctx.clone());
 
         // Execute graph
         let graph = self.graph.clone();
@@ -141,7 +232,12 @@ impl Agent for GraphAgent {
         let ctx_clone = ctx.clone();
 
         let stream = async_stream::stream! {
-            match graph.invoke(input, config).await {
+            // Each call is one turn on the session's thread: a paused thread
+            // resumes, and a finished one runs again from its entry nodes with the
+            // previous turn's state carried over.
+            let mut executor =
+                crate::executor::PregelExecutor::new(&graph, config).restarting_completed_threads();
+            match executor.run(input).await {
                 Ok(state) => {
                     let events = output_mapper(&state);
                     for event in events {
@@ -155,14 +251,32 @@ impl Agent for GraphAgent {
                     }
                 }
                 Err(GraphError::Interrupted(interrupt)) => {
-                    // Create an interrupt event
+                    // The `Agent` trait yields events, so an interrupt cannot be
+                    // returned as an error without ending the invocation. Emit one
+                    // event carrying the structured pause so a caller can read the
+                    // node, the payload, and the checkpoint to resume from.
+                    let tool_confirmation = crate::interrupt::GraphToolConfirmationPause::from_interrupted_execution(&interrupt);
+                    let payload = tool_confirmation.clone().map_or_else(
+                        || crate::interrupt::GraphInterruptPayload::new(
+                            &interrupt.interrupt,
+                            &interrupt.thread_id,
+                            &interrupt.checkpoint_id,
+                        ),
+                        crate::interrupt::GraphInterruptPayload::from_tool_confirmation_pause,
+                    );
                     let mut event = Event::new("graph_interrupted");
-                    event.set_content(Content::new("assistant").with_text(format!(
-                        "Graph interrupted: {:?}\nThread: {}\nCheckpoint: {}",
-                        interrupt.interrupt,
-                        interrupt.thread_id,
-                        interrupt.checkpoint_id
-                    )));
+                    if let Some(pause) = tool_confirmation {
+                        event.llm_response.interrupted = true;
+                        event.llm_response.turn_complete = true;
+                        event.actions.tool_confirmation = Some(pause.request);
+                    }
+                    event.set_content(
+                        Content::new("assistant").with_text(interrupt.interrupt.to_string()),
+                    );
+                    event.provider_metadata.insert(
+                        crate::interrupt::INTERRUPT_METADATA_KEY.to_string(),
+                        payload.to_metadata_value(),
+                    );
                     yield Ok(event);
                 }
                 Err(e) => {
@@ -237,6 +351,7 @@ pub struct GraphAgentBuilder {
     interrupt_before: Vec<String>,
     interrupt_after: Vec<String>,
     recursion_limit: usize,
+    max_concurrency: Option<usize>,
     input_mapper: Option<InputMapper>,
     output_mapper: Option<OutputMapper>,
     before_callback: Option<BeforeAgentCallback>,
@@ -260,7 +375,8 @@ impl GraphAgentBuilder {
             checkpointer: None,
             interrupt_before: vec![],
             interrupt_after: vec![],
-            recursion_limit: 50,
+            recursion_limit: 100,
+            max_concurrency: None,
             input_mapper: None,
             output_mapper: None,
             before_callback: None,
@@ -385,6 +501,14 @@ impl GraphAgentBuilder {
     }
 
     /// Set recursion limit
+    /// Cap how many nodes execute concurrently within one super-step.
+    ///
+    /// See [`CompiledGraph::with_max_concurrency`](crate::graph::CompiledGraph::with_max_concurrency).
+    pub fn max_concurrency(mut self, limit: usize) -> Self {
+        self.max_concurrency = Some(limit.max(1));
+        self
+    }
+
     pub fn recursion_limit(mut self, limit: usize) -> Self {
         self.recursion_limit = limit;
         self
@@ -467,6 +591,19 @@ impl GraphAgentBuilder {
     ///     })
     ///     .build()?;
     /// ```
+    /// Configure fan-in for a node already added with [`node`](Self::node).
+    ///
+    /// [`deferred_node`](Self::deferred_node) both adds and configures a node, so
+    /// a custom `Node` added through `node` had no way to set a merge strategy or
+    /// a fan-in timeout.
+    ///
+    /// A node reached by more than one unconditional edge is deferred
+    /// automatically; this overrides that default.
+    pub fn mark_deferred(mut self, name: &str, config: DeferredNodeConfig) -> Self {
+        self.deferred_configs.insert(name.to_string(), config);
+        self
+    }
+
     pub fn deferred_node<F, Fut>(mut self, name: &str, func: F, config: DeferredNodeConfig) -> Self
     where
         F: Fn(NodeContext) -> Fut + Send + Sync + 'static,
@@ -627,12 +764,20 @@ impl GraphAgentBuilder {
         compiled.interrupt_before = self.interrupt_before.into_iter().collect();
         compiled.interrupt_after = self.interrupt_after.into_iter().collect();
         compiled.recursion_limit = self.recursion_limit;
+        compiled.max_concurrency = self.max_concurrency;
         compiled.timeout_policies = self.timeout_policies;
         compiled.default_timeout = self.default_timeout;
         compiled.deferred_configs = self.deferred_configs;
 
         #[cfg(feature = "node-cache")]
         {
+            compiled.node_caches = self
+                .cache_policies
+                .iter()
+                .map(|(name, policy)| {
+                    (name.clone(), Arc::new(crate::cache::NodeCache::from_policy(policy)))
+                })
+                .collect();
             compiled.cache_policies = self.cache_policies;
         }
 
@@ -671,5 +816,14 @@ mod tests {
         let result = agent.invoke(State::new(), ExecutionConfig::new("test")).await.unwrap();
 
         assert_eq!(result.get("value"), Some(&json!(42)));
+
+        let topology = agent.topology().expect("graph topology");
+        assert_eq!(topology.root, "test");
+        assert_eq!(topology.coordinator, "test");
+        assert_eq!(topology.members.len(), 2);
+        assert_eq!(topology.relationships.len(), 1);
+        assert_eq!(topology.relationships[0].from, "test");
+        assert_eq!(topology.relationships[0].to, "set");
+        assert_eq!(topology.relationships[0].kind, AgentRelationshipKind::Flow);
     }
 }

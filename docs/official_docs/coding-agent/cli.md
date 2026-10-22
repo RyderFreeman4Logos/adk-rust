@@ -1,7 +1,7 @@
 # Coding Agent CLI
 
 The `adk-rust` CLI ships three native coding commands. All run a real agent in a
-**sandboxed workspace**, default to a Gemini 3 model, and resolve the API key
+**confined workspace**, default to a Gemini 3 model, and resolve the API key
 non-interactively from `--api-key` or the environment
 (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `OPENAI_API_KEY`, …) — so they never block on
 a setup prompt.
@@ -76,6 +76,6 @@ revise steps, ending in `finalize`.
 
 All three commands accept the global `--model` / `--provider` / `--api-key`
 flags. The default is `gemini-3.1-flash-lite` (fast, reliable multi-step tool
-use). For OpenAI: `--provider openai --model gpt-5-mini` (with `OPENAI_API_KEY`).
+use). For OpenAI: `--provider openai --model gpt-5.6-terra` (with `OPENAI_API_KEY`).
 
 Next: [Workflows →](workflows.md)

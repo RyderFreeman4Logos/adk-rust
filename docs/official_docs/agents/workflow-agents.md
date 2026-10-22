@@ -15,7 +15,7 @@ Add dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-rust = "2.0.0"
+adk-rust = "2.3.0"
 tokio = { version = "1.40", features = ["full"] }
 dotenvy = "0.15"
 ```
@@ -51,7 +51,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     // Step 1: Research agent gathers information
     let researcher = LlmAgentBuilder::new("researcher")
@@ -146,6 +146,28 @@ and performance guarantees.
 
 `ParallelAgent` runs all sub-agents concurrently. Each agent receives the same input and works independently.
 
+Independence is enforced, not just intended: each sub-agent runs on its own
+conversation branch (`{parent}.{parallel_agent}.{sub_agent}`), and history reads
+are scoped to that branch. A sub-agent sees the conversation that led to the
+fan-out but not what its siblings produced, so concurrent branches cannot
+contaminate each other's context. Use `ParallelAgent::with_shared_state()` when
+you *want* sub-agents to coordinate.
+
+Branches are polled together, so wall-clock cost is roughly the slowest branch
+rather than the sum of all of them, and a slow branch does not hold up the
+others. Two consequences worth designing around:
+
+- **Events interleave.** Events arrive in the order branches produce them, not
+  grouped per sub-agent. Use `event.author` (or `event.branch`) to attribute a
+  chunk to its branch. Ordering across branches is not guaranteed.
+- **One error ends the run, chosen deterministically.** Every branch still runs
+  to completion, and a single terminal error is surfaced afterwards. When more
+  than one branch fails, the error reported is the one from the earliest
+  sub-agent in declaration order — not whichever failed first in wall-clock
+  terms, which concurrency would make a race.
+
+Dropping the event stream early tears down branches that are still in flight.
+
 ### When to Use
 
 - Multiple perspectives on the same topic
@@ -163,7 +185,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     // Three analysts with DISTINCT personas (important for parallel execution)
     let technical = LlmAgentBuilder::new("technical_analyst")
@@ -273,7 +295,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     // Critic agent evaluates content
     let critic = LlmAgentBuilder::new("critic")
@@ -397,7 +419,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     // Create specialist agents
     let tech_agent: Arc<dyn Agent> = Arc::new(

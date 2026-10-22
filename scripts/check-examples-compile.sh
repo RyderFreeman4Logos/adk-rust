@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Compile every standalone example crate under examples/.
+#
+# Each example is its own workspace with its own Cargo.lock and path
+# dependencies back into this repo, so nothing in the root workspace build
+# covers them: `cargo check --workspace` cannot see them and
+# scripts/check-doc-examples.sh only validates that documented commands resolve
+# in cargo metadata. Without this gate an example can stop compiling against a
+# changed public API and no CI job notices.
+#
+# Usage:
+#   scripts/check-examples-compile.sh              # every example
+#   scripts/check-examples-compile.sh 0 4          # shard 0 of 4 (CI matrix)
+#
+# Each example uses its canonical SSD target link through the local Just launcher.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+
+SHARD_INDEX="${1:-0}"
+SHARD_TOTAL="${2:-1}"
+
+# Examples excluded from this gate (each entry names its own workflow/reason).
+# Currently empty: the Monty example compiles here like any other since monty
+# moved to crates.io and adk-codeact-monty joined the workspace.
+SKIP_EXAMPLES=()
+
+ADK_GATE_ROOT="$ROOT"
+source "$ADK_GATE_ROOT/scripts/local-env.sh"
+[[ "$SHARD_INDEX" =~ ^[0-9]+$ && "$SHARD_TOTAL" =~ ^[1-9][0-9]*$ && "$SHARD_INDEX" -lt "$SHARD_TOTAL" ]] || {
+    echo "error: expected shard index smaller than positive shard total" >&2; exit 2;
+}
+
+# `mapfile` needs bash 4; stock macOS ships 3.2, so read the list in a loop.
+MANIFESTS=()
+while IFS= read -r manifest; do
+    MANIFESTS+=("$manifest")
+done < <(find examples -maxdepth 2 -name Cargo.toml | sort)
+
+# Per-run scratch file so parallel shards never share one path.
+ERR_FILE="$(mktemp "${TMPDIR}/example-check-err.XXXXXX")"
+trap 'rm -f "$ERR_FILE"' EXIT
+
+declare -a failed=()
+declare -i checked=0 skipped=0 index=0
+
+for manifest in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
+    dir="$(dirname "$manifest")"
+
+    skip=0
+    # `${arr[@]+...}` keeps `set -u` happy on an empty array under bash 3.2.
+    for excluded in ${SKIP_EXAMPLES[@]+"${SKIP_EXAMPLES[@]}"}; do
+        if [[ "$dir" == "$excluded" ]]; then skip=1; fi
+    done
+    if (( skip )); then
+        printf 'skip     %s (own toolchain/workflow)\n' "$dir"
+        skipped+=1
+        continue
+    fi
+
+    if (( index % SHARD_TOTAL != SHARD_INDEX )); then
+        index+=1
+        continue
+    fi
+    index+=1
+
+    # --locked also catches a lockfile that no longer matches its manifest.
+    # Route through the pinned toolchain: hooks can run under a shadowing cargo
+    # (e.g. nix) that ignores rust-toolchain.toml. Transparent in CI, where the
+    # ambient cargo already matches the pin (falls back to plain cargo).
+    if just cargo check --manifest-path "$manifest" --locked --quiet 2>"$ERR_FILE"; then
+        printf 'ok       %s\n' "$dir"
+    else
+        printf 'FAILED   %s\n' "$dir"
+        sed 's/^/         /' "$ERR_FILE"
+        failed+=("$dir")
+    fi
+    checked+=1
+done
+
+printf '\nexamples checked: %d, skipped: %d, failed: %d' "$checked" "$skipped" "${#failed[@]}"
+if (( SHARD_TOTAL > 1 )); then
+    printf ' (shard %d of %d)' "$SHARD_INDEX" "$SHARD_TOTAL"
+fi
+printf '\n'
+
+if (( ${#failed[@]} > 0 )); then
+    printf '\nfailing examples:\n'
+    printf '  %s\n' "${failed[@]}"
+    exit 1
+fi

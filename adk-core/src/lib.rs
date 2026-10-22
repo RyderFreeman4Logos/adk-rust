@@ -74,6 +74,8 @@
 
 /// Core agent trait and event stream type.
 pub mod agent;
+/// Starting an agent turn without owning the runner's construction.
+pub mod agent_invoker;
 /// Dynamic agent loading by name.
 pub mod agent_loader;
 /// Callback type aliases for agent, model, and tool lifecycle hooks.
@@ -84,6 +86,7 @@ pub mod context;
 pub mod error;
 /// Event types representing agent interactions in a conversation.
 pub mod event;
+mod event_stream;
 /// Typed identity primitives for app, user, session, and invocation.
 pub mod identity;
 /// Template-based instruction injection with session state interpolation.
@@ -109,7 +112,12 @@ pub mod tool_concurrency;
 /// Content, Part, and multimodal data types.
 pub mod types;
 
-pub use agent::{Agent, EventStream, ResolvedContext};
+pub use agent::{
+    Agent, AgentCapabilities, AgentInteractionMode, AgentRelationshipKind, AgentTopology,
+    AgentTopologyMember, AgentTopologyRelationship, AgentTransferDecision, AgentTransferRequest,
+    EventStream, ResolvedContext,
+};
+pub use agent_invoker::AgentInvoker;
 pub use agent_loader::{AgentLoader, MultiAgentLoader, SingleAgentLoader};
 pub use callbacks::{
     AfterAgentCallback, AfterModelCallback, AfterToolCallback, AfterToolCallbackFull,
@@ -120,15 +128,18 @@ pub use callbacks::{
 pub use context::{
     Artifacts, BackpressurePolicy, CallbackContext, IncludeContents, InvocationContext,
     MAX_STATE_KEY_LEN, Memory, MemoryEntry, ReadonlyContext, ReadonlyState, RunConfig,
-    RunConfigBuilder, SecretService, Session, State, StreamingMode, ToolCallbackContext,
-    ToolConcurrencyConfig, ToolConfirmationDecision, ToolConfirmationPolicy,
-    ToolConfirmationRequest, ToolOutcome, validate_state_key,
+    RunConfigBuilder, RuntimeToolset, SecretRequest, SecretService, Session, State, StreamingMode,
+    ToolCallbackContext, ToolConcurrencyConfig, ToolConfirmationDecision, ToolConfirmationHandler,
+    ToolConfirmationPolicy, ToolConfirmationRequest, ToolOutcome, tool_call_fingerprint,
+    validate_state_key,
 };
 pub use error::{AdkError, ErrorCategory, ErrorComponent, ErrorDetails, Result, RetryHint};
 pub use event::{
     Event, EventActions, EventCompaction, KEY_PREFIX_APP, KEY_PREFIX_TEMP, KEY_PREFIX_USER,
     TOOL_PROGRESS_CALL_ID_KEY, TOOL_PROGRESS_STREAM_KEY, ToolCallView, ToolResultView,
+    event_belongs_to_branch,
 };
+pub use event_stream::EventTextDeltas;
 pub use identity::{
     AdkIdentity, AppName, ExecutionIdentity, IdentityError, InvocationId, SessionId, UserId,
 };
@@ -148,7 +159,8 @@ pub use tool::{
 };
 pub use tool_concurrency::{ConcurrencyPermit, ToolConcurrencyManager};
 pub use types::{
-    Content, FileDataPart, FunctionResponseData, InlineDataPart, MAX_INLINE_DATA_SIZE, Part,
+    BlobResourceContents, Content, EmbeddedResource, FileDataPart, FunctionResponseData,
+    InlineDataPart, MAX_INLINE_DATA_SIZE, Part, TextResourceContents,
 };
 
 // Re-export async_trait so the #[tool] macro's generated code can reference it

@@ -24,14 +24,14 @@ Agent execution runtime for ADK-Rust.
 
 ```toml
 [dependencies]
-adk-runner = "2.0.0"
+adk-runner = "2.3.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.0.0", features = ["runner"] }
+adk-rust = { version = "2.3.0", features = ["runner"] }
 ```
 
 ## Quick Start
@@ -110,6 +110,22 @@ Runner automatically handles agent-to-agent transfers:
 // 3. Preserves session state across the transfer
 // 4. Continues streaming events from the new agent
 ```
+
+Validated composite roots can provide an exact per-member transfer allowlist
+through the `Agent` policy hooks. Runner validates every handoff against that
+list and reports undeclared targets or depth overflow as errors. Ordinary agent
+trees return no explicit policy and retain legacy parent/peer discovery.
+After allowlist and depth validation, Runner awaits `Agent::govern_transfer`
+before executing the target. The default allows the transfer, preserving
+existing behavior; portable teams and other composite roots can deny it with an
+auditable reason. Denials surface as `agent.transfer.denied`.
+
+## Model History After Overlapping or Interrupted Turns
+
+- **Actual results:** late tool responses are paired with their calls before a later user turn.
+- **Missing results:** unresolved calls from earlier turns are omitted from model history; no result is fabricated.
+- **Current execution:** unresolved calls at the history tail remain available for tool execution and confirmation.
+- **Persistence:** source session events are unchanged by this projection.
 
 ## State Propagation
 

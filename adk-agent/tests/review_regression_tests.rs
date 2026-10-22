@@ -5,13 +5,15 @@ use adk_agent::{
 use adk_core::{
     Agent, CallbackContext, Content, Event, EventStream, FinishReason, InvocationContext, Llm,
     LlmRequest, LlmResponse, LlmResponseStream, Part, Result, RunConfig, Session, State, Tool,
-    ToolContext,
+    ToolContext, Toolset,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[cfg(feature = "guardrails")]
 use adk_agent::guardrails::{Guardrail, GuardrailResult, GuardrailSet, Severity};
@@ -243,8 +245,263 @@ impl Tool for IdCapturingTool {
     }
 }
 
+/// A test-only dynamic toolset whose second capability becomes available after
+/// its activation tool runs. This models progressive skill disclosure without
+/// coupling the agent runtime test to a particular skill storage backend.
+struct ActivatingToolset {
+    activated: Arc<AtomicBool>,
+    business_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Toolset for ActivatingToolset {
+    fn name(&self) -> &str {
+        "activating"
+    }
+
+    async fn tools(&self, _ctx: Arc<dyn adk_core::ReadonlyContext>) -> Result<Vec<Arc<dyn Tool>>> {
+        let mut tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(ActivateCapabilityTool { activated: self.activated.clone() })];
+        if self.activated.load(Ordering::SeqCst) {
+            tools.push(Arc::new(ActivatedCapabilityTool { calls: self.business_calls.clone() }));
+        }
+        Ok(tools)
+    }
+}
+
+struct ActivateCapabilityTool {
+    activated: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for ActivateCapabilityTool {
+    fn name(&self) -> &str {
+        "activate_capability"
+    }
+
+    fn description(&self) -> &str {
+        "Activates a deferred capability."
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Value> {
+        self.activated.store(true, Ordering::SeqCst);
+        Ok(json!({ "activated": true }))
+    }
+}
+
+struct ActivatedCapabilityTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for ActivatedCapabilityTool {
+    fn name(&self) -> &str {
+        "activated_capability"
+    }
+
+    fn description(&self) -> &str {
+        "A capability exposed after activation."
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Value> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "ok": true }))
+    }
+}
+
+struct ConcurrencyProbeTool {
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    concurrency_safe: bool,
+}
+
+impl ConcurrencyProbeTool {
+    fn new(concurrency_safe: bool) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+            concurrency_safe,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ConcurrencyProbeTool {
+    fn name(&self) -> &str {
+        "concurrency_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Records concurrent executions"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        self.concurrency_safe
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Value> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(json!({ "active": active }))
+    }
+}
+
+async fn max_concurrent_tool_calls(
+    strategy: adk_core::ToolExecutionStrategy,
+    concurrency_safe: bool,
+) -> usize {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::function_calls(vec![
+            Part::FunctionCall {
+                name: "concurrency_probe".to_string(),
+                args: json!({}),
+                id: Some("call-a".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "concurrency_probe".to_string(),
+                args: json!({}),
+                id: Some("call-b".to_string()),
+                thought_signature: None,
+            },
+        ]),
+        RecordingModel::text_response("done"),
+    ]));
+    let tool = Arc::new(ConcurrencyProbeTool::new(concurrency_safe));
+    let max_active = tool.max_active.clone();
+    let agent = LlmAgentBuilder::new("tool-agent")
+        .model(model)
+        .tool(tool)
+        .tool_execution_strategy(strategy)
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("run tools"))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), drain_stream(stream))
+        .await
+        .expect("tool dispatch timed out")
+        .unwrap();
+
+    max_active.load(Ordering::SeqCst)
+}
+
+#[derive(Default)]
+struct MixedDispatchState {
+    safe_active: AtomicUsize,
+    safe_started: AtomicUsize,
+    safe_max_active: AtomicUsize,
+    unsafe_active: AtomicUsize,
+    unsafe_started: AtomicUsize,
+    unsafe_max_active: AtomicUsize,
+    unsafe_started_while_safe_active: AtomicBool,
+}
+
+struct MixedDispatchTool {
+    name: &'static str,
+    concurrency_safe: bool,
+    state: Arc<MixedDispatchState>,
+}
+
+#[async_trait]
+impl Tool for MixedDispatchTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "Records mixed-batch execution phases"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        self.concurrency_safe
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Value> {
+        if self.concurrency_safe {
+            self.state.safe_started.fetch_add(1, Ordering::SeqCst);
+            let active = self.state.safe_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.safe_max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.state.safe_active.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            self.state.unsafe_started.fetch_add(1, Ordering::SeqCst);
+            if self.state.safe_active.load(Ordering::SeqCst) != 0 {
+                self.state.unsafe_started_while_safe_active.store(true, Ordering::SeqCst);
+            }
+            let active = self.state.unsafe_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.unsafe_max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.state.unsafe_active.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(json!({ "ok": true }))
+    }
+}
+
 struct CountingTool {
     calls: Arc<Mutex<usize>>,
+}
+
+#[derive(Default)]
+struct DelegationDispatchState {
+    delegation_active: AtomicUsize,
+    delegation_max_active: AtomicUsize,
+    ordinary_active: AtomicUsize,
+    ordinary_max_active: AtomicUsize,
+    delegation_overlapped_ordinary: AtomicBool,
+    ordinary_overlapped_delegation: AtomicBool,
+}
+
+struct DelegationDispatchTool {
+    name: &'static str,
+    delegation: bool,
+    state: Arc<DelegationDispatchState>,
+}
+
+#[async_trait]
+impl Tool for DelegationDispatchTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "Records delegation-only dispatch behavior"
+    }
+
+    fn is_agent_delegation(&self) -> bool {
+        self.delegation
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
+        if self.delegation {
+            if self.state.ordinary_active.load(Ordering::SeqCst) != 0 {
+                self.state.delegation_overlapped_ordinary.store(true, Ordering::SeqCst);
+            }
+            let active = self.state.delegation_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.delegation_max_active.fetch_max(active, Ordering::SeqCst);
+            let delay_ms = args.get("delay_ms").and_then(Value::as_u64).unwrap_or(50);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            self.state.delegation_active.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            if self.state.delegation_active.load(Ordering::SeqCst) != 0 {
+                self.state.ordinary_overlapped_delegation.store(true, Ordering::SeqCst);
+            }
+            let active = self.state.ordinary_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.ordinary_max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.state.ordinary_active.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(json!({ "ok": true }))
+    }
 }
 
 impl CountingTool {
@@ -276,6 +533,42 @@ async fn drain_stream(mut stream: EventStream) -> Result<Vec<Event>> {
         events.push(result?);
     }
     Ok(events)
+}
+
+#[tokio::test]
+async fn toolsets_are_refreshed_between_model_turns_after_a_tool_call() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::function_calls(vec![Part::FunctionCall {
+            name: "activate_capability".to_string(),
+            args: json!({}),
+            id: Some("activate".to_string()),
+            thought_signature: None,
+        }]),
+        RecordingModel::function_calls(vec![Part::FunctionCall {
+            name: "activated_capability".to_string(),
+            args: json!({}),
+            id: Some("use-activated".to_string()),
+            thought_signature: None,
+        }]),
+        RecordingModel::text_response("done"),
+    ]));
+    let activated = Arc::new(AtomicBool::new(false));
+    let business_calls = Arc::new(AtomicUsize::new(0));
+    let toolset = Arc::new(ActivatingToolset { activated, business_calls: business_calls.clone() });
+    let agent = LlmAgentBuilder::new("refresh-agent")
+        .model(model.clone())
+        .toolset(toolset)
+        .build()
+        .expect("agent builds");
+
+    let stream = agent.run(Arc::new(TestContext::new("activate and use it"))).await.expect("run");
+    drain_stream(stream).await.expect("agent stream");
+
+    assert_eq!(business_calls.load(Ordering::SeqCst), 1);
+    let requests = model.requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].tools.contains_key("activated_capability"));
+    assert!(requests[1].tools.contains_key("activated_capability"));
 }
 
 #[tokio::test]
@@ -390,6 +683,164 @@ async fn test_function_call_ids_are_unique_for_repeated_tool_calls() {
     assert_ne!(ids[0], ids[1]);
     assert!(ids[0].ends_with("_0"));
     assert!(ids[1].ends_with("_1"));
+}
+
+#[tokio::test]
+async fn test_auto_serializes_read_only_tool_without_concurrency_safety() {
+    let max_active = max_concurrent_tool_calls(adk_core::ToolExecutionStrategy::Auto, false).await;
+
+    assert_eq!(max_active, 1);
+}
+
+#[tokio::test]
+async fn test_auto_parallelizes_read_only_concurrency_safe_tool() {
+    let max_active = max_concurrent_tool_calls(adk_core::ToolExecutionStrategy::Auto, true).await;
+
+    assert_eq!(max_active, 2);
+}
+
+#[tokio::test]
+async fn test_auto_runs_safe_subset_before_sequential_unsafe_subset() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::function_calls(vec![
+            Part::FunctionCall {
+                name: "unsafe_probe".to_string(),
+                args: json!({}),
+                id: Some("unsafe-a".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "safe_probe".to_string(),
+                args: json!({}),
+                id: Some("safe-a".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "safe_probe".to_string(),
+                args: json!({}),
+                id: Some("safe-b".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "unsafe_probe".to_string(),
+                args: json!({}),
+                id: Some("unsafe-b".to_string()),
+                thought_signature: None,
+            },
+        ]),
+        RecordingModel::text_response("done"),
+    ]));
+    let state = Arc::new(MixedDispatchState::default());
+    let safe_tool = Arc::new(MixedDispatchTool {
+        name: "safe_probe",
+        concurrency_safe: true,
+        state: state.clone(),
+    });
+    let unsafe_tool = Arc::new(MixedDispatchTool {
+        name: "unsafe_probe",
+        concurrency_safe: false,
+        state: state.clone(),
+    });
+    let agent = LlmAgentBuilder::new("tool-agent")
+        .model(model)
+        .tool(safe_tool)
+        .tool(unsafe_tool)
+        .tool_execution_strategy(adk_core::ToolExecutionStrategy::Auto)
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("run tools"))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), drain_stream(stream))
+        .await
+        .expect("mixed tool dispatch timed out")
+        .unwrap();
+
+    assert_eq!(state.safe_started.load(Ordering::SeqCst), 2);
+    assert_eq!(state.safe_max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(state.unsafe_started.load(Ordering::SeqCst), 2);
+    assert_eq!(state.unsafe_max_active.load(Ordering::SeqCst), 1);
+    assert!(!state.unsafe_started_while_safe_active.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_parallel_is_explicit_tool_metadata_override() {
+    let max_active =
+        max_concurrent_tool_calls(adk_core::ToolExecutionStrategy::Parallel, false).await;
+
+    assert_eq!(max_active, 2);
+}
+
+#[tokio::test]
+async fn test_parallel_delegations_only_overlaps_consecutive_agent_tools() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::function_calls(vec![
+            Part::FunctionCall {
+                name: "ordinary_probe".to_string(),
+                args: json!({}),
+                id: Some("ordinary-before".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "delegate_probe".to_string(),
+                args: json!({ "delay_ms": 80 }),
+                id: Some("delegate-a".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "delegate_probe".to_string(),
+                args: json!({ "delay_ms": 10 }),
+                id: Some("delegate-b".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "ordinary_probe".to_string(),
+                args: json!({}),
+                id: Some("ordinary-after".to_string()),
+                thought_signature: None,
+            },
+        ]),
+        RecordingModel::text_response("done"),
+    ]));
+    let state = Arc::new(DelegationDispatchState::default());
+    let delegate_tool = Arc::new(DelegationDispatchTool {
+        name: "delegate_probe",
+        delegation: true,
+        state: state.clone(),
+    });
+    let ordinary_tool = Arc::new(DelegationDispatchTool {
+        name: "ordinary_probe",
+        delegation: false,
+        state: state.clone(),
+    });
+    let agent = LlmAgentBuilder::new("delegation-dispatch-agent")
+        .model(model.clone())
+        .tool(delegate_tool)
+        .tool(ordinary_tool)
+        .parallelize_agent_delegations(true)
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("delegate safely"))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), drain_stream(stream))
+        .await
+        .expect("delegation dispatch timed out")
+        .unwrap();
+
+    assert_eq!(state.delegation_max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(state.ordinary_max_active.load(Ordering::SeqCst), 1);
+    assert!(!state.delegation_overlapped_ordinary.load(Ordering::SeqCst));
+    assert!(!state.ordinary_overlapped_delegation.load(Ordering::SeqCst));
+    let requests = model.requests.lock().unwrap_or_else(|error| error.into_inner());
+    let response_ids = requests[1]
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter_map(|part| match part {
+            Part::FunctionResponse { id, .. } => id.as_deref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(response_ids, ["ordinary-before", "delegate-a", "delegate-b", "ordinary-after"]);
 }
 
 #[tokio::test]
@@ -714,4 +1165,117 @@ async fn test_agent_leaves_previous_response_id_none_without_interaction_id() {
     assert_eq!(requests.len(), 2, "expected two model calls (tool loop)");
     assert_eq!(requests[0].previous_response_id, None);
     assert_eq!(requests[1].previous_response_id, None);
+}
+
+// ── output_key is persisted only after output-schema validation ─────────
+
+fn score_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "score": { "type": "number" } },
+        "required": ["score"]
+    })
+}
+
+/// Collects every `output_key` value the agent emitted, plus the terminal error, if any.
+async fn output_key_writes(
+    mut stream: EventStream,
+    output_key: &str,
+) -> (Vec<Value>, Option<adk_core::AdkError>) {
+    let mut writes = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => writes.extend(event.actions.state_delta.get(output_key).cloned()),
+            Err(error) => return (writes, Some(error)),
+        }
+    }
+    (writes, None)
+}
+
+#[tokio::test]
+async fn output_key_is_not_written_when_schema_validation_is_exhausted() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::text_response("not json"),
+        RecordingModel::text_response("still not json"),
+    ]));
+    let agent = LlmAgentBuilder::new("schema-agent")
+        .model(model)
+        .output_schema(score_schema())
+        .output_max_retries(1)
+        .output_key("result")
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("score this"))).await.unwrap();
+    let (writes, error) = output_key_writes(stream, "result").await;
+
+    assert_eq!(writes, Vec::<Value>::new(), "invalid output must not reach state[output_key]");
+    assert_eq!(
+        error.map(|error| error.message),
+        Some("output schema validation failed after 1 attempts".to_string())
+    );
+}
+
+#[tokio::test]
+async fn output_key_holds_only_the_validated_retry() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::text_response("not json"),
+        RecordingModel::text_response(r#"{"score": 7}"#),
+    ]));
+    let agent = LlmAgentBuilder::new("schema-agent")
+        .model(model)
+        .output_schema(score_schema())
+        .output_max_retries(1)
+        .output_key("result")
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("score this"))).await.unwrap();
+    let (writes, error) = output_key_writes(stream, "result").await;
+
+    assert!(error.is_none(), "unexpected error: {error:?}");
+    assert_eq!(writes, vec![json!(r#"{"score": 7}"#)]);
+}
+
+// ── After-tool callbacks see the parallel agent's shared state ─────────
+
+#[tokio::test]
+async fn after_tool_callback_receives_shared_state() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::function_calls(vec![Part::FunctionCall {
+            name: "test_tool".to_string(),
+            args: json!({}),
+            id: Some("call-shared".to_string()),
+            thought_signature: None,
+        }]),
+        RecordingModel::text_response("done"),
+    ]));
+    let observed = Arc::new(Mutex::new(None));
+    let recorder = observed.clone();
+    let agent = LlmAgentBuilder::new("shared-agent")
+        .model(model)
+        .tool(Arc::new(CountingTool::new()))
+        .after_tool_callback(Box::new(move |ctx| {
+            let recorder = recorder.clone();
+            Box::pin(async move {
+                let shared =
+                    ctx.shared_state().expect("after-tool callbacks should see shared state");
+                shared.set_shared("after_tool", json!(ctx.tool_name())).await?;
+                let outcome_seen = ctx.tool_outcome().is_some();
+                *recorder.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((outcome_seen, shared.snapshot().await));
+                Ok(None)
+            })
+        }))
+        .build()
+        .unwrap();
+    let parallel = ParallelAgent::new("parallel", vec![Arc::new(agent)]).with_shared_state();
+
+    let stream = parallel.run(Arc::new(TestContext::new("use the tool"))).await.unwrap();
+    drain_stream(stream).await.unwrap();
+
+    assert_eq!(
+        *observed.lock().unwrap_or_else(|e| e.into_inner()),
+        Some((true, HashMap::from([("after_tool".to_string(), json!("test_tool"))])))
+    );
 }

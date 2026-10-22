@@ -44,6 +44,7 @@ standard = [
     "tools",
     "memory",
     "telemetry",
+    "computer-use",
 ]
 
 # Enterprise — standard + all production specialist crates.
@@ -62,6 +63,44 @@ full = [
     "audio",
     "code",
     "sandbox",
+    "code-tools",
+    "graph-functional",
+    "graph-node-cache",
+    "graph-delta",
+    "graph-time-travel",
+]
+
+# Gemini Enterprise Agent Platform — every Vertex/EAP integration except
+# realtime transports. The right default for ReasoningEngine BYOC deployments
+# (request/response + SSE agents). Composable with any tier:
+#   features = ["minimal", "gemini-agent-platform"]
+# Excluded: deploy-time tooling (host-side, not part of the agent container)
+# and `vertex-live` (build weight — see `gemini-agent-platform-full`).
+# Growth rule: every PR that introduces a Vertex/EAP feature flag appends it
+# here (or to `gemini-agent-platform-full` if it pulls in a realtime transport).
+gemini-agent-platform = [
+    "gemini-vertex",  # Vertex model backend (adk-model → adk-gemini/vertex)
+    "vertex-session", # managed Sessions (adk-session)
+    "gcp-secrets",    # GCP Secret Manager (adk-auth)
+    "gcs-artifacts",  # GCS artifact backend (adk-artifact)
+    "gcp-telemetry",  # Cloud Trace/Logging transport (adk-telemetry)
+    "agent-engine",   # class-method runtime contract + turnkey entrypoint (adk-server)
+    "vertex-memory",  # Memory Bank (adk-memory)
+    "example-store",  # Example Store few-shot retrieval (adk-tool)
+    "vertex-sandbox", # managed code-execution sandbox (adk-code)
+    "vertex-eval",    # Gen AI Evaluation bridge (adk-eval)
+    "vertex-rag",     # RAG Engine retrieval (adk-rag)
+    "agent-retrieval", # Agent Retrieval store (adk-rag)
+    "vertex-agent-registry", # Agent Registry discovery (adk-tool)
+    "vertex-skill-registry", # Skill Registry consumption (adk-skill)
+    "vertex-remote-engine", # remote ReasoningEngine sub-agents (adk-server)
+]
+
+# gemini-agent-platform + realtime: adds the Vertex AI Live API (bidirectional
+# audio/video), which pulls in the adk-realtime WebSocket/audio stack.
+gemini-agent-platform-full = [
+    "gemini-agent-platform",
+    "vertex-live", # Vertex AI Live API (adk-realtime)
 ]
 
 # CLI launcher support
@@ -78,16 +117,21 @@ cli-telemetry-otlp = ["cli", "adk-cli/telemetry-otlp"]
 agents = ["dep:adk-agent"]
 record-payloads = ["agents", "adk-agent/record-payloads"]
 models = ["dep:adk-model"]
-tools = ["dep:adk-tool"]
+tools = ["dep:adk-tool", "adk-agent?/team-tools"]
 skills = ["dep:adk-skill"]
+# Google ADK-style progressive skill discovery and activation tools.
+skills-progressive-disclosure = ["skills", "adk-skill/progressive-disclosure", "adk-agent?/skills-progressive-disclosure"]
 sessions = ["dep:adk-session"]
 artifacts = ["dep:adk-artifact"]
+# GCS artifact backend, blob-name compatible with adk-python (forwarded to adk-artifact)
+gcs-artifacts = ["artifacts", "adk-artifact/gcs"]
 memory = ["dep:adk-memory"]
 runner = ["dep:adk-runner"]
 server = ["dep:adk-server", "adk-server/a2a-v1"]
 telemetry = ["dep:adk-telemetry"]
 telemetry-otlp = ["telemetry", "adk-telemetry/otlp"]
 telemetry-sqlite = ["telemetry", "adk-telemetry/sqlite"]
+gcp-telemetry = ["telemetry", "adk-telemetry/gcp"]
 graph = ["dep:adk-graph"]
 code = ["dep:adk-code"]
 sandbox = ["dep:adk-sandbox"]
@@ -101,6 +145,7 @@ rag = ["dep:adk-rag"]
 payments = ["dep:adk-payments"]
 awp = ["dep:adk-awp"]
 acp = ["dep:adk-acp"]
+computer-use = ["dep:adk-computer-use", "graph", "auth", "mcp"]
 
 # Managed agent runtime (feature-gated, experimental)
 managed-runtime = ["dep:adk-managed"]
@@ -117,6 +162,7 @@ gemini-vertex = ["gemini", "adk-model/gemini-vertex"]
 gemini-interactions = ["gemini", "adk-model/gemini-interactions"]
 openai = ["models", "adk-model/openai"]
 openrouter = ["models", "adk-model/openrouter"]
+opencode = ["models", "adk-model/opencode"]
 anthropic = ["models", "adk-model/anthropic"]
 deepseek = ["models", "adk-model/deepseek"]
 groq = ["models", "adk-model/groq"]
@@ -131,14 +177,17 @@ bedrock = ["models", "adk-model/bedrock"]
 azure-ai = ["models", "adk-model/azure-ai"]
 
 # Production backend features (forwarded to adk-session, adk-memory, adk-auth)
-# These require external infrastructure (PostgreSQL, Redis, MongoDB, Firestore, Neo4j) and are NOT included in `full`
+# These require external infrastructure (PostgreSQL, Redis, MongoDB, Firestore, Neo4j, Vertex AI) and are NOT included in `full`
 postgres-session = ["sessions", "adk-session/postgres"]
 redis-session = ["sessions", "adk-session/redis"]
 mongodb-session = ["sessions", "adk-session/mongodb"]
 firestore-session = ["sessions", "adk-session/firestore"]
 neo4j-session = ["sessions", "adk-session/neo4j"]
+vertex-session = ["sessions", "adk-session/vertex-session"]
 database-memory = ["memory", "adk-memory/database-memory"]
 sqlite-memory = ["memory", "adk-memory/sqlite-memory"]
+# Vertex AI Agent Engine Memory Bank backend (forwarded to adk-memory)
+vertex-memory = ["memory", "adk-memory/vertex-memory"]
 redis-memory = ["memory", "adk-memory/redis-memory"]
 mongodb-memory = ["memory", "adk-memory/mongodb-memory"]
 neo4j-memory = ["memory", "adk-memory/neo4j-memory"]
@@ -158,10 +207,54 @@ openai-webrtc = ["realtime", "adk-realtime/openai-webrtc"]
 yaml-agent = ["server", "adk-server/yaml-agent"]
 # Agent Registry REST API (forwarded to adk-server)
 agent-registry = ["server", "adk-server/agent-registry"]
+# Gemini Enterprise Agent Platform runtime contract: class-method dispatch
+# endpoints and the turnkey serve_agent_engine entrypoint (forwarded to adk-server)
+agent-engine = ["server", "adk-server/agent-engine"]
+# Vertex AI Example Store client and few-shot retrieval provider (forwarded to adk-tool)
+example-store = ["tools", "adk-tool/example-store"]
+# Vertex AI Agent Engine managed code-execution sandbox (forwarded to adk-code):
+# sandboxEnvironments lifecycle, :execute chunk protocol, SandboxCodeExecutor,
+# VertexSandboxTool
+vertex-sandbox = ["code", "adk-code/vertex-sandbox"]
+# Gen AI Evaluation Service bridge (forwarded to adk-eval)
+vertex-eval = ["eval", "adk-eval/vertex-eval"]
+# Vertex AI RAG Engine retrieval client + tool (forwarded to adk-rag)
+vertex-rag = ["rag", "adk-rag/vertex-rag"]
+# Agent Retrieval (Vector Search 2.0) VectorStore backend (forwarded to adk-rag)
+agent-retrieval = ["rag", "adk-rag/agent-retrieval"]
+# Agent Registry client + discovery tool (forwarded to adk-tool); unrelated to
+# the local YAML `agent-registry` feature below
+vertex-agent-registry = ["tools", "adk-tool/vertex-agent-registry"]
+# Skill Registry read-only client + safe extraction (forwarded to adk-skill)
+vertex-skill-registry = ["skills", "adk-skill/vertex-skill-registry"]
+# Remote ReasoningEngine invocation — call other deployed Agent Engine agents
+# as sub-agents (forwarded to adk-server)
+vertex-remote-engine = ["server", "adk-server/vertex-remote-engine"]
+# Agent Engine (ReasoningEngine) deployment client — host-side tooling, so
+# deliberately NOT part of gemini-agent-platform (the agent container never
+# deploys itself)
+gcp-deploy = ["dep:adk-deploy", "adk-deploy/gcp"]
 # MCP sampling callback support (forwarded to adk-tool)
 mcp = ["tools", "adk-tool/mcp"]
 mcp-http = ["mcp", "adk-tool/http-transport"]
 mcp-sampling = ["mcp", "adk-tool/mcp-sampling"]
+# Code execution tools over the adk-code substrate (forwarded to adk-tool):
+# CodeTool, PythonCodeTool, JavaScriptCodeTool, FrontendCodeTool,
+# MontyPythonCodeTool. `sandbox` is included because constructing the
+# recommended CodeTool takes an adk-sandbox backend. Included in `full`.
+code-tools = ["tools", "code", "sandbox", "adk-tool/code"]
+# Embedded JavaScript execution via boa_engine — the JavaScriptCodeTool live
+# path (forwarded to adk-tool and adk-code)
+code-embedded-js = ["code-tools", "adk-tool/code-embedded-js", "adk-code/embedded-js"]
+# Embedded Python execution via the Monty interpreter — the MontyPythonCodeTool
+# live path (forwarded to adk-tool and adk-code)
+code-embedded-python = ["code-tools", "adk-tool/code-embedded-python", "adk-code/embedded-python"]
+# Docker SDK-based persistent container execution (forwarded to adk-tool and adk-code)
+code-docker = ["code-tools", "adk-tool/code-docker", "adk-code/docker"]
+# CodeAct agents: the model acts by writing code (forwarded to adk-agent)
+codeact = ["agents", "adk-agent/codeact"]
+# Python CodeRuntime for the CodeActAgent, backed by the Monty interpreter
+codeact-monty = ["codeact", "dep:adk-codeact-monty"]
 # Native Slack toolset (forwarded to adk-tool)
 slack = ["tools", "adk-tool/slack"]
 # Native BigQuery toolset (forwarded to adk-tool)
@@ -192,6 +285,19 @@ audio-all = ["audio", "adk-audio/all"]
 
 # Anthropic client crate (direct access to adk-anthropic types)
 anthropic-client = ["dep:adk-anthropic"]
+
+# Graph capability features (forwarded to adk-graph).
+#
+# `graph` alone enables adk-graph with default features, which are empty, so none
+# of the capabilities below were reachable through this crate at all.
+graph-functional = ["graph", "adk-graph/functional"]
+graph-node-cache = ["graph", "adk-graph/node-cache"]
+graph-delta = ["graph", "adk-graph/delta-checkpoint"]
+graph-time-travel = ["graph", "adk-graph/time-travel"]
+# These two need external infrastructure, so they stay out of `full` alongside
+# the other production backends.
+graph-sqlite = ["graph", "adk-graph/sqlite"]
+graph-redis-cache = ["graph", "adk-graph/redis-cache"]
 
 # Action node features (forwarded to adk-graph)
 action = ["graph", "dep:adk-action", "adk-graph/action"]
@@ -227,12 +333,15 @@ adk-memory = { workspace = true, optional = true }
 adk-runner = { workspace = true, optional = true }
 adk-server = { workspace = true, optional = true }
 adk-telemetry = { workspace = true, optional = true }
+adk-deploy = { workspace = true, optional = true }
 adk-cli = { workspace = true, optional = true }
 adk-graph = { workspace = true, optional = true }
 adk-code = { workspace = true, optional = true }
+adk-codeact-monty = { workspace = true, optional = true }
 adk-sandbox = { workspace = true, optional = true }
 adk-realtime = { workspace = true, optional = true }
 adk-browser = { workspace = true, optional = true }
+adk-computer-use = { workspace = true, optional = true }
 adk-eval = { workspace = true, optional = true }
 adk-guardrail = { workspace = true, optional = true }
 adk-auth = { workspace = true, optional = true }
@@ -254,6 +363,7 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal", "fs", "process", "io-util", "test-util"] }
@@ -267,6 +377,7 @@ name = "performance_0_8_llm_agents"
 required-features = ["minimal"]
 
 [package.metadata.docs.rs]
-# Use "full" to show the complete API surface on docs.rs.
-features = ["full"]
+# Use "full" to show the complete API surface on docs.rs, plus the Monty
+# opt-ins (not part of any tier) so their modules appear in the docs.
+features = ["full", "code-embedded-python", "codeact-monty"]
 rustdoc-args = ["--cfg", "docsrs"]

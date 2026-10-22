@@ -24,7 +24,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
     
     let agent = LlmAgentBuilder::new("my_agent")
         .description("A helpful assistant")
@@ -176,9 +176,10 @@ See the [Server API](server.md) documentation for detailed endpoint specificatio
 The server includes a built-in web UI accessible at `http://localhost:8080/ui/`. The UI provides:
 
 - Interactive chat interface
-- Session management
-- Real-time streaming responses
-- Multi-agent visualization
+- Session, state, artifact, and event-timeline inspection
+- Real-time streaming responses and tool activity
+- Exact team delegation and handoff topology
+- Agent and UI-protocol capability discovery
 
 ## CLI Arguments
 
@@ -207,7 +208,7 @@ async fn main() -> Result<()> {
         .expect("GOOGLE_API_KEY environment variable not set");
     
     // Create model
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
     
     // Create agent with tools
     let weather_tool = FunctionTool::new(

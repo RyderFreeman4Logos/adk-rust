@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use cron::Schedule;
@@ -91,7 +91,9 @@ pub struct CronJobResponse {
     pub status: CronJobStatus,
     pub concurrency_policy: ConcurrencyPolicy,
     pub created_at: String,
+    /// The scheduling cursor; see [`CronJob::last_execution`].
     pub last_execution: Option<String>,
+    /// How many runs the scheduler has started for this job, including queued runs.
     pub execution_count: u64,
     pub active_run_count: u32,
 }
@@ -114,7 +116,15 @@ pub struct CronJob {
     pub status: CronJobStatus,
     pub concurrency_policy: ConcurrencyPolicy,
     pub created_at: DateTime<Utc>,
+    /// The scheduling cursor: the latest occurrence the scheduler claimed, or the
+    /// instant the job was last resumed, whichever is later.
+    ///
+    /// The next occurrence due is the first one strictly after this point, so
+    /// occurrences that fall inside a pause are skipped rather than replayed.
     pub last_execution: Option<DateTime<Utc>>,
+    /// How many runs the scheduler has started for this job, including runs taken
+    /// off the queue. Occurrences dropped under `Skip`, or by a full queue, are not
+    /// counted.
     pub execution_count: u64,
     pub active_run_count: u32,
     /// Queued runs waiting to execute (for `Queue` concurrency policy).
@@ -143,16 +153,54 @@ impl CronJob {
 // In-Memory Cron Job Store
 // ---------------------------------------------------------------------------
 
+/// How many runs a job using the `Queue` policy may have waiting by default.
+///
+/// An occurrence that arrives while the queue is full is skipped with a warning,
+/// so a job whose runs outlast its interval cannot grow the queue without bound.
+pub const DEFAULT_MAX_QUEUE_DEPTH: usize = 100;
+
 /// Thread-safe in-memory store for cron jobs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CronJobStore {
     jobs: Arc<RwLock<HashMap<String, CronJob>>>,
+    max_queue_depth: usize,
+}
+
+impl Default for CronJobStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CronJobStore {
-    /// Create a new empty cron job store.
+    /// Create a new empty cron job store with [`DEFAULT_MAX_QUEUE_DEPTH`].
     pub fn new() -> Self {
-        Self { jobs: Arc::new(RwLock::new(HashMap::new())) }
+        Self {
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+        }
+    }
+
+    /// Set how many runs a `Queue`-policy job may have waiting.
+    ///
+    /// Set this before cloning the store; each clone keeps its own limit.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_server::background::cron::CronJobStore;
+    ///
+    /// let store = CronJobStore::new().with_max_queue_depth(10);
+    /// assert_eq!(store.max_queue_depth(), 10);
+    /// ```
+    pub fn with_max_queue_depth(mut self, depth: usize) -> Self {
+        self.max_queue_depth = depth;
+        self
+    }
+
+    /// How many runs a `Queue`-policy job may have waiting.
+    pub fn max_queue_depth(&self) -> usize {
+        self.max_queue_depth
     }
 
     /// Insert a new cron job into the store.
@@ -171,13 +219,25 @@ impl CronJobStore {
     }
 
     /// Update the status of a cron job. Returns `true` if the job existed.
+    ///
+    /// Resuming a paused job moves its scheduling cursor
+    /// ([`CronJob::last_execution`]) to the resume instant, so the next run is the
+    /// first occurrence after the resume. Occurrences missed while paused are
+    /// skipped; without this a per-minute job paused for a day would claim its
+    /// ~1,440 missed occurrences one per scheduler tick.
     pub async fn update_status(&self, job_id: &str, status: CronJobStatus) -> bool {
-        if let Some(job) = self.jobs.write().await.get_mut(job_id) {
-            job.status = status;
-            true
-        } else {
-            false
+        let mut jobs = self.jobs.write().await;
+        let Some(job) = jobs.get_mut(job_id) else {
+            return false;
+        };
+        if job.status == CronJobStatus::Paused && status == CronJobStatus::Active {
+            let now = Utc::now();
+            if job.last_execution.is_none_or(|last| last < now) {
+                job.last_execution = Some(now);
+            }
         }
+        job.status = status;
+        true
     }
 
     /// Remove a cron job by ID. Returns `true` if the job existed.
@@ -185,7 +245,12 @@ impl CronJobStore {
         self.jobs.write().await.remove(job_id).is_some()
     }
 
-    /// Record an execution for a cron job (updates last_execution, increments count).
+    /// Record that a job executed, setting `last_execution` to now.
+    ///
+    /// The scheduler no longer calls this: it advances scheduling state with
+    /// [`CronJobStore::claim_occurrence`], which stores the exact schedule point rather
+    /// than the wall-clock time a run happened to start. Setting `last_execution` to
+    /// now would skip any occurrence between the schedule point and that moment.
     pub async fn record_execution(&self, job_id: &str) {
         if let Some(job) = self.jobs.write().await.get_mut(job_id) {
             job.last_execution = Some(Utc::now());
@@ -200,6 +265,15 @@ impl CronJobStore {
         }
     }
 
+    /// Record that the scheduler started a run: increments both the active run
+    /// count and [`CronJob::execution_count`].
+    pub async fn record_run_started(&self, job_id: &str) {
+        if let Some(job) = self.jobs.write().await.get_mut(job_id) {
+            job.active_run_count += 1;
+            job.execution_count += 1;
+        }
+    }
+
     /// Decrement the active run count for a cron job.
     pub async fn decrement_active_runs(&self, job_id: &str) {
         if let Some(job) = self.jobs.write().await.get_mut(job_id) {
@@ -208,42 +282,77 @@ impl CronJobStore {
     }
 
     /// Enqueue a run for a cron job (for `Queue` policy).
-    pub async fn enqueue_run(&self, job_id: &str, run_id: String) {
-        if let Some(job) = self.jobs.write().await.get_mut(job_id) {
-            job.queued_runs.push(run_id);
+    ///
+    /// Returns `false`, and logs a warning, when the job's queue already holds
+    /// [`max_queue_depth`](Self::max_queue_depth) runs; the occurrence is skipped.
+    /// Also returns `false` when the job does not exist.
+    pub async fn enqueue_run(&self, job_id: &str, run_id: String) -> bool {
+        let mut jobs = self.jobs.write().await;
+        let Some(job) = jobs.get_mut(job_id) else {
+            return false;
+        };
+        if job.queued_runs.len() >= self.max_queue_depth {
+            tracing::warn!(
+                cron.job_id = %job_id,
+                cron.max_queue_depth = self.max_queue_depth,
+                "cron queue is full, skipping occurrence"
+            );
+            return false;
         }
+        job.queued_runs.push(run_id);
+        true
     }
 
     /// Dequeue the next pending run for a cron job (for `Queue` policy).
     pub async fn dequeue_run(&self, job_id: &str) -> Option<String> {
-        if let Some(job) = self.jobs.write().await.get_mut(job_id) {
-            if !job.queued_runs.is_empty() {
-                return Some(job.queued_runs.remove(0));
-            }
+        if let Some(job) = self.jobs.write().await.get_mut(job_id)
+            && !job.queued_runs.is_empty()
+        {
+            return Some(job.queued_runs.remove(0));
         }
         None
     }
 
     /// Get all active jobs that are due for execution.
     pub async fn get_due_jobs(&self) -> Vec<CronJob> {
+        self.due_occurrences().await.into_iter().map(|(job, _)| job).collect()
+    }
+
+    /// Active jobs that are due, paired with the exact occurrence they are due for.
+    ///
+    /// The occurrence timestamp is what makes a claim idempotent: without it, a job
+    /// whose scheduling state has not advanced looks due on every poll.
+    pub async fn due_occurrences(&self) -> Vec<(CronJob, DateTime<Utc>)> {
         let jobs = self.jobs.read().await;
         let now = Utc::now();
 
         jobs.values()
             .filter(|job| job.status == CronJobStatus::Active)
-            .filter(|job| {
-                // Check if the job is due based on cron expression
-                if let Ok(schedule) = Schedule::from_str(&job.cron_expression) {
-                    // Find the next occurrence after the last execution (or creation time)
-                    let reference_time = job.last_execution.unwrap_or(job.created_at);
-                    if let Some(next) = schedule.after(&reference_time).next() {
-                        return next <= now;
-                    }
-                }
-                false
+            .filter_map(|job| {
+                let schedule = Schedule::from_str(&job.cron_expression).ok()?;
+                let reference_time = job.last_execution.unwrap_or(job.created_at);
+                let next = schedule.after(&reference_time).next()?;
+                (next <= now).then(|| (job.clone(), next))
             })
-            .cloned()
             .collect()
+    }
+
+    /// Claim `occurrence` for `job_id`, returning whether this caller won it.
+    ///
+    /// Scheduling state advances here rather than when a run starts, so an occurrence
+    /// that is queued behind an active run is not offered again on the next poll. The
+    /// check and the write happen under one write lock, so only one caller can claim a
+    /// given occurrence.
+    pub async fn claim_occurrence(&self, job_id: &str, occurrence: DateTime<Utc>) -> bool {
+        let mut jobs = self.jobs.write().await;
+        let Some(job) = jobs.get_mut(job_id) else {
+            return false;
+        };
+        if job.last_execution.is_some_and(|last| last >= occurrence) {
+            return false;
+        }
+        job.last_execution = Some(occurrence);
+        true
     }
 }
 
@@ -262,6 +371,24 @@ impl CronState {
     /// Create a new cron state with a fresh store.
     pub fn new(background_state: BackgroundState) -> Self {
         Self { cron_store: CronJobStore::new(), background_state }
+    }
+
+    /// Set how many runs a `Queue`-policy job may have waiting.
+    ///
+    /// Defaults to [`DEFAULT_MAX_QUEUE_DEPTH`]. Call this before cloning the state
+    /// into the router and the scheduler.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_server::background::{BackgroundState, CronState};
+    ///
+    /// let state = CronState::new(BackgroundState::new()).with_max_queue_depth(10);
+    /// assert_eq!(state.cron_store.max_queue_depth(), 10);
+    /// ```
+    pub fn with_max_queue_depth(mut self, depth: usize) -> Self {
+        self.cron_store = self.cron_store.with_max_queue_depth(depth);
+        self
     }
 }
 
@@ -318,6 +445,23 @@ async fn list_cron_jobs(State(state): State<CronState>) -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::to_value(responses).unwrap())).into_response()
 }
 
+/// GET /cron/{job_id} — Retrieve one cron job.
+async fn get_cron_job(
+    State(state): State<CronState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    match state.cron_store.get(&job_id).await {
+        Some(job) => {
+            (StatusCode::OK, Json(serde_json::to_value(job.to_response()).unwrap())).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("cron job '{job_id}' not found") })),
+        )
+            .into_response(),
+    }
+}
+
 /// PATCH /cron/{job_id} — Pause or resume a cron job.
 async fn patch_cron_job(
     State(state): State<CronState>,
@@ -367,24 +511,29 @@ pub fn start_cron_scheduler(state: CronState) -> tokio::task::JoinHandle<()> {
         loop {
             interval.tick().await;
 
-            let due_jobs = state.cron_store.get_due_jobs().await;
+            for (job, occurrence) in state.cron_store.due_occurrences().await {
+                // Claim the occurrence before acting on it. Under `Queue` the previous
+                // code advanced scheduling state only when a run started, so an
+                // occurrence waiting behind an active run was enqueued again on every
+                // one-second poll and one schedule point became many runs.
+                if !state.cron_store.claim_occurrence(&job.job_id, occurrence).await {
+                    continue;
+                }
 
-            for job in due_jobs {
                 match job.concurrency_policy {
                     ConcurrencyPolicy::Skip => {
-                        // Skip if previous run still active
+                        // Drop this occurrence if a previous run is still active.
                         if job.active_run_count > 0 {
                             continue;
                         }
                         trigger_run(&state, &job).await;
                     }
                     ConcurrencyPolicy::Allow => {
-                        // Always create a new run
                         trigger_run(&state, &job).await;
                     }
                     ConcurrencyPolicy::Queue => {
-                        // If active, enqueue; otherwise execute immediately
                         if job.active_run_count > 0 {
+                            // A full queue drops the occurrence; `enqueue_run` warns.
                             let run_id = uuid::Uuid::new_v4().to_string();
                             state.cron_store.enqueue_run(&job.job_id, run_id).await;
                         } else {
@@ -397,16 +546,14 @@ pub fn start_cron_scheduler(state: CronState) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Trigger a background run for a due cron job.
-async fn trigger_run(state: &CronState, job: &CronJob) {
+/// Builds a background run record for one occurrence of `job`.
+fn run_record(job: &CronJob, run_id: String) -> super::BackgroundRun {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    let run_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
-
-    let run = super::BackgroundRun {
-        run_id: run_id.clone(),
+    super::BackgroundRun {
+        run_id,
         workflow_id: job.workflow_id.clone(),
         status: RunStatus::Queued,
         input: job.input.clone().unwrap_or_default(),
@@ -418,65 +565,69 @@ async fn trigger_run(state: &CronState, job: &CronJob) {
         max_retries: 0,
         retry_count: 0,
         cancel_token: CancellationToken::new(),
-    };
+    }
+}
 
-    state.background_state.store.insert(run).await;
-    state.cron_store.record_execution(&job.job_id).await;
-    state.cron_store.increment_active_runs(&job.job_id).await;
+/// Trigger a background run for a due cron job.
+///
+/// Every run for a job goes through here, including one started from the queue, so the
+/// active count is always paired with a monitor that will decrement it.
+async fn trigger_run(state: &CronState, job: &CronJob) {
+    let run_id = uuid::Uuid::new_v4().to_string();
 
-    // Start execution
+    state.background_state.store.insert(run_record(job, run_id.clone())).await;
+    state.cron_store.record_run_started(&job.job_id).await;
     state.background_state.runner.execute(run_id.clone());
 
-    // Spawn a task to monitor run completion and handle queue policy
-    let cron_store = state.cron_store.clone();
-    let bg_store = state.background_state.store.clone();
-    let bg_runner = state.background_state.runner.clone();
+    // One monitor follows the whole chain: the run it started, then each run it takes
+    // off the queue. Starting a queued run without a monitor left `active_run_count`
+    // permanently nonzero, which stalled every later Skip and Queue decision.
+    let state = state.clone();
     let job_id = job.job_id.clone();
-
     tokio::spawn(async move {
-        // Poll until the run completes
+        let mut current = run_id;
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Some(run) = bg_store.get(&run_id).await {
-                match run.status {
-                    RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => {
-                        cron_store.decrement_active_runs(&job_id).await;
-
-                        // If queue policy, check for queued runs
-                        if let Some(job) = cron_store.get(&job_id).await {
-                            if job.concurrency_policy == ConcurrencyPolicy::Queue {
-                                if let Some(queued_run_id) = cron_store.dequeue_run(&job_id).await {
-                                    // Create and execute the queued run
-                                    let now = Utc::now();
-                                    let queued_run = super::BackgroundRun {
-                                        run_id: queued_run_id.clone(),
-                                        workflow_id: job.workflow_id.clone(),
-                                        status: RunStatus::Queued,
-                                        input: job.input.clone().unwrap_or_default(),
-                                        result: None,
-                                        error: None,
-                                        created_at: now,
-                                        updated_at: now,
-                                        timeout: Some(Duration::from_secs(3600)),
-                                        max_retries: 0,
-                                        retry_count: 0,
-                                        cancel_token: CancellationToken::new(),
-                                    };
-                                    bg_store.insert(queued_run).await;
-                                    cron_store.increment_active_runs(&job_id).await;
-                                    bg_runner.execute(queued_run_id);
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    _ => continue,
-                }
-            } else {
+            if !wait_for_run(&state, &current).await {
+                // The run record vanished; release the slot so the job is not wedged.
+                state.cron_store.decrement_active_runs(&job_id).await;
                 break;
             }
+            state.cron_store.decrement_active_runs(&job_id).await;
+
+            let Some(job) = state.cron_store.get(&job_id).await else {
+                break;
+            };
+            if job.concurrency_policy != ConcurrencyPolicy::Queue {
+                break;
+            }
+            let Some(next_run_id) = state.cron_store.dequeue_run(&job_id).await else {
+                break;
+            };
+
+            state.background_state.store.insert(run_record(&job, next_run_id.clone())).await;
+            state.cron_store.record_run_started(&job_id).await;
+            state.background_state.runner.execute(next_run_id.clone());
+            current = next_run_id;
         }
     });
+}
+
+/// Waits for `run_id` to reach a terminal status.
+///
+/// Returns `false` when the run record disappeared, which is not a completion and must
+/// not be mistaken for one.
+async fn wait_for_run(state: &CronState, run_id: &str) -> bool {
+    use std::time::Duration;
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match state.background_state.store.get(run_id).await {
+            Some(run) => match run.status {
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => return true,
+                _ => continue,
+            },
+            None => return false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +641,11 @@ async fn trigger_run(state: &CronState, job: &CronJob) {
 /// - `GET /cron` — List all cron jobs
 /// - `PATCH /cron/{job_id}` — Pause/resume a cron job
 /// - `DELETE /cron/{job_id}` — Delete a cron job
+///
+/// > **Important:** the router carries no authentication. Anyone who reaches it can
+/// > schedule recurring work. Mount it through
+/// > [`ServerBuilder::with_cron_jobs`](crate::ServerBuilder::with_cron_jobs), which
+/// > applies the server's auth middleware, or behind your own authentication layer.
 pub fn cron_jobs_router(background_state: BackgroundState) -> Router {
     let state = CronState::new(background_state);
     cron_jobs_router_with_state(state)
@@ -498,9 +654,11 @@ pub fn cron_jobs_router(background_state: BackgroundState) -> Router {
 /// Create the cron jobs router with a pre-configured state.
 ///
 /// This is useful for testing or sharing state with other components.
+///
+/// > **Important:** the router carries no authentication; see [`cron_jobs_router`].
 pub fn cron_jobs_router_with_state(state: CronState) -> Router {
     Router::new()
         .route("/cron", post(create_cron_job).get(list_cron_jobs))
-        .route("/cron/{job_id}", axum::routing::patch(patch_cron_job).delete(delete_cron_job))
+        .route("/cron/{job_id}", get(get_cron_job).patch(patch_cron_job).delete(delete_cron_job))
         .with_state(state)
 }

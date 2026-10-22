@@ -1,6 +1,6 @@
 use crate::{
-    BlockReason, FinishReason, FunctionCall, GenerationResponse, HarmCategory, HarmProbability,
-    Modality, Model, Part,
+    BlockReason, FinishReason, FunctionCall, GenerationConfig, GenerationResponse, HarmCategory,
+    HarmProbability, Modality, Model, Part, ThinkingConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,6 +21,59 @@ fn test_model_deserialization() {
     let serialized = serde_json::to_string(&response).unwrap();
     let deserialized: Response = serde_json::from_str(&serialized).unwrap();
     assert_eq!(deserialized.model, response.model);
+}
+
+#[test]
+fn current_default_uses_future_proof_custom_model() {
+    let model = Model::default();
+    assert_eq!(model.as_str(), "models/gemini-3.7-flash");
+    assert_eq!(Model::gemini_3_6_flash().as_str(), "models/gemini-3.6-flash");
+}
+
+#[test]
+fn gemini_37_rejects_removed_generation_parameters() {
+    use crate::client::validate_generation_config_for_model;
+
+    for config in [
+        GenerationConfig { temperature: Some(0.7), ..Default::default() },
+        GenerationConfig { top_p: Some(0.9), ..Default::default() },
+        GenerationConfig { top_k: Some(20), ..Default::default() },
+        GenerationConfig { candidate_count: Some(2), ..Default::default() },
+        GenerationConfig {
+            thinking_config: Some(ThinkingConfig::new().with_thinking_budget(1024)),
+            ..Default::default()
+        },
+    ] {
+        assert!(validate_generation_config_for_model(&Model::default(), &config).is_err());
+    }
+
+    assert!(
+        validate_generation_config_for_model(
+            &Model::default(),
+            &GenerationConfig {
+                thinking_config: Some(
+                    ThinkingConfig::new()
+                        .with_thinking_level(crate::generation::ThinkingLevel::Medium),
+                ),
+                ..Default::default()
+            },
+        )
+        .is_ok()
+    );
+}
+
+#[cfg(feature = "interactions")]
+#[test]
+fn gemini_37_interactions_reject_removed_sampling_parameters() {
+    use crate::client::validate_interaction_generation_config_for_model;
+    use crate::interactions::GenerationConfig as InteractionGenerationConfig;
+
+    let config = InteractionGenerationConfig { temperature: Some(0.7), ..Default::default() };
+    let error =
+        validate_interaction_generation_config_for_model(Some("models/gemini-3.7-flash"), &config)
+            .expect_err("Gemini 3.7 interactions must reject explicit sampling");
+
+    assert!(error.to_string().contains("does not accept temperature or top_p"));
 }
 
 #[test]

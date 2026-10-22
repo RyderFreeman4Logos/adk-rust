@@ -8,11 +8,79 @@ The purpose of this file is to provide transparency to consumers about the secur
 
 These accepted advisories are also configured in [`.cargo/audit.toml`](../../.cargo/audit.toml) so that `cargo audit` passes in CI while still surfacing new, unreviewed advisories.
 
-**Last reviewed:** 2026-06-07
+**Last reviewed:** 2026-10-06 (post-2.2.0 review)
+
+---
+
+## Resolved in 2.0.0
+
+| Advisory | Crate | Resolution |
+|---|---|---|
+| RUSTSEC-2026-0193, RUSTSEC-2026-0213 | `ammonia` | Lockfile updated to 4.1.4. |
+| RUSTSEC-2026-0204 | `crossbeam-epoch` | Lockfile updated to 0.9.20. |
+| RUSTSEC-2026-0194, RUSTSEC-2026-0195 | `quick-xml` (declared) | `adk-eval` now requires quick-xml 0.41. The transitive 0.26 copy is covered below. |
+| RUSTSEC-2026-0222, RUSTSEC-2026-0223 | `wasmtime` | Lockfile updated from 46.0.1 to 46.0.2. |
+
+## Resolved in 2.1.0
+
+| Advisory | Crate | Resolution |
+|---|---|---|
+| RUSTSEC-2026-0176, RUSTSEC-2026-0177 | `pyo3` | Monty updated to 0.0.21, which selects jiter 0.16 and PyO3 0.29.2. The old advisory exceptions were removed from both audit policies. |
+| RUSTSEC-2026-0258 | `h2` | Updated the HTTP/2 1.x stack to h2 0.4.19, moved Azure Identity to its matching 0.22 SDK generation, and disabled the AWS Secrets Manager legacy Hyper 0.14 TLS feature. The vulnerable h2 0.3 line is no longer in the lockfile. |
+
+## Resolved since 2.1.0
+
+| Advisory | Crate | Resolution |
+|---|---|---|
+| RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 | `rustls-webpki` | The lockfile no longer contains a `rustls-webpki` release below 0.103.12. Neither `cargo audit` nor `cargo deny` reports the advisories, and the exceptions were removed from both policies. |
+
+## Open advisories (fix in flight)
+
+These fail the nightly `supply-chain` job today. They are not accepted risks; the
+exceptions are deliberately absent so the job stays red until the fixes land.
+
+| Advisory | Crate | Fix |
+|---|---|---|
+| RUSTSEC-2026-0321, RUSTSEC-2026-0322, RUSTSEC-2026-0323, RUSTSEC-2026-0324, RUSTSEC-2026-0325, RUSTSEC-2026-0326, RUSTSEC-2026-0327 | `wasmtime`, `wasmtime-wasi` 48.0.3 (`adk-sandbox`, feature `wasm`) | Patched in 48.0.5; dependabot PR #704 moves the lockfile. |
+| RUSTSEC-2026-0285 | `rustls` 0.23.43 | Patched in 0.23.45; PR #687 updates the workspace and example lockfiles. |
 
 ---
 
 ## Active Advisories
+
+---
+
+### RUSTSEC-2026-0235 — rkyv 0.7 archive validation
+
+> Listed in `.cargo/audit.toml` only. `cargo audit` scans the lockfile and reports
+> the package; `cargo deny` resolves the feature graph, never reaches it, and
+> would flag the exception as `advisory-not-detected`.
+
+- **Crate:** `rkyv` (0.7.46)
+- **Severity:** Memory safety when validating malicious archives containing shared pointers
+- **ADK Impact:** The package is recorded only through `rust_decimal`'s optional `rkyv` feature. `rust_decimal` is used by SurrealDB, but neither SurrealDB nor any ADK-Rust feature enables that archive integration.
+- **Status:** rkyv fixed the issue on its 0.8 line. `rust_decimal` 1.42.1 still declares rkyv 0.7 as its optional compatibility dependency.
+- **Disposition:** Accepted risk — dependency feature is unreachable
+- **ADK-Specific Context:** `cargo tree --workspace --all-features --target all -e features -i rkyv@0.7.46` has no reachable package. Active rkyv users in the lockfile resolve to 0.8.18.
+- **Mitigation:** Keep the exception only until `rust_decimal` moves or removes its rkyv 0.7 compatibility feature. Never enable `rust_decimal/rkyv`; use the current rkyv 0.8 integration directly for archive handling.
+
+---
+
+### RUSTSEC-2026-0194, RUSTSEC-2026-0195 — quick-xml 0.26: parser denial of service
+
+- **Crate:** `quick-xml` (0.26.0)
+- **Severity:** High (7.5) — availability only
+- **Advisories:**
+  - [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194) — quadratic run time checking a start tag for duplicate attribute names
+  - [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195) — unbounded namespace-declaration allocation in `NsReader`
+- **ADK Impact:** `adk-rag` → `lancedb` → `lance-testing` → `pprof` → `inferno` → `quick-xml 0.26`, behind the optional `adk-rag/lancedb` feature.
+- **Status:** Patched upstream in quick-xml ≥ 0.41. The 0.26 copy cannot be updated from this workspace: `lancedb` declares `lance-testing` as a normal (not dev) dependency with `default = []`, so no feature selection removes the path. It needs a `lancedb` release that moves `lance-testing` to dev-dependencies.
+- **Disposition:** Accepted risk — no ADK-reachable path
+- **Conditions:** Both advisories require the attacker to control XML fed to the parser.
+- **ADK-Specific Context:** `inferno` parses only the flamegraph SVG that `pprof` generates in-process during profiling. No ADK-Rust request, document, or tool input reaches this parser, and the profiler is not invoked by the RAG backend at runtime.
+- **Mitigation:** The crates this workspace declares directly are on the patched line — `adk-eval` requires quick-xml 0.41. `deny.toml` bans `quick-xml < 0.41` with `inferno` as the sole permitted wrapper, so a direct regression cannot hide behind this exception.
+
+---
 
 ### RUSTSEC-2023-0071 — rsa: Marvin Attack (Timing Side-Channel)
 
@@ -31,22 +99,16 @@ These accepted advisories are also configured in [`.cargo/audit.toml`](../../.ca
 
 ---
 
-### RUSTSEC-2026-0104, RUSTSEC-2026-0098, RUSTSEC-2026-0099 — rustls-webpki
+### RUSTSEC-2026-0174 — http-types: ASCII invariant in `Authorization` values
 
-- **Crate:** `rustls-webpki` (< 0.103.12)
-- **Severity:** Moderate
-- **Advisories:**
-  - [RUSTSEC-2026-0104](https://rustsec.org/advisories/RUSTSEC-2026-0104) — CRL validation bypass
-  - [RUSTSEC-2026-0098](https://rustsec.org/advisories/RUSTSEC-2026-0098) — Name constraint bypass
-  - [RUSTSEC-2026-0099](https://rustsec.org/advisories/RUSTSEC-2026-0099) — Related name constraint issue
-- **ADK Impact:** Transitive dependency via `adk-server`/`adk-auth` → `rustls` → `rustls-webpki`
-- **Status:** Fix available in `rustls-webpki` ≥ 0.103.12, but upgrade is deferred — causes breaking compilation issues across the workspace due to incompatible `rustls` version constraints from multiple downstream crates.
-- **Disposition:** Accepted risk — upgrade deferred to post-1.0 patch release
-- **Conditions:** These vulnerabilities require specific TLS server configurations to be exploitable:
-  1. CRL validation bypass (RUSTSEC-2026-0104): Only affects deployments that rely on Certificate Revocation Lists for client certificate validation
-  2. Name constraint bypass (RUSTSEC-2026-0098, RUSTSEC-2026-0099): Only affects deployments using X.509 name constraints to restrict certificate issuance scope
-- **ADK-Specific Context:** ADK-Rust's TLS usage is primarily outbound HTTPS connections to LLM provider APIs. Inbound TLS (via `adk-server`) typically terminates at a reverse proxy or load balancer, not at the application layer. The CRL and name-constraint features are rarely configured in typical ADK deployments.
-- **Mitigation:** Upgrade to `rustls-webpki` ≥ 0.103.12 in the post-1.0.1 patch release once upstream `rustls` ecosystem version alignment is resolved. Consumers relying on CRL validation or name constraints in their TLS configuration should use an external TLS termination proxy.
+- **Crate:** `http-types` (2.12.0)
+- **Severity:** Informational (unsoundness notice)
+- **Advisory:** [RUSTSEC-2026-0174](https://rustsec.org/advisories/RUSTSEC-2026-0174)
+- **ADK Impact:** Transitive dependency via `adk-auth` → `azure_core` → `http-types`.
+- **Status:** The crate is unmaintained upstream; the Azure SDK is migrating away from it.
+- **Disposition:** Accepted risk — no ADK-reachable path
+- **ADK-Specific Context:** ADK-Rust never constructs `http-types` header values. The Azure SDK builds its own `Authorization` headers from tokens it obtains itself.
+- **Mitigation:** Listed in `deny.toml` only (cargo-audit treats the notice as informational). Remove the exception when the Azure SDK drops `http-types`.
 
 ---
 
@@ -85,7 +147,7 @@ The following crates are flagged by `cargo audit` as unmaintained. Each has been
 | `async-std` | [RUSTSEC-2025-0052](https://rustsec.org/advisories/RUSTSEC-2025-0052) | 1.13.2 | `adk-auth` → `azure_security_keyvault_secrets`; `adk-realtime` → `livekit` → `async-tungstenite` | Acceptable — no security impact | Discontinued runtime, used only as transitive async shim. Will be removed when upstream migrates. |
 | `atomic-polyfill` | [RUSTSEC-2023-0089](https://rustsec.org/advisories/RUSTSEC-2023-0089) | 1.0.3 | `adk-rag` → `surrealdb` → `geo-types` → `rstar` → `heapless` | Acceptable — no security impact | Polyfill for non-std targets. ADK-Rust uses std only. |
 | `audiopus_sys` | [RUSTSEC-2026-0150](https://rustsec.org/advisories/RUSTSEC-2026-0150) | 0.2.2 | `adk-realtime` → `audiopus` | Replacement planned | Tracking replacement with `opus-rs` or direct `libopus-sys`. |
-| `backoff` | [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) | 0.4.0 | `adk-session` → `neo4rs`/`firestore`; `adk-model`/`adk-realtime` → `async-openai` | Acceptable — no security impact | Pure-Rust retry logic. Functional despite unmaintained status. |
+| `backoff` | [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) | 0.4.0 | `adk-session` → `neo4rs`/`firestore` | Acceptable — no security impact | Pure-Rust retry logic. Functional despite unmaintained status. |
 | `bincode` | [RUSTSEC-2025-0141](https://rustsec.org/advisories/RUSTSEC-2025-0141) | 2.0.1 | `adk-rag` → `surrealdb` → `surrealmx` | Acceptable — no security impact | Internal to SurrealDB. No direct ADK usage. |
 | `fxhash` | [RUSTSEC-2025-0057](https://rustsec.org/advisories/RUSTSEC-2025-0057) | 0.2.1 | `adk-mistralrs` → `mistralrs` → `bm25` | Acceptable — no security impact | Non-crypto hash for BM25 lookup tables. No security context. |
 | `instant` | [RUSTSEC-2024-0384](https://rustsec.org/advisories/RUSTSEC-2024-0384) | 0.1.13 | `adk-auth` → `azure_core` → `http-types` → `futures-lite` → `fastrand` | Acceptable — no security impact | Time shim for non-WASM. Delegates to `std::time::Instant` on native. |
@@ -106,16 +168,33 @@ The following crates are flagged by `cargo audit` as unmaintained. Each has been
 
 ---
 
+## Non-OSI dependency licenses
+
+Two optional backends link code under licenses that are not OSI-approved. They are
+allowed per-crate in [`deny.toml`](../../deny.toml) rather than through the global
+allow-list, so enabling the feature is a visible decision.
+
+| Crate | License | Reached through | Note |
+|---|---|---|---|
+| `surrealdb`, `surrealdb-core`, `surrealdb-types`, `surrealdb-types-derive`, `surrealdb-strand`, `surrealdb-collections`, `surrealdb-protocol` | Business Source License 1.1 | `adk-rag/surrealdb` | BSL restricts production use of the licensed work until its change date. Review before enabling the SurrealDB vector backend in a commercial deployment. |
+| `intel-mkl-src` | Intel Simplified Software License | `adk-mistralrs/mkl` | Intel's redistribution terms apply to the bundled MKL binaries. |
+| `inferno` | CDDL-1.0 (OSI-approved, file-level copyleft) | `adk-rag/lancedb` → `lance-testing` → `pprof` | No obligation on this workspace's own sources. |
+
+Neither `surrealdb` nor `intel-mkl-src` is enabled by any default, `standard`,
+`enterprise`, or `full` feature tier.
+
+---
+
 ## Review Cadence
 
-This document is reviewed at each minor release. Run `cargo audit` to check for new advisories:
+This document is reviewed at each minor release. Run both supply-chain gates:
 
 ```bash
 cargo audit
+cargo deny check
 ```
 
-To check for outdated dependencies:
-
-```bash
-cargo audit --deny warnings
-```
+`cargo audit` scans `Cargo.lock`; `cargo deny check` additionally enforces the
+license allow-list, the registry allow-list, and the `quick-xml` version floor.
+The accepted-advisory lists in [`.cargo/audit.toml`](../../.cargo/audit.toml) and
+[`deny.toml`](../../deny.toml) are kept in sync — add the rationale here first.

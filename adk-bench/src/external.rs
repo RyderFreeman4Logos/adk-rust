@@ -342,6 +342,55 @@ pub fn load_external_configs(path: &Path) -> crate::Result<Vec<ExternalFramework
 mod tests {
     use super::*;
 
+    /// Writes `body` to an executable throwaway script and returns its path.
+    ///
+    /// These tests drive the runner with fixed shell snippets. They cannot be
+    /// passed as a `cmd /C` argument on Windows: `Command::args` applies
+    /// `CommandLineToArgvW` escaping, which `cmd.exe` does not implement, so a
+    /// payload containing `"` arrives with literal `\"` and any JSON in it is
+    /// corrupted (the same quirk `adk-sandbox`'s `ProcessBackend::execute_command`
+    /// documents). A script file keeps the body off the command line entirely.
+    ///
+    /// The returned `TempDir` owns the file and must stay alive for the call.
+    fn script(body: &str) -> (tempfile::TempDir, String, Vec<String>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let name = if cfg!(windows) { "s.ps1" } else { "s.sh" };
+        let contents =
+            if cfg!(windows) { body.to_string() } else { format!("#!/bin/sh\n{body}\n") };
+
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).expect("write script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+        }
+
+        let script_path = path.to_string_lossy().into_owned();
+
+        // PowerShell rather than cmd on Windows: `set /a` is limited to 32 bits and
+        // cannot add to an epoch-nanosecond timestamp. `powershell` (5.1) ships with
+        // every supported Windows, unlike `sh` or `pwsh`.
+        if cfg!(windows) {
+            (
+                dir,
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    script_path,
+                ],
+            )
+        } else {
+            (dir, script_path, vec![])
+        }
+    }
+
     #[test]
     fn test_external_metrics_output_deserialize() {
         let json = r#"{
@@ -516,10 +565,11 @@ mod tests {
     #[tokio::test]
     async fn test_external_runner_non_zero_exit() {
         let runner = ExternalRunner::new(10);
+        let (_dir, command, args) = script("exit 1");
         let config = ExternalFrameworkConfig {
             name: "failing-script".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), "exit 1".to_string()],
+            command,
+            args,
             working_dir: None,
             env: vec![],
         };
@@ -538,10 +588,15 @@ mod tests {
     #[tokio::test]
     async fn test_external_runner_invalid_json() {
         let runner = ExternalRunner::new(10);
+        // `echo` is a shell builtin on Windows with no executable to spawn, so go
+        // through the platform shell rather than invoking it directly.
+        let emit =
+            if cfg!(windows) { "Write-Output 'not valid json'" } else { "echo not valid json" };
+        let (_dir, command, args) = script(emit);
         let config = ExternalFrameworkConfig {
             name: "bad-json".to_string(),
-            command: "echo".to_string(),
-            args: vec!["not valid json".to_string()],
+            command,
+            args,
             working_dir: None,
             env: vec![],
         };
@@ -561,11 +616,12 @@ mod tests {
     #[tokio::test]
     async fn test_external_runner_timeout() {
         let runner = ExternalRunner::new(1); // 1 second timeout
+        let sleep = if cfg!(windows) { "Start-Sleep -Seconds 10" } else { "sleep 10" };
+        let (_dir, command, args) = script(sleep);
         let config = ExternalFrameworkConfig {
             name: "slow-script".to_string(),
-            command: "sh".to_string(),
-            // The workload path will be appended as the last arg, but the script ignores it.
-            args: vec!["-c".to_string(), "sleep 10; #".to_string()],
+            command,
+            args,
             working_dir: None,
             env: vec![],
         };
@@ -588,10 +644,15 @@ mod tests {
         let ebp_json = r#"{"framework":"test","cold_start_us":1000,"first_llm_call_epoch_ns":99999999999999999,"loop_overhead":{"min_us":10,"max_us":100,"mean_us":50,"median_us":45,"p95_us":90,"p99_us":95,"count":5}}"#;
 
         let runner = ExternalRunner::new(10);
+        // Single quotes on both platforms: inside a script file the JSON needs no
+        // escaping, and quoting keeps the braces and spaces intact.
+        let emit = format!("echo '{ebp_json}'");
+        let emit = if cfg!(windows) { format!("Write-Output '{ebp_json}'") } else { emit };
+        let (_dir, command, args) = script(&emit);
         let config = ExternalFrameworkConfig {
             name: "test-framework".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), format!("echo '{}'; #", ebp_json)],
+            command,
+            args,
             working_dir: None,
             env: vec![],
         };
@@ -611,15 +672,22 @@ mod tests {
     async fn test_external_runner_env_injection() {
         // Verify that BENCH_START_EPOCH_NS is injected and custom env vars are passed.
         let runner = ExternalRunner::new(10);
+        // Both branches add 5_000_000ns to the injected start timestamp and emit it
+        // as first_llm_call_epoch_ns, so the runner derives cold_start_us = 5000.
+        // The cast to [long] matters: the timestamp exceeds 32 bits, which is also
+        // why this cannot be cmd's `set /a`.
+        let emit = if cfg!(windows) {
+            r#"$first = [long]$env:BENCH_START_EPOCH_NS + 5000000
+Write-Output "{""framework"":""env-test"",""cold_start_us"":0,""first_llm_call_epoch_ns"":$first,""loop_overhead"":{""min_us"":1,""max_us"":2,""mean_us"":1,""median_us"":1,""p95_us"":2,""p99_us"":2,""count"":1}}""#
+        } else {
+            r#"FIRST_CALL=$(expr $BENCH_START_EPOCH_NS + 5000000)
+echo "{\"framework\":\"env-test\",\"cold_start_us\":0,\"first_llm_call_epoch_ns\":$FIRST_CALL,\"loop_overhead\":{\"min_us\":1,\"max_us\":2,\"mean_us\":1,\"median_us\":1,\"p95_us\":2,\"p99_us\":2,\"count\":1}}""#
+        };
+        let (_dir, command, args) = script(emit);
         let config = ExternalFrameworkConfig {
             name: "env-test".to_string(),
-            command: "sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                // Output EBP JSON using the injected env var as first_llm_call_epoch_ns.
-                // The workload path will be the next positional arg but -c ignores it.
-                r#"FIRST_CALL=$(expr $BENCH_START_EPOCH_NS + 5000000); echo "{\"framework\":\"env-test\",\"cold_start_us\":0,\"first_llm_call_epoch_ns\":$FIRST_CALL,\"loop_overhead\":{\"min_us\":1,\"max_us\":2,\"mean_us\":1,\"median_us\":1,\"p95_us\":2,\"p99_us\":2,\"count\":1}}"; #"#.to_string(),
-            ],
+            command,
+            args,
             working_dir: None,
             env: vec![("CUSTOM_VAR".to_string(), "hello".to_string())],
         };

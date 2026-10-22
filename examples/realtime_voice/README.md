@@ -92,7 +92,7 @@ configures its capture/playback contexts accordingly.
 
 ## Prerequisites
 
-- Rust 1.94.0+
+- Rust 1.95.0+
 - `OPENAI_API_KEY` (for OpenAI) and/or `GEMINI_API_KEY` / `GOOGLE_API_KEY` (for Gemini)
 - A modern browser with WebSocket + Web Audio API support and microphone access
 
@@ -155,7 +155,7 @@ cargo run --manifest-path examples/realtime_voice/Cargo.toml -- probe gemini
 ## Feature Flags
 
 ```toml
-adk-realtime = { version = "2.0.0", features = ["openai", "gemini", "integration"] }
-adk-memory   = { version = "2.0.0", features = ["graph-memory"] }
-adk-tool     = { version = "2.0.0", features = ["graph-memory-tools"] }
+adk-realtime = { version = "2.3.0", features = ["openai", "gemini", "integration"] }
+adk-memory   = { version = "2.3.0", features = ["graph-memory"] }
+adk-tool     = { version = "2.3.0", features = ["graph-memory-tools"] }
 ```

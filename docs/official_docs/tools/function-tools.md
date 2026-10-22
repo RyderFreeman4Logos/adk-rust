@@ -111,8 +111,8 @@ Available attributes (all optional, combine freely):
 
 | Attribute | Effect |
 |-----------|--------|
-| `read_only` | `is_read_only() → true` — included in concurrent batch under `Auto` strategy |
-| `concurrency_safe` | `is_concurrency_safe() → true` — explicitly safe for parallel dispatch |
+| `read_only` | `is_read_only() → true` — one of two signals required for concurrent `Auto` dispatch |
+| `concurrency_safe` | `is_concurrency_safe() → true` — one of two signals required for concurrent `Auto` dispatch |
 | `long_running` | `is_long_running() → true` — prevents LLM from re-calling a pending tool |
 
 Plain `#[tool]` without attributes keeps the defaults (all `false`), so existing code is unaffected.
@@ -143,7 +143,7 @@ struct WeatherParams {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // Weather tool with proper schema
     let weather_tool = FunctionTool::new(
@@ -461,7 +461,6 @@ let status_tool = FunctionTool::new(
 - `.with_long_running(true)` tells the agent this tool returns a pending status
 - The tool spawns work with `tokio::spawn()` and returns immediately
 - Provide a status check tool so users can poll progress
-```
 
 This adds a note to prevent the LLM from calling the tool repeatedly.
 
@@ -514,6 +513,24 @@ model text, and the final tool result all arrive on one ordered stream.
 tools and runners that don't stream are unaffected. Only tools that opt in emit
 progress, and only consumers that check `tool_progress_stream()` observe it.
 
+**Progress is bounded and lossy.** A tool can produce output faster than a client
+consumes it — a compiler log, a shell command, a runaway loop — so the framework
+caps what it will hold and forward rather than growing without limit:
+
+| Limit | Value | On exceeding it |
+|-------|-------|-----------------|
+| Queue depth per tool batch | 256 events | The tool waits up to 100 ms for space, then the chunk is dropped |
+| Bytes per chunk | 8 KiB | The chunk is truncated on a character boundary |
+| Bytes per tool call | 1 MiB | Remaining progress is not forwarded |
+
+When output is dropped for any of these reasons, exactly one progress event
+carrying the text `[adk: tool progress truncated]` is emitted for that call, so a
+gap is always visible rather than silent. A slow consumer therefore slows the tool
+briefly but can never stall it indefinitely or exhaust memory.
+
+These limits apply only to *progress*. A tool's final result is not affected, so
+truncate large results inside the tool if that matters to you.
+
 > See the `streaming_bash` example for a complete web UI that renders live
 > `bash` output and one-shot tool results (`read_file`, `grep`, `glob`) from a
 > single event feed. The streaming `bash` tool itself lives in `adk-devtools`.
@@ -537,7 +554,7 @@ cargo run
 3. **Return structured JSON** - Use clear field names
 4. **Keep tools focused** - Each tool should do one thing well
 5. **Use schemas** - For complex tools, define parameter schemas
-6. **Mark read-only tools** - Use `.with_read_only(true)` for tools with no side effects so `Auto` dispatch can run them concurrently
+6. **Mark safe read-only tools** - Set both `.with_read_only(true)` and `.with_concurrency_safe(true)` so `Auto` dispatch can include them in its concurrent subset
 
 ---
 
@@ -550,8 +567,8 @@ Mark tools as read-only or concurrency-safe to enable smarter dispatch:
 let lookup = FunctionTool::new("lookup", "Look up data", |_ctx, args| async move {
     Ok(json!({"result": "cached data"}))
 })
-.with_read_only(true)        // Safe for concurrent execution in Auto mode
-.with_concurrency_safe(true); // Explicitly safe for parallel dispatch
+.with_read_only(true)
+.with_concurrency_safe(true); // Auto mode requires both signals
 
 // A mutation tool (defaults: read_only=false, concurrency_safe=false)
 let update = FunctionTool::new("update", "Update record", |_ctx, args| async move {
@@ -559,7 +576,7 @@ let update = FunctionTool::new("update", "Update record", |_ctx, args| async mov
 });
 ```
 
-When `ToolExecutionStrategy::Auto` is active, the dispatch loop runs all `is_read_only() == true` tools concurrently first, then executes the remaining tools sequentially. This reduces latency when an LLM returns multiple tool calls in a single response.
+When `ToolExecutionStrategy::Auto` is active, the dispatch loop first runs calls concurrently when their selected tools return `true` from both `is_read_only()` and `is_concurrency_safe()`. It then executes all remaining calls sequentially. `ToolExecutionStrategy::Parallel` is an explicit override that bypasses these signals, so its caller owns concurrency safety.
 
 ---
 
@@ -579,12 +596,17 @@ let ctx = SimpleToolContext::new("my-test-harness");
 let ctx = SimpleToolContext::new("my-mcp-server")
     .with_function_call_id("custom-call-id");
 
+// Bind a session ID so session-aware tools (and MCP servers that key state by
+// session) see a stable identifier instead of the empty default.
+let ctx = SimpleToolContext::new("my-mcp-server")
+    .with_session_id("session-42");
+
 // Use it to execute any tool
 let tool_ctx: Arc<dyn ToolContext> = Arc::new(ctx);
 let result = my_tool.execute(tool_ctx, json!({"key": "value"})).await?;
 ```
 
-Defaults: `user_id()` → `"anonymous"`, `session_id()` / `branch()` → `""`, `artifacts()` → `None`, `search_memory()` → empty vec. Both `invocation_id` and `function_call_id` are auto-generated UUIDs.
+Defaults: `user_id()` → `"anonymous"`, `session_id()` / `branch()` → `""`, `artifacts()` → `None`, `search_memory()` → empty vec. Both `invocation_id` and `function_call_id` are auto-generated UUIDs. Set a real session with `with_session_id(...)` when a tool routes or persists state per session.
 
 ---
 
@@ -703,7 +725,8 @@ let frd = FunctionResponseData::with_file_data(
 let frd = FunctionResponseData::with_multimodal("tool", json, inline_parts, file_parts);
 ```
 
-> **Note**: Multimodal function responses require Gemini 3 series models (`gemini-3-flash-preview`, `gemini-3-pro-preview`). Earlier models return a 400 error.
+> **Note**: Multimodal function responses require Gemini 3 series models such as
+> `gemini-3.7-flash`. Earlier models return a 400 error.
 
 See `examples/multimodal_function_response/` for a complete working example.
 

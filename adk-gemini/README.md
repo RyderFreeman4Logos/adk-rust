@@ -34,14 +34,14 @@ Rust client library for Google's Gemini API — content generation, streaming, f
 
 ```toml
 [dependencies]
-adk-gemini = "2.0.0"
+adk-gemini = "2.3.0"
 ```
 
 Or through `adk-model`:
 
 ```toml
 [dependencies]
-adk-model = { version = "2.0.0", features = ["gemini"] }
+adk-model = { version = "2.3.0", features = ["gemini"] }
 ```
 
 ## Quick Start
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Constructor | Description |
 |-------------|-------------|
-| `Gemini::new(api_key)` | Default model (gemini-2.5-flash) via v1beta |
+| `Gemini::new(api_key)` | Default model (`gemini-3.7-flash`) via v1beta |
 | `Gemini::pro(api_key)` | Gemini 2.5 Pro | Gemini 3 Pro
 | `Gemini::with_model(api_key, model)` | Specific model |
 | `Gemini::with_v1(api_key)` | Stable v1 API |
@@ -291,7 +291,7 @@ println!("Embedding dimensions: {}", response.embedding.values.len());
 ```rust
 let client = Gemini::with_model(
     api_key,
-    "models/gemini-2.5-flash-image-preview".to_string(),
+    Model::Gemini31FlashImage,
 )?;
 
 let response = client
@@ -320,7 +320,7 @@ use adk_gemini::*;
 
 let client = Gemini::with_model(
     api_key,
-    "models/gemini-2.5-flash-preview-tts".to_string(),
+    "models/gemini-3.1-flash-tts-preview".to_string(),
 )?;
 
 let response = client
@@ -422,13 +422,13 @@ let client = Gemini::with_google_cloud_adc("my-project", "global")?;
 // Service account
 let sa_json = std::fs::read_to_string("service-account.json")?;
 let client = Gemini::with_google_cloud_service_account_json(
-    &sa_json, "my-project", "us-central1", "gemini-2.5-flash",
+    &sa_json, "my-project", "us-central1", "gemini-3.7-flash",
 )?;
 
 // Workload Identity Federation
 let wif_json = std::fs::read_to_string("wif-credentials.json")?;
 let client = Gemini::with_google_cloud_wif_json(
-    &wif_json, "my-project", "us-central1", "gemini-2.5-flash",
+    &wif_json, "my-project", "us-central1", "gemini-3.7-flash",
 )?;
 ```
 
@@ -437,16 +437,16 @@ When `location` is `"global"`, the endpoint resolves to `https://aiplatform.goog
 ### Generation Config
 
 ```rust
-use adk_gemini::GenerationConfig;
+use adk_gemini::{GenerationConfig, ThinkingConfig, ThinkingLevel};
 
 let response = client
     .generate_content()
     .with_user_message("Tell me a joke.")
     .with_generation_config(GenerationConfig {
-        temperature: Some(0.9),
-        top_p: Some(0.95),
-        top_k: Some(40),
         max_output_tokens: Some(1024),
+        thinking_config: Some(
+            ThinkingConfig::new().with_thinking_level(ThinkingLevel::Medium),
+        ),
         ..Default::default()
     })
     .execute()
@@ -464,6 +464,8 @@ let response = client
 
 The `GeminiBackend` trait defines `send_request()` and `send_streaming_request()` methods. All `Gemini::new()` / `Gemini::with_model()` constructors use `StudioBackend` by default. Vertex AI constructors (`with_google_cloud`, `with_google_cloud_adc`, etc.) use `VertexBackend`.
 
+**Backend capabilities.** `StudioBackend` supports the full API surface. `VertexBackend` supports generation, streaming, embeddings, and cached content (create, get, update, list, delete). The Files API, batch operations, and the Interactions API are Studio-only and return `GoogleCloudUnsupported` on Vertex.
+
 ```rust
 use adk_gemini::{Gemini, GeminiBuilder};
 
@@ -476,7 +478,7 @@ let client = Gemini::with_google_cloud_adc("my-project", "us-central1")?;
 // Explicit backend via builder
 let client = GeminiBuilder::new()
     .with_api_key(api_key)
-    .with_model("gemini-2.5-flash")
+    .with_model("gemini-3.7-flash")
     .build()?;
 ```
 

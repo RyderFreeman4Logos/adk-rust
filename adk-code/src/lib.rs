@@ -68,12 +68,17 @@ mod container;
 pub mod diagnostics;
 #[cfg(feature = "embedded-js")]
 mod embedded_js;
+#[cfg(feature = "embedded-python")]
+pub mod embedded_python;
 mod error;
 mod executor;
 pub mod harness;
+mod host_process;
 mod rust_executor;
 mod rust_sandbox;
 mod types;
+#[cfg(feature = "vertex-sandbox")]
+pub mod vertex_sandbox;
 mod wasm_guest;
 mod workspace;
 
@@ -84,11 +89,20 @@ pub use container::*;
 pub use diagnostics::{RustDiagnostic, parse_diagnostics};
 #[cfg(feature = "embedded-js")]
 pub use embedded_js::*;
+#[cfg(feature = "embedded-python")]
+pub use embedded_python::{
+    HostFunction, HostFunctionError, MontyBuildError, MontyExecutorBuilder, MontyOneShotExecutor,
+    MontyReplExecutor, PathAccess,
+};
 pub use error::*;
 pub use executor::*;
 pub use harness::{HARNESS_TEMPLATE, validate_rust_source};
 pub use rust_executor::{CodeResult, RustExecutor, RustExecutorConfig};
 pub use rust_sandbox::*;
 pub use types::*;
+#[cfg(feature = "vertex-sandbox")]
+pub use vertex_sandbox::{
+    SandboxCodeExecutor, VertexSandboxClient, VertexSandboxConfig, VertexSandboxTool,
+};
 pub use wasm_guest::*;
 pub use workspace::*;

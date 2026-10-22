@@ -1,4 +1,7 @@
-use crate::{CallbackContext, EventActions, MemoryEntry, Result};
+use crate::{
+    CallbackContext, Event, EventActions, LlmRequest, Memory, MemoryEntry, ReadonlyContext, Result,
+    RunConfig, Session,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,7 +33,7 @@ pub trait Tool: Send + Sync {
     ///         "name": self.name(),
     ///         "description": self.description(),
     ///         "x-adk-openai-tool": {
-    ///             "type": "web_search_2025_08_26"
+    ///             "type": "web_search"
     ///         }
     ///     })
     /// }
@@ -102,14 +105,28 @@ pub trait Tool: Send + Sync {
     }
 
     /// Indicates whether this tool performs no side effects.
-    /// Read-only tools may be executed concurrently in Auto mode.
+    ///
+    /// [`ToolExecutionStrategy::Auto`] includes a call in its concurrent subset
+    /// only when the selected tool is both read-only and concurrency-safe.
     fn is_read_only(&self) -> bool {
         false
     }
 
     /// Indicates whether this tool is safe for concurrent execution.
-    /// Used by the Parallel strategy to validate dispatch safety.
+    ///
+    /// [`ToolExecutionStrategy::Auto`] requires this signal in addition to
+    /// [`Tool::is_read_only`]. [`ToolExecutionStrategy::Parallel`] is an
+    /// explicit caller override and does not inspect either signal.
     fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+
+    /// Indicates whether this tool delegates work to another agent.
+    ///
+    /// Agent implementations can use this marker to overlap consecutive
+    /// delegation calls while preserving sequential execution for ordinary
+    /// tools.
+    fn is_agent_delegation(&self) -> bool {
         false
     }
 
@@ -131,6 +148,64 @@ pub trait ToolContext: CallbackContext {
     fn set_actions(&self, actions: EventActions);
     /// Searches memory for entries matching the query.
     async fn search_memory(&self, query: &str) -> Result<Vec<MemoryEntry>>;
+
+    /// Returns the memory service backing the parent invocation, when exposed.
+    ///
+    /// The default keeps contexts written before this capability backward
+    /// compatible. Agent-as-tool adapters use it only when memory forwarding is
+    /// explicitly enabled.
+    fn memory(&self) -> Option<Arc<dyn Memory>> {
+        None
+    }
+
+    /// Returns the parent session, when exposed by the runtime tool context.
+    ///
+    /// Agent-as-tool adapters can snapshot its history and state for a child
+    /// invocation without sharing mutable session ownership.
+    fn session(&self) -> Option<&dyn Session> {
+        None
+    }
+
+    /// Returns the parent run configuration, when exposed by the runtime.
+    fn run_config(&self) -> Option<&RunConfig> {
+        None
+    }
+
+    /// Returns whether the parent invocation has been cancelled.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
+    /// Returns authenticated request metadata inherited from the parent run.
+    fn request_metadata(&self) -> std::collections::HashMap<String, Value> {
+        std::collections::HashMap::new()
+    }
+
+    /// Returns the current nested agent-as-tool delegation depth.
+    fn delegation_depth(&self) -> u32 {
+        0
+    }
+
+    /// Returns the maximum nested agent-as-tool delegation depth.
+    fn max_delegation_depth(&self) -> Option<u32> {
+        None
+    }
+
+    /// Returns the root invocation that owns this orchestration tree.
+    fn orchestration_root_invocation_id(&self) -> &str {
+        self.invocation_id()
+    }
+
+    /// Returns the causal relationship execution containing this tool call.
+    fn orchestration_edge_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Emits a nested agent event through the parent agent's event stream.
+    ///
+    /// The default is a no-op. AgentTool uses this only when event forwarding is
+    /// explicitly enabled, preserving existing callers' output behavior.
+    async fn emit_event(&self, _event: Event) {}
 
     /// Emit streaming progress output during long-running tool execution.
     ///
@@ -187,6 +262,16 @@ pub trait ToolContext: CallbackContext {
     async fn get_secret(&self, _name: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// Resolves a secret, stating why it is needed.
+    ///
+    /// The tool identity is added by the framework, not taken from the tool, so a
+    /// purpose is the only part a tool contributes. An authorizing
+    /// [`SecretService`](crate::SecretService) sees both.
+    async fn get_secret_for_purpose(&self, name: &str, purpose: &str) -> Result<Option<String>> {
+        let _ = purpose;
+        self.get_secret(name).await
+    }
 }
 
 /// Configuration for automatic tool retry on failure.
@@ -233,6 +318,33 @@ pub trait Toolset: Send + Sync {
     fn name(&self) -> &str;
     /// Returns the tools available in this toolset for the given context.
     async fn tools(&self, ctx: Arc<dyn crate::ReadonlyContext>) -> Result<Vec<Arc<dyn Tool>>>;
+
+    /// Applies toolset-specific context to an LLM request before each model call.
+    ///
+    /// Toolsets can use this hook to describe a dynamic tool protocol without
+    /// requiring every agent that installs the toolset to repeat that guidance
+    /// in its instruction. The default implementation leaves the request
+    /// unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// async fn process_llm_request(
+    ///     &self,
+    ///     _ctx: std::sync::Arc<dyn adk_core::ReadonlyContext>,
+    ///     request: &mut adk_core::LlmRequest,
+    /// ) -> adk_core::Result<()> {
+    ///     request.contents.insert(0, adk_core::Content::new("user").with_text("Tool guidance"));
+    ///     Ok(())
+    /// }
+    /// ```
+    async fn process_llm_request(
+        &self,
+        _ctx: Arc<dyn ReadonlyContext>,
+        _request: &mut LlmRequest,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Controls how multiple tool calls from a single LLM response are dispatched.
@@ -241,9 +353,13 @@ pub enum ToolExecutionStrategy {
     /// Execute tools one at a time in LLM-returned order. Default.
     #[default]
     Sequential,
-    /// Execute all tools concurrently via `join_all`.
+    /// Execute all tools concurrently without inspecting tool metadata.
+    ///
+    /// This is an explicit caller override. The caller is responsible for
+    /// ensuring every selected tool is safe to execute concurrently.
     Parallel,
-    /// Execute read-only tools concurrently, then mutable tools sequentially.
+    /// Execute calls whose tools report both read-only and concurrency-safe
+    /// concurrently, then execute all remaining calls sequentially.
     Auto,
 }
 

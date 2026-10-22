@@ -51,7 +51,7 @@ Camera frames are sent via the realtime crate's `send_video_frame`:
 
 ## Prerequisites
 
-- Rust 1.94+
+- Rust 1.95+
 - `OPENAI_API_KEY` (OpenAI) and/or `GEMINI_API_KEY` / `GOOGLE_API_KEY` (Gemini)
 - A browser with WebSocket + Web Audio + mic/camera access
 
@@ -87,7 +87,7 @@ Then **Connect**, press **Start mic** and/or **Start camera**, and try:
 ## Feature flags
 
 ```toml
-adk-realtime = { version = "2.0.0", features = ["openai", "gemini", "integration"] }
+adk-realtime = { version = "2.3.0", features = ["openai", "gemini", "integration"] }
 ```
 
 > Multimodal video input is provided by `RealtimeSession::send_video_frame`

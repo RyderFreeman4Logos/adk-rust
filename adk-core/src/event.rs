@@ -298,6 +298,7 @@ impl Event {
     ///             serde_json::json!({ "stdout": "ok\n", "exit_code": 0 }),
     ///         ),
     ///         id: Some("call_1".to_string()),
+    ///         annotations: None,
     ///     }],
     /// });
     ///
@@ -315,7 +316,7 @@ impl Event {
             .parts
             .iter()
             .filter_map(|part| match part {
-                crate::types::Part::FunctionResponse { function_response, id } => {
+                crate::types::Part::FunctionResponse { function_response, id, .. } => {
                     Some(ToolResultView {
                         call_id: id.as_deref(),
                         name: &function_response.name,
@@ -360,6 +361,8 @@ impl Event {
 
     /// Returns whether the event is the final response of an agent.
     ///
+    /// Tool-start notifications and provider-native continuation pauses are not final.
+    ///
     /// An event is considered final if:
     /// - It has skip_summarization set, OR
     /// - It has long_running_tool_ids (indicating async operations), OR
@@ -369,6 +372,18 @@ impl Event {
     /// Note: When multiple agents participate in one invocation, there could be
     /// multiple events with is_final_response() as true, for each participating agent.
     pub fn is_final_response(&self) -> bool {
+        if self.provider_metadata.contains_key("adk_tool_started")
+            || self
+                .llm_response
+                .provider_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("continue_turn"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        {
+            return false;
+        }
+
         // If skip_summarization is set or we have long-running tools, it's final
         if self.actions.skip_summarization || !self.long_running_tool_ids.is_empty() {
             return true;
@@ -437,6 +452,91 @@ impl Event {
     }
 }
 
+/// Whether an event is visible from a given conversation branch.
+///
+/// An event is visible when its branch equals `invocation_branch` or is an
+/// *ancestor* of it. Siblings and descendants are excluded, which is what keeps
+/// concurrent `ParallelAgent` branches from seeing each other's output while
+/// still letting each one see the conversation that led to the fan-out.
+///
+/// An empty branch on either side means "unscoped" and matches everything, so
+/// events written without a branch stay globally visible and callers that never
+/// set a branch are unaffected.
+///
+/// Branch segments are delimited by `.`, and the prefix test requires that
+/// delimiter explicitly: without it `agent_0` would match `agent_00`. This
+/// mirrors ADK Python's `_is_event_belongs_to_branch` and ADK Go's
+/// `eventBelongsToBranch`.
+///
+/// # Example
+///
+/// ```
+/// use adk_core::event_belongs_to_branch;
+///
+/// // Own branch and ancestors are visible.
+/// assert!(event_belongs_to_branch("parent.parallel.a", "parent.parallel.a"));
+/// assert!(event_belongs_to_branch("parent.parallel.a", "parent"));
+///
+/// // A sibling branch is not.
+/// assert!(!event_belongs_to_branch("parent.parallel.a", "parent.parallel.b"));
+///
+/// // Unscoped events remain visible.
+/// assert!(event_belongs_to_branch("parent.parallel.a", ""));
+/// ```
+pub fn event_belongs_to_branch(invocation_branch: &str, event_branch: &str) -> bool {
+    if invocation_branch.is_empty() || event_branch.is_empty() {
+        return true;
+    }
+    if event_branch == invocation_branch {
+        return true;
+    }
+    // Require the delimiter so `agent_0` does not match `agent_00`.
+    invocation_branch.starts_with(event_branch)
+        && invocation_branch.as_bytes().get(event_branch.len()) == Some(&b'.')
+}
+
+#[cfg(test)]
+mod branch_visibility_tests {
+    use super::event_belongs_to_branch;
+
+    #[test]
+    fn own_branch_is_visible() {
+        assert!(event_belongs_to_branch("root.parallel.a", "root.parallel.a"));
+    }
+
+    #[test]
+    fn ancestor_branches_are_visible() {
+        assert!(event_belongs_to_branch("root.parallel.a", "root"));
+        assert!(event_belongs_to_branch("root.parallel.a", "root.parallel"));
+    }
+
+    #[test]
+    fn sibling_branches_are_hidden() {
+        assert!(!event_belongs_to_branch("root.parallel.a", "root.parallel.b"));
+        assert!(!event_belongs_to_branch("root.parallel.b", "root.parallel.a"));
+    }
+
+    #[test]
+    fn descendant_branches_are_hidden() {
+        // A parent must not see what a nested child produced in its own branch.
+        assert!(!event_belongs_to_branch("root", "root.parallel.a"));
+    }
+
+    #[test]
+    fn empty_branch_on_either_side_matches() {
+        assert!(event_belongs_to_branch("", "root.parallel.a"));
+        assert!(event_belongs_to_branch("root.parallel.a", ""));
+        assert!(event_belongs_to_branch("", ""));
+    }
+
+    #[test]
+    fn prefix_match_requires_the_delimiter() {
+        // The bug the delimiter guards against: `agent_0` vs `agent_00`.
+        assert!(!event_belongs_to_branch("root.agent_00", "root.agent_0"));
+        assert!(event_belongs_to_branch("root.agent_0.child", "root.agent_0"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +570,30 @@ mod tests {
         let event = Event::new("inv-123");
         // No content, no function calls -> final
         assert!(event.is_final_response());
+    }
+
+    #[test]
+    fn tool_start_is_not_final() {
+        let mut event = Event::new("inv-123");
+        event.provider_metadata.insert(
+            "adk_tool_started".into(),
+            serde_json::json!({"id": "call-1", "name": "search"}).to_string(),
+        );
+        assert!(!event.llm_response.partial);
+        assert!(!event.is_final_response());
+    }
+
+    #[test]
+    fn provider_continuation_is_not_final() {
+        for content in [None, Some(Content::new("model").with_text("Searching"))] {
+            let mut event = Event::new("inv-123");
+            event.llm_response.content = content;
+            event.llm_response.provider_metadata = Some(serde_json::json!({"continue_turn": true}));
+            assert!(!event.is_final_response());
+            event.llm_response.provider_metadata =
+                Some(serde_json::json!({"continue_turn": false}));
+            assert!(event.is_final_response());
+        }
     }
 
     #[test]
@@ -510,6 +634,7 @@ mod tests {
                     serde_json::json!({"temp": 72}),
                 ),
                 id: Some("call_123".to_string()),
+                annotations: None,
             }],
         });
         // Has function response -> NOT final (model needs to respond)
@@ -540,6 +665,7 @@ mod tests {
                     serde_json::json!({"result": "done"}),
                 ),
                 id: Some("call_tool".to_string()),
+                annotations: None,
             }],
         });
         // Even with function response, skip_summarization makes it final
@@ -632,6 +758,7 @@ mod tests {
                         serde_json::json!({"output": "42"}),
                     ),
                     id: Some("call_exec".to_string()),
+                    annotations: None,
                 },
             ],
         });
@@ -681,6 +808,7 @@ mod tests {
                         serde_json::json!({}),
                     ),
                     id: Some("call_1".to_string()),
+                    annotations: None,
                 },
                 Part::Text { text: "Done".to_string() },
             ],

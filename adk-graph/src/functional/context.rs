@@ -66,9 +66,19 @@ pub struct TaskContext {
     /// Iteration counters for loop checkpoint keying.
     /// Maps task_name -> current iteration index.
     iteration_counters: HashMap<String, usize>,
-    /// Pending dynamic route targets set by `route_to()`.
-    /// Consumed by the executor to populate `EventActions.route`.
+    /// Route targets set by `route_to`, read back by `take_pending_route`.
     pending_route: Option<Vec<String>>,
+    /// Values supplied for interrupt sites, keyed by continuation key.
+    ///
+    /// Without this there was no resume channel at all: `interrupt` always returned an error and
+    /// nothing outside the method consumed a resume value, so the typed-resumption contract in
+    /// its signature could not be honoured.
+    resume_values: HashMap<String, Value>,
+    /// Counts interrupt calls so each site gets a stable key across a replay.
+    interrupt_ordinal: Arc<RwLock<usize>>,
+    /// Calls made so far of each `#[task]`, keyed by task name, so each call
+    /// gets its own execution-log key; see [`super::task_call_id`].
+    task_call_counters: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 impl TaskContext {
@@ -95,6 +105,9 @@ impl TaskContext {
             schema_validator: None,
             iteration_counters: HashMap::new(),
             pending_route: None,
+            resume_values: HashMap::new(),
+            interrupt_ordinal: Arc::new(RwLock::new(0)),
+            task_call_counters: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -175,6 +188,30 @@ impl TaskContext {
     /// let approval: bool = ctx.interrupt("Please approve this action").await?;
     /// ```
     pub async fn interrupt<T: DeserializeOwned>(&self, message: &str) -> Result<T> {
+        // Each interrupt site gets a key from its position in the run. Replaying the same
+        // workflow reaches the same interrupts in the same order, so the key a caller was told
+        // to supply is the key the site looks for.
+        let continuation_key = {
+            let mut ordinal = self.interrupt_ordinal.write().await;
+            *ordinal += 1;
+            format!("interrupt-{ordinal}")
+        };
+
+        // Resume: a value supplied for this site is returned to the call site, which is what the
+        // signature promised and what previously could not happen.
+        if let Some(value) = self.resume_values.get(&continuation_key) {
+            return serde_json::from_value(value.clone()).map_err(|e| {
+                FunctionalError::InterruptTypeMismatch {
+                    task: continuation_key.clone(),
+                    message: format!(
+                        "the value supplied for {continuation_key} does not deserialize into the \
+                         type this interrupt expects: {e}"
+                    ),
+                }
+                .into()
+            });
+        }
+
         // Emit the interrupt event for stream listeners.
         self.emit(StreamEvent::interrupted("functional_task", message));
 
@@ -185,7 +222,8 @@ impl TaskContext {
             self.current_step().await,
             vec![],
         )
-        .with_metadata("interrupt_message", Value::String(message.to_string()));
+        .with_metadata("interrupt_message", Value::String(message.to_string()))
+        .with_metadata("continuation_key", Value::String(continuation_key.clone()));
 
         self.checkpointer.save(&checkpoint).await.map_err(|e| {
             FunctionalError::CheckpointFailed {
@@ -209,15 +247,34 @@ impl TaskContext {
             );
         }
 
-        // In a real runtime the workflow executor would suspend here and
-        // later provide the resume value. For now we return an error
-        // indicating the interrupt was requested — the macro-generated
-        // wrapper handles actual suspension/resumption.
-        Err(FunctionalError::InterruptTypeMismatch {
-            task: "interrupt".to_string(),
-            message: format!("workflow interrupted: {message}"),
-        }
-        .into())
+        Err(FunctionalError::Suspended { continuation_key, message: message.to_string() }.into())
+    }
+
+    /// Supplies values for interrupt sites, keyed by continuation key.
+    ///
+    /// Re-invoke the entrypoint with these set to resume: an interrupt whose key is present
+    /// returns the deserialized value instead of suspending.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // First run suspends and reports its continuation key.
+    /// let Err(e) = run(ctx).await else { unreachable!() };
+    ///
+    /// // Second run supplies the value under that key.
+    /// let ctx = ctx.with_resume_values(HashMap::from([
+    ///     ("interrupt-1".to_string(), serde_json::json!({ "approved": true })),
+    /// ]));
+    /// let output = run(ctx).await?;
+    /// ```
+    pub fn with_resume_values(mut self, resume_values: HashMap<String, Value>) -> Self {
+        self.resume_values = resume_values;
+        self
+    }
+
+    /// The values available to interrupt sites in this context.
+    pub fn resume_values(&self) -> &HashMap<String, Value> {
+        &self.resume_values
     }
 
     /// Get the thread identifier for this context.
@@ -325,28 +382,63 @@ impl TaskContext {
         self.iteration_counters.clear();
     }
 
-    // ─── Route Dispatch ──────────────────────────────────────────────────
+    // ─── Route Hand-off ──────────────────────────────────────────────────
 
-    /// Set dynamic route targets for this task's output.
+    /// Records the task names this task chose, for its caller to read.
     ///
-    /// The execution framework will dispatch to these named tasks
-    /// instead of following the declared order. The pending route is
-    /// consumed by the executor after the task completes and used to
-    /// populate `EventActions.route`.
+    /// Nothing in this crate acts on the value. The functional API runs your
+    /// own control flow: `#[entrypoint]` calls your function once, and the
+    /// awaits inside it are the order of execution. So a task states its
+    /// choice here and the surrounding code reads it with
+    /// [`Self::take_pending_route`] and calls what it names.
+    ///
+    /// For routing the framework performs, build the workflow with
+    /// [`StateGraph::add_conditional_edges`](crate::graph::StateGraph::add_conditional_edges),
+    /// which resolves a route key against declared targets and dispatches to
+    /// them.
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    ///
+    /// use adk_graph::checkpoint::{Checkpointer, MemoryCheckpointer};
+    /// use adk_graph::functional::{ExecutionLog, TaskContext};
+    /// use tokio::sync::{RwLock, broadcast};
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// # fn main() {
+    /// let (event_tx, _rx) = broadcast::channel(8);
+    /// let mut ctx = TaskContext::new(
+    ///     "thread-1".to_string(),
+    ///     HashMap::new(),
+    ///     Arc::new(MemoryCheckpointer::new()) as Arc<dyn Checkpointer>,
+    ///     event_tx,
+    ///     Arc::new(RwLock::new(ExecutionLog::new())),
+    ///     CancellationToken::new(),
+    ///     None,
+    /// );
+    ///
+    /// // A task states which branches it chose.
     /// ctx.route_to(&["process_a", "process_b"]);
+    ///
+    /// // The surrounding code reads the choice and calls those tasks itself.
+    /// let chosen = ctx.take_pending_route().expect("a route was set");
+    /// assert_eq!(chosen, vec!["process_a".to_string(), "process_b".to_string()]);
+    ///
+    /// // Reading it clears it, so the next task starts with no choice pending.
+    /// assert_eq!(ctx.take_pending_route(), None);
+    /// # }
     /// ```
     pub fn route_to(&mut self, targets: &[&str]) {
         self.pending_route = Some(targets.iter().map(|s| s.to_string()).collect());
     }
 
-    /// Consume and return the pending route targets, if any.
+    /// Takes the task names recorded by [`Self::route_to`], clearing them.
     ///
-    /// Used by the executor to retrieve the route set by `route_to()`
-    /// and clear the pending state.
+    /// Returns `None` when no task set a route. Call this from the code that
+    /// sequences your tasks; nothing in this crate calls it for you.
     pub fn take_pending_route(&mut self) -> Option<Vec<String>> {
         self.pending_route.take()
     }
@@ -354,6 +446,24 @@ impl TaskContext {
     // ─── Internal Methods (pub(crate)) ───────────────────────────────────
     // These methods are used by the macro-generated task wrappers
     // (`#[entrypoint]` and `#[task]`), not directly by user code.
+
+    /// Returns the execution-log key for the next call of `task_name`.
+    ///
+    /// Advances the task's call ordinal, so two calls in one run never share a
+    /// key. `args` holds each argument as JSON, or `None` for one that does not
+    /// implement `Serialize`. The key format is documented on
+    /// [`super::task_call_id`].
+    #[doc(hidden)]
+    pub fn next_task_call_id(&self, task_name: &str, args: &[Option<Value>]) -> String {
+        let ordinal = {
+            let mut counters = self.task_call_counters.lock().unwrap_or_else(|e| e.into_inner());
+            let counter = counters.entry(task_name.to_string()).or_insert(0);
+            let ordinal = *counter;
+            *counter += 1;
+            ordinal
+        };
+        super::task_call_id(task_name, ordinal, args)
+    }
 
     /// Check if a task was already completed in a prior run (for resume-skip).
     ///

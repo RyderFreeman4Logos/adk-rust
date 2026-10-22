@@ -90,7 +90,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-adk
       - run: cargo adk build
@@ -114,7 +114,7 @@ error[E0432]: unresolved import `adk_tool`
 
 ```toml
 [dependencies]
-adk-tool = { version = "2.0.0", features = ["mcp"] }
+adk-tool = { version = "2.3.0", features = ["mcp"] }
 ```
 
 ### Invalid project structure

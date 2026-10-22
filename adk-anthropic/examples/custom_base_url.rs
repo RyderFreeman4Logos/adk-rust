@@ -12,8 +12,17 @@
 //! | Enterprise      | https://your-proxy.internal.com/anthropic   |
 //!
 //! Two ways to set the base URL:
-//! 1. Builder: `Anthropic::new(key)?.with_base_url(url)`
+//! 1. Builder: `Anthropic::new(key)?.with_base_url(url)?`
 //! 2. Env var: `ANTHROPIC_BASE_URL=https://...`
+//!
+//! Both paths reject base URLs that would send the API key in cleartext: only
+//! `https://`, or `http://` bound to loopback (localhost, 127.0.0.1, [::1]), is
+//! accepted. A rejected `ANTHROPIC_BASE_URL` makes `Anthropic::new` fail rather
+//! than silently falling back to the default endpoint.
+//!
+//! A trusted internal gateway reachable only over plain HTTP needs an opt-in:
+//! `allow_insecure_http()` before `with_base_url`, or
+//! `ANTHROPIC_ALLOW_INSECURE_HTTP=1` alongside `ANTHROPIC_BASE_URL`.
 //!
 //! Run: `ANTHROPIC_API_KEY=sk-... cargo run -p adk-anthropic --example anthropic_custom_base_url`
 
@@ -47,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Using base URL: {custom_url}");
 
-    let client = Anthropic::new(None)?.with_base_url(custom_url);
+    let client = Anthropic::new(None)?.with_base_url(custom_url)?;
 
     let r = client
         .send(MessageCreateParams::simple(
@@ -66,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Ollama (localhost:11434) ===\n");
 
     let ollama_client = Anthropic::new(Some("ollama".to_string()))?
-        .with_base_url("http://localhost:11434".to_string());
+        .with_base_url("http://localhost:11434".to_string())?;
 
     match ollama_client
         .send(MessageCreateParams::simple(

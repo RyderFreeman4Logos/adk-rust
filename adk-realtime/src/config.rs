@@ -46,6 +46,15 @@ pub enum VadMode {
     /// Semantic VAD (OpenAI-specific).
     SemanticVad,
     /// No automatic VAD - manual turn management.
+    ///
+    /// **The application becomes responsible for turn detection.** On Gemini
+    /// Live this sends
+    /// `setup.realtimeInputConfig.automaticActivityDetection.disabled = true`,
+    /// after which the server performs no turn detection at all and the client
+    /// must send `activityStart` / `activityEnd` itself, via the
+    /// `ActivitySignaller` that a Gemini session offers only in this mode.
+    /// Selecting this and never signalling leaves a session that never takes
+    /// a turn.
     None,
 }
 
@@ -340,7 +349,11 @@ impl RealtimeConfig {
         self.with_vad(VadConfig::server_vad())
     }
 
-    /// Disable VAD (manual turn management).
+    /// Disable automatic VAD, taking ownership of turn detection.
+    ///
+    /// See [`VadMode::None`] — on Gemini Live this is also what unlocks client
+    /// `activityStart` / `activityEnd` signalling, which the protocol permits
+    /// only while server-side detection is disabled.
     pub fn without_vad(mut self) -> Self {
         self.turn_detection = Some(VadConfig::disabled());
         self
@@ -374,6 +387,34 @@ impl RealtimeConfig {
     /// native-audio models (v1alpha); a no-op for other providers/models.
     pub fn with_affective_dialog(mut self, enabled: bool) -> Self {
         self.affective_dialog = Some(enabled);
+        self
+    }
+
+    /// Pins the spoken language (BCP-47, e.g. `"en-US"`).
+    ///
+    /// Gemini Live sends it as `speechConfig.languageCode`, which steers both the voice and
+    /// the input/output transcription; without it the model detects the language per turn
+    /// and short or accented utterances can be transcribed in the wrong one. Gemini
+    /// native-audio output models choose the language automatically and do not honor it.
+    ///
+    /// Stored under `extra.language_code`. An `extra` value that is not a JSON object is
+    /// replaced. OpenAI Realtime and other providers ignore the key.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_realtime::RealtimeConfig;
+    ///
+    /// let config = RealtimeConfig::default().with_voice("Kore").with_language("en-US");
+    /// assert_eq!(config.extra.unwrap()["language_code"], "en-US");
+    /// ```
+    pub fn with_language(mut self, code: impl Into<String>) -> Self {
+        let mut extra = match self.extra.take() {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        extra.insert("language_code".to_string(), Value::String(code.into()));
+        self.extra = Some(Value::Object(extra));
         self
     }
 

@@ -172,12 +172,25 @@ implementation that supports suspend/resume.
 ## Python via Monty
 
 The intended production adapter is
-[`adk-codeact-monty`](https://github.com/zavora-ai/adk-rust/tree/main/adk-codeact-monty),
+[`adk-codeact-monty`](https://crates.io/crates/adk-codeact-monty),
 a `CodeRuntime` backed by [Pydantic Monty](https://github.com/pydantic/monty). It
 lets the model *act by writing Python*, runs in-process with no container or
 subprocess, and snapshots a paused run to bytes — exactly what suspend/resume
-needs. It is kept outside the workspace because Monty is currently a git
-dependency (not yet on crates.io) and requires rustc 1.95+.
+needs. The Monty interpreter is consumed through `adk-code`'s `embedded-python`
+kernel, which pins the `monty` crates in one place; rustc 1.95+ is required.
+
+```toml
+[dependencies]
+adk-agent = { version = "2.3.0", features = ["codeact"] }
+adk-codeact-monty = "2.3.0"
+```
+
+Or through the umbrella crate (re-exported as `adk_rust::codeact_monty`):
+
+```toml
+[dependencies]
+adk-rust = { version = "2.3.0", features = ["minimal", "codeact-monty"] }
+```
 
 ```rust,ignore
 use adk_codeact_monty::MontyRuntime;

@@ -171,6 +171,13 @@ impl Agent for ConditionalAgent {
         &self.all_agents
     }
 
+    fn supports_agent_transfer(&self) -> bool {
+        // Deterministic workflow agent: on cross-turn resumption the runner
+        // must restart from this root so the condition is re-evaluated, rather
+        // than resuming a single branch that responded last.
+        false
+    }
+
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
         let run_ctx = super::skill_context::with_skill_injected_context(
             ctx,

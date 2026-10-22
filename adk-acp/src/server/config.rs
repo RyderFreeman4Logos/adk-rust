@@ -13,7 +13,6 @@
 //!     .agent(my_agent)
 //!     .session_service(my_session_service)
 //!     .agent_name("my-agent")
-//!     .streaming(true)
 //!     .build()?;
 //! ```
 
@@ -24,6 +23,7 @@ use adk_core::Agent;
 use adk_session::SessionService;
 
 use super::error::AcpServerError;
+use super::modes::SessionControls;
 
 /// Transport selection for the ACP Server.
 #[derive(Clone, Debug, Default)]
@@ -31,13 +31,6 @@ pub enum TransportConfig {
     /// Stdio transport (newline-delimited JSON on stdin/stdout).
     #[default]
     Stdio,
-    /// HTTP transport with SSE streaming.
-    Http {
-        /// Address to bind to (e.g., "127.0.0.1").
-        bind_address: String,
-        /// Port to listen on.
-        port: u16,
-    },
 }
 
 /// Configuration for the ACP Server.
@@ -54,20 +47,20 @@ pub struct AcpServerConfig {
     pub agent_name: String,
     /// Agent description advertised in capabilities.
     pub agent_description: String,
-    /// Whether the agent supports streaming responses.
-    pub streaming: bool,
-    /// Whether the agent supports tool use.
-    pub tool_use: bool,
-    /// List of tool names the agent can use.
-    pub tool_names: Vec<String>,
+    /// Stable ADK-Rust user identifier used for sessions on this ACP connection.
+    pub user_id: String,
     /// Maximum concurrent sessions allowed.
     pub max_sessions: usize,
-    /// Timeout for permission requests from the client.
-    pub permission_timeout: Duration,
     /// Graceful shutdown timeout.
     pub shutdown_timeout: Duration,
     /// Transport configuration.
     pub transport: TransportConfig,
+    /// Optional provider of session modes and configuration options.
+    ///
+    /// When `None` (the default), the server advertises no modes and no
+    /// configuration options, preserving capability accuracy for agents that
+    /// expose no interactive session controls.
+    pub session_controls: Option<Arc<dyn SessionControls>>,
 }
 
 /// Builder for [`AcpServerConfig`] with validation.
@@ -86,13 +79,11 @@ pub struct AcpServerConfigBuilder {
     session_service: Option<Arc<dyn SessionService>>,
     agent_name: String,
     agent_description: String,
-    streaming: bool,
-    tool_use: bool,
-    tool_names: Vec<String>,
+    user_id: String,
     max_sessions: usize,
-    permission_timeout: Duration,
     shutdown_timeout: Duration,
     transport: TransportConfig,
+    session_controls: Option<Arc<dyn SessionControls>>,
 }
 
 impl Default for AcpServerConfigBuilder {
@@ -109,13 +100,11 @@ impl AcpServerConfigBuilder {
             session_service: None,
             agent_name: "adk-agent".to_string(),
             agent_description: String::new(),
-            streaming: true,
-            tool_use: false,
-            tool_names: Vec::new(),
+            user_id: "acp-client".to_string(),
             max_sessions: 16,
-            permission_timeout: Duration::from_secs(120),
             shutdown_timeout: Duration::from_secs(30),
             transport: TransportConfig::Stdio,
+            session_controls: None,
         }
     }
 
@@ -143,33 +132,15 @@ impl AcpServerConfigBuilder {
         self
     }
 
-    /// Set whether the agent supports streaming responses.
-    pub fn streaming(mut self, enabled: bool) -> Self {
-        self.streaming = enabled;
-        self
-    }
-
-    /// Set whether the agent supports tool use.
-    pub fn tool_use(mut self, enabled: bool) -> Self {
-        self.tool_use = enabled;
-        self
-    }
-
-    /// Set the list of tool names the agent can use.
-    pub fn tool_names(mut self, names: Vec<String>) -> Self {
-        self.tool_names = names;
+    /// Set the stable ADK-Rust user identifier used by ACP sessions.
+    pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = user_id.into();
         self
     }
 
     /// Set the maximum number of concurrent sessions.
     pub fn max_sessions(mut self, max: usize) -> Self {
         self.max_sessions = max;
-        self
-    }
-
-    /// Set the timeout for permission requests from the client.
-    pub fn permission_timeout(mut self, timeout: Duration) -> Self {
-        self.permission_timeout = timeout;
         self
     }
 
@@ -185,6 +156,14 @@ impl AcpServerConfigBuilder {
         self
     }
 
+    /// Set the provider of session modes and configuration options.
+    ///
+    /// When unset, the server advertises no modes and no configuration options.
+    pub fn session_controls(mut self, controls: Arc<dyn SessionControls>) -> Self {
+        self.session_controls = Some(controls);
+        self
+    }
+
     /// Build the configuration, validating all required fields.
     ///
     /// # Errors
@@ -193,7 +172,6 @@ impl AcpServerConfigBuilder {
     /// - `agent` is not set
     /// - `session_service` is not set
     /// - `max_sessions` is 0
-    /// - `permission_timeout` is 0
     /// - `shutdown_timeout` is 0
     pub fn build(self) -> Result<AcpServerConfig, AcpServerError> {
         let agent =
@@ -209,12 +187,6 @@ impl AcpServerConfigBuilder {
             ));
         }
 
-        if self.permission_timeout.is_zero() {
-            return Err(AcpServerError::Internal(
-                "permission_timeout must be greater than 0".to_string(),
-            ));
-        }
-
         if self.shutdown_timeout.is_zero() {
             return Err(AcpServerError::Internal(
                 "shutdown_timeout must be greater than 0".to_string(),
@@ -226,13 +198,11 @@ impl AcpServerConfigBuilder {
             session_service,
             agent_name: self.agent_name,
             agent_description: self.agent_description,
-            streaming: self.streaming,
-            tool_use: self.tool_use,
-            tool_names: self.tool_names,
+            user_id: self.user_id,
             max_sessions: self.max_sessions,
-            permission_timeout: self.permission_timeout,
             shutdown_timeout: self.shutdown_timeout,
             transport: self.transport,
+            session_controls: self.session_controls,
         })
     }
 }

@@ -1,6 +1,6 @@
 # Rust
-/target/
-**/target/
+/target
+**/target
 **/*.rs.bk
 *.pdb
 
@@ -66,6 +66,8 @@ temp/
 *.tmp
 node_modules/
 **/node_modules/
+# TypeScript incremental build metadata, emitted next to the tsconfig it belongs to.
+*.tsbuildinfo
 
 # OS Specific
 Thumbs.db
@@ -99,3 +101,28 @@ optimized_instructions.txt
 
 # Local Node reference server (not part of the workspace)
 examples/gpt-realtime-reference/
+
+# Episode 3 podcast assets — work in progress, and adk-rust-episode-3.mp4 alone is
+# ~900 MB, which exceeds GitHub's 100 MB per-file limit. Episodes 1 and 2 stay
+# tracked. Remove these lines when the episode is ready to publish.
+docs/podcast/Podcast.webp
+docs/podcast/adk-rust-episode-3.mp4
+docs/podcast/ep3-pilot.mp4
+docs/podcast/episode-3-narration.mp3
+docs/podcast/episode-3-v2-launch-script.md
+docs/podcast/ep3-assets/
+docs/podcast/ep3-video/
+docs/podcast/slides-ep3/
+# …except the one slide used as the episode thumbnail in the README, which has to
+# be tracked for GitHub to render it.
+!docs/podcast/episode-3-thumbnail.png
+docs/podcast/pipeline/
+
+# Local agent-skill install and stray capture artefacts.
+.agents/
+skills-lock.json
+site-home-current.png
+
+# Python bytecode from scripts/
+__pycache__/
+*.pyc

@@ -328,7 +328,7 @@ let gemini_api_key = std::env::var("GOOGLE_API_KEY")
     .or_else(|_| std::env::var("GEMINI_API_KEY"))
     .expect("GOOGLE_API_KEY or GEMINI_API_KEY must be set");
 
-let model = Arc::new(GeminiModel::new(&gemini_api_key, "gemini-2.5-flash")?);
+let model = Arc::new(GeminiModel::new(&gemini_api_key, "gemini-3.7-flash")?);
 ```
 
 Example with OpenAI:
@@ -340,7 +340,7 @@ use adk_model::openai::{OpenAIClient, OpenAIConfig};
 let openai_api_key = std::env::var("OPENAI_API_KEY")
     .expect("OPENAI_API_KEY must be set");
 
-let model = Arc::new(OpenAIClient::new(OpenAIConfig::new(&openai_api_key, "gpt-5-mini"))?);
+let model = Arc::new(OpenAIClient::new(OpenAIConfig::new(&openai_api_key, "gpt-5.6-terra"))?);
 ```
 
 Example with Ollama (local, no API key):
@@ -356,13 +356,13 @@ The generated `Cargo.toml` automatically includes the correct `adk-model` featur
 
 ```toml
 # Only Gemini
-adk-model = { version = "2.0.0", default-features = false, features = ["gemini"] }
+adk-model = { version = "2.3.0", default-features = false, features = ["gemini"] }
 
 # Mixed providers (e.g., Gemini + Anthropic)
-adk-model = { version = "2.0.0", default-features = false, features = ["gemini", "anthropic"] }
+adk-model = { version = "2.3.0", default-features = false, features = ["gemini", "anthropic"] }
 
 # Ollama only (no API key needed)
-adk-model = { version = "2.0.0", default-features = false, features = ["ollama"] }
+adk-model = { version = "2.3.0", default-features = false, features = ["ollama"] }
 ```
 
 ### Generated Code with Action Nodes

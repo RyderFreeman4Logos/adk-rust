@@ -42,6 +42,10 @@ pub fn content_to_message(
         _ => MessageRole::User,
     };
 
+    if let Some(blocks) = super::history::restore(content) {
+        return Ok(MessageParam::new_with_blocks(blocks, role));
+    }
+
     // Note: cache_control is applied at the system prompt and top-level request
     // level only (max 4 blocks). Individual message blocks do not get cache_control
     // to avoid exceeding Anthropic's 4-block limit.
@@ -66,7 +70,7 @@ pub fn content_to_message(
                 };
                 Some(ContentBlock::ToolUse(block))
             }
-            Part::FunctionResponse { function_response, id } => {
+            Part::FunctionResponse { function_response, id, .. } => {
                 Some(ContentBlock::ToolResult(ToolResultBlock {
                     tool_use_id: id.clone().unwrap_or_else(|| "unknown".to_string()),
                     content: Some(tool_result_content(&function_response.response)),
@@ -74,7 +78,7 @@ pub fn content_to_message(
                     cache_control: None,
                 }))
             }
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 let media_type = match mime_type.as_str() {
                     "image/jpeg" => Some(ImageMediaType::Jpeg),
                     "image/png" => Some(ImageMediaType::Png),
@@ -107,7 +111,7 @@ pub fn content_to_message(
                     ))))
                 }
             }
-            Part::FileData { mime_type, file_uri } => {
+            Part::FileData { mime_type, file_uri, .. } => {
                 if mime_type == "application/pdf" {
                     Some(ContentBlock::Document(DocumentBlock::new_with_url_pdf(
                         UrlPdfSource::new(file_uri.clone()),
@@ -145,6 +149,50 @@ pub fn content_to_message(
                 .ok()
                 .map(ContentBlock::WebSearchToolResult)
             }
+            // Embedded resources: text → text block; blob → inline bytes handling.
+            Part::EmbeddedResource { resource } => match resource {
+                adk_core::EmbeddedResource::Text(text) => {
+                    if text.text.is_empty() {
+                        None
+                    } else {
+                        Some(ContentBlock::Text(TextBlock::new(text.text.clone())))
+                    }
+                }
+                adk_core::EmbeddedResource::Blob(blob) => {
+                    let mime_type = blob.mime_type.as_deref().unwrap_or("application/octet-stream");
+                    let media_type = match mime_type {
+                        "image/jpeg" => Some(ImageMediaType::Jpeg),
+                        "image/png" => Some(ImageMediaType::Png),
+                        "image/gif" => Some(ImageMediaType::Gif),
+                        "image/webp" => Some(ImageMediaType::Webp),
+                        _ => None,
+                    };
+                    if let Some(media_type) = media_type {
+                        let encoded = attachment::encode_base64(&blob.data);
+                        Some(ContentBlock::Image(ImageBlock::new_with_base64(
+                            Base64ImageSource::new(encoded, media_type),
+                        )))
+                    } else if mime_type == "application/pdf" {
+                        let encoded = attachment::encode_base64(&blob.data);
+                        Some(ContentBlock::Document(DocumentBlock::new_with_base64_pdf(
+                            Base64PdfSource::new(encoded),
+                        )))
+                    } else if mime_type.starts_with("text/") {
+                        match String::from_utf8(blob.data.clone()) {
+                            Ok(text) => Some(ContentBlock::Document(
+                                DocumentBlock::new_with_plain_text(PlainTextSource::new(text)),
+                            )),
+                            Err(_) => Some(ContentBlock::Text(TextBlock::new(
+                                attachment::inline_attachment_to_text(mime_type, &blob.data),
+                            ))),
+                        }
+                    } else {
+                        Some(ContentBlock::Text(TextBlock::new(
+                            attachment::inline_attachment_to_text(mime_type, &blob.data),
+                        )))
+                    }
+                }
+            },
         })
         .collect();
 
@@ -161,13 +209,18 @@ pub fn content_to_message(
 }
 
 /// Convert ADK tools to adk-anthropic ToolUnionParam format.
+///
+/// Tools are emitted sorted by name: the declarations come from a `HashMap`, and
+/// a stable order keeps the prompt-cache prefix identical across requests.
 pub fn convert_tools(
     tools: &HashMap<String, Value>,
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Result<Vec<ToolUnionParam>, ConversionError> {
+    let mut tools = tools.iter().collect::<Vec<_>>();
+    tools.sort_unstable_by_key(|(name, _)| *name);
     tools
-        .iter()
+        .into_iter()
         .map(|(name, decl)| {
             if let Some(provider_tool) = decl.get("x-adk-anthropic-tool") {
                 return serde_json::from_value::<ToolUnionParam>(provider_tool.clone()).map_err(
@@ -183,7 +236,7 @@ pub fn convert_tools(
 
             let input_schema =
                 decl.get("parameters").cloned().unwrap_or_else(|| adapter.empty_schema());
-            let normalized_schema = cache.get_or_normalize(&input_schema, adapter);
+            let normalized_schema = cache.normalize(&input_schema);
 
             let normalized_name = adapter.normalize_tool_name(name);
 
@@ -203,10 +256,8 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
 
     for block in &message.content {
         match block {
-            ContentBlock::Text(text_block) => {
-                if !text_block.text.is_empty() {
-                    parts.push(Part::Text { text: text_block.text.clone() });
-                }
+            ContentBlock::Text(text_block) if !text_block.text.is_empty() => {
+                parts.push(Part::Text { text: text_block.text.clone() });
             }
             ContentBlock::ToolUse(tool_use) => {
                 parts.push(Part::FunctionCall {
@@ -216,17 +267,15 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
                     thought_signature: None,
                 });
             }
-            ContentBlock::Thinking(thinking_block) => {
-                if !thinking_block.thinking.is_empty() {
-                    parts.push(Part::Thinking {
-                        thinking: thinking_block.thinking.clone(),
-                        signature: if thinking_block.signature.is_empty() {
-                            None
-                        } else {
-                            Some(thinking_block.signature.clone())
-                        },
-                    });
-                }
+            ContentBlock::Thinking(thinking_block) if !thinking_block.thinking.is_empty() => {
+                parts.push(Part::Thinking {
+                    thinking: thinking_block.thinking.clone(),
+                    signature: if thinking_block.signature.is_empty() {
+                        None
+                    } else {
+                        Some(thinking_block.signature.clone())
+                    },
+                });
             }
             ContentBlock::ServerToolUse(server_tool_use) => {
                 if let Ok(val) = serde_json::to_value(server_tool_use) {
@@ -242,25 +291,39 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
         }
     }
 
+    if let Some(native) = super::history::preserve(message) {
+        parts.push(native);
+    }
     let content =
         if parts.is_empty() { None } else { Some(Content { role: "model".to_string(), parts }) };
 
+    // Anthropic reports uncached input separately from cache reads and writes.
+    let prompt_token_count = message
+        .usage
+        .input_tokens
+        .saturating_add(message.usage.cache_read_input_tokens.unwrap_or(0))
+        .saturating_add(message.usage.cache_creation_input_tokens.unwrap_or(0));
     let usage_metadata = Some(UsageMetadata {
-        prompt_token_count: message.usage.input_tokens,
+        prompt_token_count,
         candidates_token_count: message.usage.output_tokens,
-        total_token_count: (message.usage.input_tokens + message.usage.output_tokens),
+        total_token_count: prompt_token_count.saturating_add(message.usage.output_tokens),
         cache_read_input_token_count: message.usage.cache_read_input_tokens,
         cache_creation_input_token_count: message.usage.cache_creation_input_tokens,
+        provider_usage: serde_json::to_value(message.usage).ok(),
         ..Default::default()
     });
 
     let finish_reason = message.stop_reason.as_ref().map(|sr| match sr {
         StopReason::EndTurn => FinishReason::Stop,
-        StopReason::MaxTokens => FinishReason::MaxTokens,
+        StopReason::MaxTokens | StopReason::ModelContextWindowExceeded => FinishReason::MaxTokens,
+        StopReason::Refusal => FinishReason::Safety,
         StopReason::StopSequence => FinishReason::Stop,
         StopReason::ToolUse => FinishReason::Stop,
         _ => FinishReason::Stop,
     });
+    let paused = matches!(message.stop_reason, Some(StopReason::PauseTurn));
+    let tool_call_turn = matches!(message.stop_reason, Some(StopReason::ToolUse))
+        || content.as_ref().is_some_and(Content::has_function_calls);
 
     let cache_meta = extract_cache_usage(&message.usage);
 
@@ -269,13 +332,13 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
             content,
             usage_metadata,
             finish_reason,
-            citation_metadata: None,
+            citation_metadata: super::history::citations(message),
             partial: false,
-            turn_complete: true,
+            turn_complete: !tool_call_turn && !paused,
             interrupted: false,
             error_code: None,
             error_message: None,
-            provider_metadata: None,
+            provider_metadata: paused.then(|| serde_json::json!({"continue_turn": true})),
             interaction_id: None,
         },
         cache_meta,
@@ -472,10 +535,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "What is in this image?".to_string() },
-                Part::InlineData {
-                    mime_type: "image/png".to_string(),
-                    data: vec![0x89, 0x50, 0x4E, 0x47],
-                },
+                Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
             ],
         };
         let msg = content_to_message(&content, false).unwrap();
@@ -500,10 +560,10 @@ mod tests {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "Check this".to_string() },
-                Part::InlineData {
-                    mime_type: "audio/wav".to_string(), // Not supported by Anthropic images
-                    data: vec![0x52, 0x49, 0x46, 0x46],
-                },
+                Part::inline_data(
+                    "audio/wav", // Not supported by Anthropic images
+                    vec![0x52, 0x49, 0x46, 0x46],
+                ),
             ],
         };
         let msg = content_to_message(&content, false).unwrap();
@@ -523,8 +583,8 @@ mod tests {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "Compare".to_string() },
-                Part::InlineData { mime_type: "image/jpeg".to_string(), data: vec![0xFF, 0xD8] },
-                Part::InlineData { mime_type: "image/webp".to_string(), data: vec![0x52, 0x49] },
+                Part::inline_data("image/jpeg", vec![0xFF, 0xD8]),
+                Part::inline_data("image/webp", vec![0x52, 0x49]),
             ],
         };
         let msg = content_to_message(&content, false).unwrap();
@@ -540,10 +600,7 @@ mod tests {
     fn test_content_to_message_pdf_inline_data_maps_to_document_block() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::InlineData {
-                mime_type: "application/pdf".to_string(),
-                data: b"%PDF-1.4".to_vec(),
-            }],
+            parts: vec![Part::inline_data("application/pdf", b"%PDF-1.4".to_vec())],
         };
         let msg = content_to_message(&content, false).unwrap();
 
@@ -559,10 +616,7 @@ mod tests {
     fn test_content_to_message_pdf_file_uri_maps_to_document_block() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::FileData {
-                mime_type: "application/pdf".to_string(),
-                file_uri: "https://example.com/test.pdf".to_string(),
-            }],
+            parts: vec![Part::file_data("application/pdf", "https://example.com/test.pdf")],
         };
         let msg = content_to_message(&content, false).unwrap();
 
@@ -580,10 +634,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "Describe this".to_string() },
-                Part::FileData {
-                    mime_type: "image/jpeg".to_string(),
-                    file_uri: "https://example.com/photo.jpg".to_string(),
-                },
+                Part::file_data("image/jpeg", "https://example.com/photo.jpg"),
             ],
         };
         let msg = content_to_message(&content, false).unwrap();
@@ -601,10 +652,7 @@ mod tests {
     fn test_content_to_message_webp_file_data_maps_to_url_image() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::FileData {
-                mime_type: "image/webp".to_string(),
-                file_uri: "https://example.com/image.webp".to_string(),
-            }],
+            parts: vec![Part::file_data("image/webp", "https://example.com/image.webp")],
         };
         let msg = content_to_message(&content, false).unwrap();
 
@@ -619,10 +667,7 @@ mod tests {
     fn test_content_to_message_unsupported_file_data_falls_back_to_text() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::FileData {
-                mime_type: "audio/wav".to_string(),
-                file_uri: "https://example.com/audio.wav".to_string(),
-            }],
+            parts: vec![Part::file_data("audio/wav", "https://example.com/audio.wav")],
         };
         let msg = content_to_message(&content, false).unwrap();
 
@@ -651,10 +696,38 @@ mod tests {
         );
 
         let adapter = AnthropicSchemaAdapter;
-        let cache = SchemaCache::new();
+        let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
         let claude_tools =
             convert_tools(&tools, &adapter, &cache).expect("tool conversion should succeed");
         assert_eq!(claude_tools.len(), 1);
+    }
+
+    #[test]
+    fn convert_tools_order_is_stable_across_maps() {
+        use super::super::schema_adapter::AnthropicSchemaAdapter;
+        let names: Vec<String> = (0..12).map(|i| format!("tool_{i:02}")).collect();
+        let declaration = |name: &str| {
+            serde_json::json!({
+                "description": format!("{name} description"),
+                "parameters": {"type": "object", "properties": {}}
+            })
+        };
+        let forward: HashMap<String, Value> =
+            names.iter().map(|name| (name.clone(), declaration(name))).collect();
+        let reverse: HashMap<String, Value> =
+            names.iter().rev().map(|name| (name.clone(), declaration(name))).collect();
+
+        let adapter = AnthropicSchemaAdapter;
+        let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
+        let from_forward = convert_tools(&forward, &adapter, &cache).unwrap();
+        let from_reverse = convert_tools(&reverse, &adapter, &cache).unwrap();
+
+        assert_eq!(from_forward, from_reverse);
+        let converted_names: Vec<String> = from_forward
+            .iter()
+            .map(|tool| serde_json::to_value(tool).unwrap()["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(converted_names, names);
     }
 
     #[test]
@@ -672,7 +745,7 @@ mod tests {
         );
 
         let adapter = AnthropicSchemaAdapter;
-        let cache = SchemaCache::new();
+        let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
         let claude_tools =
             convert_tools(&tools, &adapter, &cache).expect("tool conversion should succeed");
         assert_eq!(claude_tools.len(), 1);
@@ -691,6 +764,7 @@ mod tests {
                     Value::String("hello".to_string()),
                 ),
                 id: Some("tool_123".to_string()),
+                annotations: None,
             }],
         };
 
@@ -777,5 +851,37 @@ mod tests {
         // Empty thinking block should be skipped
         assert_eq!(content.parts.len(), 1);
         assert_eq!(content.parts[0].text(), Some("Just text."));
+    }
+
+    #[test]
+    fn test_from_anthropic_tool_call_keeps_turn_open() {
+        use adk_anthropic::{ToolUseBlock, Usage};
+
+        let message = Message {
+            id: "msg_tool".to_string(),
+            model: Model::Custom("claude-sonnet-5".to_string()),
+            role: MessageRole::Assistant,
+            container: None,
+            content: vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                "tool_123",
+                "get_weather",
+                serde_json::json!({"city": "Paris"}),
+            ))],
+            stop_reason: Some(StopReason::ToolUse),
+            stop_sequence: None,
+            r#type: "message".to_string(),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 12,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens_1h: None,
+                server_tool_use: None,
+            },
+        };
+
+        let (response, _) = from_anthropic_message(&message);
+        assert!(!response.turn_complete, "tool-call turns must remain open for execution");
+        assert!(response.content.is_some_and(|content| content.has_function_calls()));
     }
 }

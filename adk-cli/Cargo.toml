@@ -44,7 +44,7 @@ tracing.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
-dirs = "6"
+dirs = "7"
 toml.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
@@ -65,12 +65,27 @@ deepseek = ["adk-model/deepseek"]
 groq = ["adk-model/groq"]
 ollama = ["adk-model/ollama"]
 all-providers = ["gemini", "openai", "anthropic", "deepseek", "groq", "ollama"]
+# `adk-rust deploy agent-engine`: deploy a BYOC container as a Gemini
+# Enterprise Agent Platform engine (host-side tooling)
+gcp-deploy = ["adk-deploy/gcp"]
+# `adk-rust registry ...`: register self-hosted agents, external MCP servers,
+# and bare endpoints in the Google Agent Registry (host-side tooling)
+vertex-agent-registry = ["adk-tool/vertex-agent-registry"]
 telemetry-otlp = ["adk-telemetry/otlp"]
 # Prompt optimization CLI command (adk optimize)
 optimize = []
+# `adk-rust skills search` / `skills pull`: read-only Vertex AI Skill
+# Registry commands (lifecycle stays with platform tooling)
+vertex-skill-registry = ["adk-skill/vertex-skill-registry"]
 # SQLite checkpointer for graph time-travel commands
 graph-sqlite = ["adk-graph/sqlite"]
 
 [dev-dependencies]
 async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }
+axum = "0.8"
+google-cloud-auth = { version = "1.8", default-features = false, features = ["default-rustls-provider"] }
+tempfile = "3"
+zip = { workspace = true }
+base64 = "0.22"
+sha2 = "0.10"

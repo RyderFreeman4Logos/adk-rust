@@ -126,6 +126,9 @@ fn estimate_part_chars(part: &Part) -> usize {
         Part::ServerToolResponse { server_tool_response } => {
             serde_json::to_string(server_tool_response).map_or(0, |s| s.len())
         }
+        Part::EmbeddedResource { resource } => {
+            serde_json::to_string(resource).map_or(0, |s| s.len())
+        }
     }
 }
 
@@ -200,6 +203,7 @@ mod tests {
                     serde_json::json!({"temp": 72}),
                 ),
                 id: None,
+                annotations: None,
             }],
         });
         let tokens = estimate_tokens(&[event], 4);

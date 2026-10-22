@@ -79,12 +79,21 @@ pub mod webhooks;
 #[cfg(feature = "background")]
 pub mod background;
 
+#[cfg(feature = "agent-engine")]
+pub mod agent_engine;
+
+#[cfg(feature = "agent-engine")]
+pub use agent_engine::{
+    AgentEngineOptions, AgentEngineState, agent_engine_router, build_agent_engine_app,
+    serve_agent_engine,
+};
+
 // Background runs and cron scheduling re-exports
 #[cfg(feature = "background")]
 pub use background::{
     BackgroundRun, BackgroundRunner, BackgroundState, RunStatus, RunStatusResponse, RunStore,
-    SubmitRunRequest, SubmitRunResponse, WorkflowState, background_runs_router,
-    background_runs_router_with_state,
+    SubmitRunRequest, SubmitRunResponse, WorkflowExecutor, WorkflowRegistry, WorkflowState,
+    background_runs_router, background_runs_router_with_state,
 };
 #[cfg(feature = "background")]
 pub use background::{
@@ -94,13 +103,15 @@ pub use background::{
 
 pub use a2a::{
     A2aClient, Executor, ExecutorConfig, RemoteA2aAgent, RemoteA2aAgentBuilder, RemoteA2aConfig,
-    build_agent_card, build_agent_skills,
+    agent_skills_from_index, build_agent_card, build_agent_skills,
 };
 #[cfg(feature = "a2a-v1")]
 pub use a2a::{A2aServer, A2aServerApp, A2aServerBuilder};
-pub use auth_bridge::{RequestContext, RequestContextError, RequestContextExtractor};
+pub use auth_bridge::{
+    AuthenticatedCaller, RequestContext, RequestContextError, RequestContextExtractor,
+};
 pub use config::{SecurityConfig, ServerConfig};
 pub use rest::{
-    A2aController, RuntimeController, ServerBuilder, SessionController, ShutdownHandle, create_app,
-    create_app_with_a2a, shutdown_signal,
+    A2aController, A2aTaskRetention, RuntimeController, ServerBuilder, SessionController,
+    ShutdownHandle, create_app, create_app_with_a2a, shutdown_signal,
 };

@@ -41,14 +41,14 @@ Add the providers you need to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Pick one or more providers:
-adk-model = { version = "2.0.0", features = ["gemini"] }        # Google Gemini (default)
-adk-model = { version = "2.0.0", features = ["openai"] }        # OpenAI GPT-5
-adk-model = { version = "2.0.0", features = ["anthropic"] }     # Anthropic Claude
-adk-model = { version = "2.0.0", features = ["deepseek"] }      # DeepSeek
-adk-model = { version = "2.0.0", features = ["groq"] }          # Groq (ultra-fast)
+adk-model = { version = "2.3.0", features = ["gemini"] }        # Google Gemini (default)
+adk-model = { version = "2.3.0", features = ["openai"] }        # OpenAI GPT-5
+adk-model = { version = "2.3.0", features = ["anthropic"] }     # Anthropic Claude
+adk-model = { version = "2.3.0", features = ["deepseek"] }      # DeepSeek
+adk-model = { version = "2.3.0", features = ["groq"] }          # Groq (ultra-fast)
 
 # Or all cloud providers at once:
-adk-model = { version = "2.0.0", features = ["all-providers"] }
+adk-model = { version = "2.3.0", features = ["all-providers"] }
 ```
 
 ## Step 2: Set Your API Key
@@ -60,6 +60,8 @@ export ANTHROPIC_API_KEY="your-key"   # Anthropic
 export DEEPSEEK_API_KEY="your-key"    # DeepSeek
 export GROQ_API_KEY="your-key"        # Groq
 ```
+
+For OpenCode Go and Zen, enable `opencode` and follow the [OpenCode configuration guide](opencode.md).
 
 ## Schema Normalization
 
@@ -110,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     let agent = LlmAgentBuilder::new("gemini_assistant")
         .description("Gemini-powered assistant")
@@ -127,11 +129,10 @@ async fn main() -> anyhow::Result<()> {
 
 | Model | Description | Context |
 |-------|-------------|---------|
-| `gemini-3.1-pro-preview` | Strongest reasoning for complex agentic workflows | 2M tokens |
-| `gemini-3-flash-preview` | Fast and efficient for code and agents | 1M tokens |
-| `gemini-3.1-flash-lite-preview` | Cheapest, fastest routing and high-volume tasks | 1M tokens |
-| `gemini-2.5-pro` | Advanced reasoning and multimodal | 1M tokens |
-| `gemini-2.5-flash` | Balanced speed and capability (recommended) | 1M tokens |
+| `gemini-3.7-flash` | Default balanced agent model | 1M tokens |
+| `gemini-3.6-flash` | Previous balanced generation | 1M tokens |
+| `gemini-3.5-flash-lite` | Cost-efficient routing and high-volume tasks | 1M tokens |
+| `gemini-3.1-pro-preview` | Advanced preview reasoning | 2M tokens |
 
 ### Thinking Mode
 
@@ -177,7 +178,7 @@ It has green eyes and distinctive striped markings typical of tabby cats.
 > - 📖 Best documentation & ecosystem
 > - 🎯 Consistent, predictable outputs
 > - 📋 **Structured output** with JSON schema enforcement
-> - 🧠 **Reasoning effort** control for o1/o3 reasoning models
+> - 🧠 **Reasoning effort** control for GPT-5.6 reasoning models
 > - 🆕 **[Responses API](./openai-responses.md)** — dedicated client for `/v1/responses` with reasoning summaries, built-in tools, and server-side state
 
 ### Complete Working Example
@@ -192,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     
     let api_key = std::env::var("OPENAI_API_KEY")?;
-    let model = OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-5-mini"))?;
+    let model = OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-5.6-terra"))?;
 
     let agent = LlmAgentBuilder::new("openai_assistant")
         .description("OpenAI-powered assistant")
@@ -214,7 +215,7 @@ use adk_rust::prelude::*;
 use serde_json::json;
 use std::sync::Arc;
 
-let model = OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-5-mini"))?;
+let model = OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-5.6-terra"))?;
 
 let agent = LlmAgentBuilder::new("data_extractor")
     .model(Arc::new(model))
@@ -255,19 +256,24 @@ For strict mode with nested objects, include `additionalProperties: false` at ea
 }))
 ```
 
-### Reasoning Effort (o1, o3 Models)
+### Reasoning Effort
 
 For OpenAI reasoning models, control how much reasoning effort the model applies:
 
 ```rust
-use adk_model::openai::{OpenAIClient, OpenAIConfig, ReasoningEffort};
+use adk_model::openai::{OpenAIClient, OpenAIConfig, OpenAIReasoningEffort};
 
-let config = OpenAIConfig::new(&api_key, "o3-mini")
-    .with_reasoning_effort(ReasoningEffort::High);
-let model = OpenAIClient::new(config)?;
+let config = OpenAIConfig::new(&api_key, "gpt-5.6-terra");
+let model = OpenAIClient::new_with_reasoning_effort(
+    config,
+    OpenAIReasoningEffort::XHigh,
+)?;
 ```
 
-Available levels: `Low`, `Medium`, `High`. Higher effort produces more thorough reasoning at the cost of latency and tokens.
+The complete vocabulary is `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`,
+and `Max`; availability depends on the model and API. GPT-5.6 Chat Completions
+supports up to `XHigh`; use `OpenAIResponsesClient` for `Max`. The original
+three-value `ReasoningEffort` API remains available for backward compatibility.
 
 ### OpenAI-Compatible Local APIs
 
@@ -284,6 +290,36 @@ let model = OpenAIClient::new(config)?;
 ```
 
 > **Note**: Structured output (`output_schema`) requires backend support. Native OpenAI fully supports it; local servers may have limited support.
+
+### OpenAI-Compatible Reasoning History
+
+Reasoning replay is disabled by default. `Part::Thinking` stays separate from
+visible message text regardless of the replay setting.
+
+| Client setting | Assistant history field |
+|---|---|
+| Default or `with_reasoning_replay(false)` | Neither field |
+| `with_reasoning_replay(true)` | `reasoning_content` |
+| `with_reasoning_replay_field(ReasoningReplayField::Reasoning)` | `reasoning` |
+
+```rust
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig, ReasoningReplayField};
+
+fn main() -> Result<(), adk_core::AdkError> {
+    let config = OpenAICompatibleConfig::new("key", "model")
+        .with_base_url("http://localhost:8000/v1");
+    let model = OpenAICompatible::new(config)?.with_reasoning_replay(true);
+    // Select this override for vLLM endpoints that accept `reasoning`.
+    let model = model.with_reasoning_replay_field(ReasoningReplayField::Reasoning);
+    let _ = model;
+    Ok(())
+}
+```
+
+The last reasoning-replay builder call determines the setting. Enable replay
+only for endpoints that accept the chosen field; older vLLM deployments may use
+`reasoning_content`. This setting controls history serialization, not thinking
+generation. Standard OpenAI and Azure Chat Completions omit both fields by default.
 
 ### Gemini via the OpenAI-Compatible Endpoint
 
@@ -327,14 +363,57 @@ cargo run -p adk-model --features openai --example gemini_openai_compat
 cargo run -p adk-agent --example gemini_openai_compat_agent
 ```
 
-### Reasoning Effort (o1, o3 Models)
+### OrcaRouter via the OpenAI-Compatible Endpoint
 
-Control how much reasoning effort the model applies with `ReasoningEffort`:
+OrcaRouter serves models from several vendors through the OpenAI Chat
+Completions wire format at `https://api.orcarouter.ai/v1`. Use the
+`OpenAICompatibleConfig::orcarouter(...)` preset (under the `openai` feature)
+with an `ORCAROUTER_API_KEY`:
+
+```toml
+[dependencies]
+adk-model = { version = "2.3.0", features = ["openai"] }
+```
+
+```rust
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = std::env::var("ORCAROUTER_API_KEY")?;
+    let model = OpenAICompatible::new(
+        OpenAICompatibleConfig::orcarouter(api_key, "openai/gpt-5.6-terra"),
+    )?;
+    let _ = model;
+    Ok(())
+}
+```
+
+Model IDs carry a vendor prefix, so changing the model string switches the
+upstream vendor while the key and client stay the same:
+
+| Model ID | Upstream vendor |
+|----------|-----------------|
+| `openai/gpt-5.6-terra` | OpenAI |
+| `anthropic/claude-sonnet-5` | Anthropic |
+
+Chat, streaming, function calling, and structured output go through the same
+`OpenAICompatible` client as every other preset.
+
+**Example** (requires `ORCAROUTER_API_KEY`):
+
+```bash
+# Chat, tool calling, and a second vendor on the same client.
+cargo run --manifest-path examples/orcarouter/Cargo.toml
+```
+
+### Legacy Reasoning-Effort API
+
+The original three-level `ReasoningEffort` API remains available for compatibility:
 
 ```rust
 use adk_model::openai::{OpenAIClient, OpenAIConfig, ReasoningEffort};
 
-let config = OpenAIConfig::new(&api_key, "o3-mini")
+let config = OpenAIConfig::new(&api_key, "gpt-5")
     .with_reasoning_effort(ReasoningEffort::High);
 let model = OpenAIClient::new(config)?;
 ```
@@ -345,10 +424,10 @@ Available levels: `Low` (fastest), `Medium` (balanced), `High` (most thorough).
 
 | Model | Description | Context |
 |-------|-------------|---------|
-| `gpt-5` | State-of-the-art unified model with adaptive thinking | 256K tokens |
-| `gpt-5-mini` | Efficient version for most tasks (recommended) | 128K tokens |
-| `gpt-5-nano` | Lowest-cost routing and classification | 128K tokens |
-| `gpt-4.1` | Stable production model for legacy GPT-4.1 deployments | 1M tokens |
+| `gpt-5.6-terra` | Balanced default for production agents | 256K tokens |
+| `gpt-5.6-sol` | Flagship reasoning and coding | 256K tokens |
+| `gpt-5.6-luna` | Cost-efficient, high-volume workloads | 128K tokens |
+| `gpt-5.6` | Flagship alias | 256K tokens |
 
 ### Example Output
 
@@ -384,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
-    let model = AnthropicClient::new(AnthropicConfig::new(&api_key, "claude-sonnet-4-6"))?;
+    let model = AnthropicClient::new(AnthropicConfig::new(&api_key, "claude-sonnet-5"))?;
 
     let agent = LlmAgentBuilder::new("anthropic_assistant")
         .description("Anthropic-powered assistant")
@@ -401,12 +480,10 @@ async fn main() -> anyhow::Result<()> {
 
 | Model | Description | Context |
 |-------|-------------|---------|
-| `claude-opus-4-7` | Most capable GA model, adaptive thinking only | 1M tokens |
-| `claude-opus-4-6` | Previous flagship for complex autonomous tasks | 1M tokens |
-| `claude-sonnet-4-6` | Balanced intelligence and cost (recommended) | 1M tokens |
-| `claude-haiku-4-5-20251001` | Ultra-efficient for high-volume workloads | 200K tokens |
-| `claude-opus-4-20250514` | Hybrid model with extended thinking | 200K tokens |
-| `claude-sonnet-4-20250514` | Balanced model with extended thinking | 1M tokens |
+| `claude-sonnet-5` | Balanced intelligence and cost (default) | 1M tokens |
+| `claude-opus-5` | Flagship capability | 1M tokens |
+| `claude-fable-5` | Premium creative and long-form work | 1M tokens |
+| `claude-haiku-4-5` | Cost-efficient previous generation | 200K tokens |
 
 ### Example Output
 
@@ -466,11 +543,8 @@ async fn main() -> anyhow::Result<()> {
 
 | Model | Description | Special Feature |
 |-------|-------------|-----------------|
-| `deepseek-r1-0528` | Latest reasoning model | Enhanced thinking depth |
-| `deepseek-r1` | Advanced reasoning | Comparable to o1 |
-| `deepseek-v3.1` | Latest 671B MoE model | General tasks |
-| `deepseek-chat` | 671B MoE model (V3) | General purpose, cheap |
-| `deepseek-vl2` | Vision-language model | Multimodal |
+| `deepseek-v4-flash` | Current default | Fast general-purpose agents |
+| `deepseek-v4-pro` | Advanced reasoning | Complex agentic work |
 
 ### Example Output (Reasoner with Thinking Mode)
 
@@ -512,7 +586,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     
     let api_key = std::env::var("GROQ_API_KEY")?;
-    let model = GroqClient::llama70b(&api_key)?;
+    let model = GroqClient::new(GroqConfig::gpt_oss_120b(&api_key))?;
 
     let agent = LlmAgentBuilder::new("groq_assistant")
         .description("Groq-powered assistant")
@@ -529,11 +603,8 @@ async fn main() -> anyhow::Result<()> {
 
 | Model | Method | Description |
 |-------|--------|-------------|
-| `llama-4-scout` | `GroqClient::new(GroqConfig::new(key, "llama-4-scout"))` | Llama 4 Scout (17Bx16E) |
-| `llama-3.2-90b-text-preview` | `GroqClient::new(GroqConfig::new(key, "llama-3.2-90b-text-preview"))` | Large text model |
-| `llama-3.1-70b-versatile` | `GroqClient::llama70b()` | Versatile large model |
-| `llama-3.1-8b-instant` | `GroqClient::llama8b()` | Fastest |
-| `mixtral-8x7b-32768` | `GroqClient::mixtral()` | Good balance |
+| `openai/gpt-oss-120b` | `GroqClient::new(GroqConfig::gpt_oss_120b(key))` | Current production default |
+| `openai/gpt-oss-20b` | `GroqClient::new(GroqConfig::new(key, "openai/gpt-oss-20b"))` | Lower-cost GPT-OSS model |
 | Any model | `GroqClient::new(GroqConfig::new(key, "model"))` | Custom model |
 
 ### Example Output
@@ -551,6 +622,69 @@ async fn main() -> anyhow::Result<()> {
 
 ---
 
+## Retries, Tool Calls, and Credentials
+
+These rules apply to every HTTP provider client in `adk-model` (OpenAI and
+OpenAI-compatible, Azure OpenAI, Azure AI Inference, Anthropic, DeepSeek, Groq).
+
+| Behaviour | Rule |
+|-----------|------|
+| Transient upstream errors | HTTP 500, 502, 503, 504, and 529 map to `ErrorCategory::Unavailable` with the upstream status recorded, so `RetryConfig` retries them |
+| `Retry-After` | A delay in seconds is attached to the error and used for the next retry, capped at `RetryConfig::max_delay` (default 5 seconds) |
+| Mid-stream Anthropic `error` event | Fails the stream with the category of the equivalent HTTP error, so `overloaded_error` and `rate_limit_error` are retryable |
+| Malformed streamed tool arguments | Fail with `model.<provider>.invalid_tool_arguments`; an empty payload is a zero-argument call with `{}` |
+| Text-encoded tool calls | Recognised only when the request declares the named tool; a ` ```json ` fence also needs an `arguments` or `parameters` object |
+| Tool order | Anthropic and Bedrock send tool definitions sorted by name, so the prompt-cache prefix is stable |
+| API keys | Provider configs redact the key in `Debug` output and omit it when serialized |
+| Redirects | Anthropic, Gemini, OpenAI, OpenAI-compatible, Azure OpenAI, Azure AI Inference and DeepSeek clients return a 3xx response as an error instead of following it |
+| Inline PDFs | OpenAI and Azure OpenAI receive a `file` part; other OpenAI-compatible providers receive the text fallback |
+
+```rust
+use std::time::Duration;
+
+use adk_model::catalog::GROQ_DEFAULT;
+use adk_model::groq::{GroqClient, GroqConfig};
+use adk_model::RetryConfig;
+
+fn build() -> Result<GroqClient, adk_core::AdkError> {
+    let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+    let retry = RetryConfig::default().with_max_delay(Duration::from_secs(30));
+    Ok(GroqClient::new(GroqConfig::new(api_key, GROQ_DEFAULT))?.with_retry_config(retry))
+}
+```
+
+### Request Adapters and Explicit Endpoints
+
+`OpenAICompatible` (and so every OpenAI-compatible preset) and `OpenAIResponsesClient`
+accept a `RequestAdapter` that edits the JSON body and headers of each generation
+request, retries included. Constructors that take the endpoint explicitly avoid ambient
+configuration when the application owns authentication:
+
+| Constructor | Provider | Reads environment |
+|-------------|----------|-------------------|
+| `Anthropic::new_with_base_url` | Anthropic | No |
+| `GeminiModel::new_with_base_url` | Gemini API | No |
+| `GeminiModel::new_google_cloud_endpoint` | Vertex AI (`gemini-vertex`) | Only ADC when no key is given |
+| `BedrockClient::new_with_api_key`, `BedrockClient::from_client` | Amazon Bedrock | No |
+
+```rust
+use std::sync::Arc;
+
+use adk_model::openai::{OpenAICompatible, OpenAICompatibleConfig, RequestAdapter};
+
+fn build(api_key: String) -> Result<OpenAICompatible, adk_core::AdkError> {
+    let adapter: RequestAdapter = Arc::new(|body, headers| {
+        body["metadata"] = serde_json::json!({"application": "support-bot"});
+        headers.insert("x-request-source", "support-bot".parse().expect("valid header"));
+        Ok(())
+    });
+    Ok(OpenAICompatible::new(OpenAICompatibleConfig::new(api_key, "gpt-5-mini"))?
+        .with_request_adapter(adapter))
+}
+```
+
+---
+
 ## Switching Providers
 
 All providers implement the same `Llm` trait, so switching is easy:
@@ -562,11 +696,11 @@ use std::sync::Arc;
 // Just change the model - everything else stays the same!
 let model: Arc<dyn adk_core::Llm> = Arc::new(
     // Pick one:
-    // GeminiModel::new(&api_key, "gemini-2.5-flash")?
-    // OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-5-mini"))?
-    // AnthropicClient::new(AnthropicConfig::new(&api_key, "claude-sonnet-4-6"))?
+    // GeminiModel::new(&api_key, "gemini-3.7-flash")?
+    // OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-5.6-terra"))?
+    // AnthropicClient::new(AnthropicConfig::new(&api_key, "claude-sonnet-5"))?
     // DeepSeekClient::chat(&api_key)?
-    // GroqClient::llama70b(&api_key)?
+    // GroqClient::new(GroqConfig::gpt_oss_120b(&api_key))?
 );
 
 let agent = LlmAgentBuilder::new("assistant")
@@ -593,6 +727,7 @@ The generated projects are compiled in CI by `scripts/check-cargo-adk-templates.
 
 ## Related
 
+- [OpenCode Go and Zen](./opencode.md) - Per-model routing for OpenCode services
 - [Ollama (Local)](./ollama.md) - Run models locally with Ollama
 - [Local Models (mistral.rs)](./mistralrs.md) - Native Rust inference
 - [LlmAgent](../agents/llm-agent.md) - Using models with agents
@@ -601,3 +736,74 @@ The generated projects are compiled in CI by `scripts/check-cargo-adk-templates.
 ---
 
 **Previous**: [← Realtime Agents](../agents/realtime-agents.md) | **Next**: [Ollama (Local) →](./ollama.md)
+
+## What happens to content a provider cannot carry
+
+`Content` can express more than any single provider transport accepts, so each adapter has
+to decide what to do with the remainder. Those decisions are now recorded rather than
+applied invisibly. Every part is classified:
+
+| Disposition | Meaning |
+|-------------|---------|
+| `Converted` | Carried to the provider in an equivalent native form |
+| `Downgraded` | Carried in a lossier form — a file reference rendered as descriptive text the model can read but not fetch |
+| `Omitted` | Not carried at all |
+
+Downgrades and omissions emit a `tracing` warning as they are recorded, naming the part
+kind, MIME type, and reason, so neither is silent.
+
+To see the outcome before dispatching a request:
+
+```rust
+use adk_core::{Content, Part};
+use adk_model::bedrock::convert::report_for_contents;
+
+let content = Content {
+    role: "user".to_string(),
+    parts: vec![Part::inline_data("audio/wav", vec![0u8; 16])],
+};
+let report = report_for_contents(std::slice::from_ref(&content));
+
+for omission in report.omitted_parts() {
+    println!("{} was dropped: {}", omission.kind, omission.detail);
+}
+```
+
+To refuse a request that would reach the model incomplete rather than receive an answer
+about material the model never saw:
+
+```rust
+use adk_core::{Content, Part};
+use adk_model::bedrock::convert::report_for_contents;
+
+let content = Content {
+    role: "user".to_string(),
+    parts: vec![Part::inline_data("video/mp4", vec![0u8; 16])],
+};
+
+if let Some(error) = report_for_contents(std::slice::from_ref(&content)).into_error() {
+    return Err(error);
+}
+```
+
+`into_error` covers omissions only. A downgrade still reaches the model, and rejecting it
+would refuse the documented textual fallback.
+
+> **Note:** the ledger is complete by construction. Any part that leaves an adapter without
+> a recorded fate — including one added by a future change — is recorded as an omission
+> with an explicit "no recorded reason", and `adk-model/tests/part_conversion_matrix_tests.rs`
+> fails on it.
+
+### Bedrock Converse coverage
+
+| Part | Disposition |
+|------|-------------|
+| Text, FunctionCall, FunctionResponse, Thinking | `Converted` |
+| `InlineData` with JPEG, PNG, GIF, WebP | `Converted` as an image block |
+| `InlineData` with a supported document type (PDF and similar) | `Converted` as a document block |
+| `InlineData` with audio, video, or arbitrary binary | `Omitted` |
+| `FileData` for an image or supported document | `Downgraded` to text — Converse takes S3 URIs, not arbitrary URLs |
+| `FileData` for any other type | `Omitted` |
+| `ServerToolCall`, `ServerToolResponse` | `Omitted` — Gemini-specific |
+| `EmbeddedResource` text, or a blob of a supported type | `Converted` |
+| `EmbeddedResource` blob of an unsupported type | `Omitted` |

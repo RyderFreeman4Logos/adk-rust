@@ -373,7 +373,7 @@ impl MistralRsVisionModel {
                 .parts
                 .iter()
                 .filter_map(|part| match part {
-                    Part::InlineData { mime_type, data } => {
+                    Part::InlineData { mime_type, data, .. } => {
                         if is_image_mime_type(mime_type) {
                             image_from_bytes(data).ok()
                         } else {
@@ -389,7 +389,7 @@ impl MistralRsVisionModel {
                 .parts
                 .iter()
                 .filter_map(|part| match part {
-                    Part::InlineData { mime_type, data } => {
+                    Part::InlineData { mime_type, data, .. } => {
                         if is_audio_mime_type(mime_type) {
                             audio_from_bytes(data).ok()
                         } else {

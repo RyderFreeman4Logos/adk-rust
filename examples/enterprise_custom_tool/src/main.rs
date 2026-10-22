@@ -10,9 +10,7 @@
 //! 6. Print the agent's final response
 //! 7. Clean up (archive session, delete agent)
 
-use adk_enterprise::{
-    CreateAgentParams, EnterpriseClient, SessionEvent, ToolConfig,
-};
+use adk_enterprise::{ContentBlock, CreateAgentParams, EnterpriseClient, SessionEvent, ToolConfig};
 use futures::StreamExt;
 use serde_json::json;
 
@@ -66,35 +64,32 @@ async fn main() -> anyhow::Result<()> {
     println!("[4/7] SSE stream opened.");
 
     // ─── 5. Send a message that will trigger the custom tool ─────────
-    client
-        .send_message(&session.id, "What's the weather in Tokyo?")
-        .await?;
+    client.send_message(&session.id, "What's the weather in Tokyo?").await?;
     println!("[5/7] Message sent: \"What's the weather in Tokyo?\"\n");
 
     // ─── 6. Event loop: handle custom tool use and print response ────
     println!("--- Streaming events ---");
     while let Some(event) = stream.next().await {
         match event? {
-            SessionEvent::CustomToolUse {
-                custom_tool_use_id,
-                name,
-                input,
-                ..
-            } => {
+            SessionEvent::CustomToolUse { custom_tool_use_id, name, input, .. } => {
                 println!("  [CustomToolUse] tool={name}, input={input}");
 
                 // Execute the tool locally
                 let result = execute_custom_tool(&name, &input);
                 println!("  [ToolResult] {result}");
 
-                // Send the result back to the agent
+                // Send the result back to the agent as a content block
                 client
-                    .custom_tool_result(&session.id, &custom_tool_use_id, &result)
+                    .custom_tool_result(
+                        &session.id,
+                        &custom_tool_use_id,
+                        vec![ContentBlock::text(result)],
+                    )
                     .await?;
             }
             SessionEvent::Message { content, .. } => {
                 for block in &content {
-                    if let adk_enterprise::ContentBlock::Text { text } = block {
+                    if let ContentBlock::Text { text } = block {
                         println!("  [Agent] {text}");
                     }
                 }

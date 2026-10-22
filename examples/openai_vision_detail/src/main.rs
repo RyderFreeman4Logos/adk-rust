@@ -1,10 +1,11 @@
 //! Validation example for issue #395.
 //!
-//! Background: `async-openai` 0.33 serializes `ImageUrl.detail` even when it is
-//! `None`, producing an explicit `"detail": null`. The official OpenAI API
-//! tolerates that, but stricter OpenAI-compatible gateways validate `detail`
-//! against the literal set `{auto, low, high}` and reject `null` with HTTP 400.
-//! The fix makes `adk-model` emit the API default `"auto"` instead.
+//! Background: older `async-openai` releases serialized `ImageUrl.detail` as
+//! an explicit `"detail": null` when unset. The official OpenAI API tolerates
+//! that, but stricter OpenAI-compatible gateways validate `detail` against the
+//! literal set `{auto, low, high}` and reject `null` with HTTP 400. `adk-model`
+//! emits the API default `"auto"` explicitly so this behavior remains stable
+//! across dependency versions.
 //!
 //! This example proves the fix end-to-end, fully offline:
 //!
@@ -63,10 +64,13 @@ async fn main() -> anyhow::Result<()> {
                 Part::InlineData {
                     mime_type: "image/png".to_string(),
                     data: vec![0x89, 0x50, 0x4E, 0x47],
+                    uri: None,
+                    annotations: None,
                 },
                 Part::FileData {
                     mime_type: "image/jpeg".to_string(),
                     file_uri: "https://example.com/photo.jpg".to_string(),
+                    annotations: None,
                 },
             ],
         }],

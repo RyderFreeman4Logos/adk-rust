@@ -19,24 +19,38 @@ use super::{DEFAULT_MODEL, GEMINI_VOICES};
 /// use adk_realtime::RealtimeModel;
 ///
 /// let backend = GeminiLiveBackend::studio("your-key");
-/// let model = GeminiRealtimeModel::new(backend, "models/gemini-live-2.5-flash-native-audio");
+/// let model = GeminiRealtimeModel::new(backend, "models/gemini-3.1-flash-live-preview");
 /// let session = model.connect(config).await?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct GeminiRealtimeModel {
     backend: GeminiLiveBackend,
     model_id: String,
+    schema_dialect: adk_gemini::GeminiSchemaDialect,
 }
 
 impl GeminiRealtimeModel {
     /// Create a new Gemini Live model.
     pub fn new(backend: GeminiLiveBackend, model_id: impl Into<String>) -> Self {
-        Self { backend, model_id: model_id.into() }
+        Self { backend, model_id: model_id.into(), schema_dialect: Default::default() }
     }
 
     /// Create with the default Live model.
     pub fn with_default_model(backend: GeminiLiveBackend) -> Self {
         Self::new(backend, DEFAULT_MODEL)
+    }
+
+    /// Declare the schema dialect this model's tool schemas are reduced to.
+    ///
+    /// Must match the adapter that produced them. Pair
+    /// [`GeminiSchemaAdapter::json_schema()`](adk_gemini::GeminiSchemaAdapter::json_schema)
+    /// with [`GeminiSchemaDialect::JsonSchema`](adk_gemini::GeminiSchemaDialect::JsonSchema)
+    /// so the constraints it preserved are posted under the field that accepts
+    /// them. The default is the legacy OpenAPI subset, so this changes nothing
+    /// unless called.
+    pub fn with_schema_dialect(mut self, dialect: adk_gemini::GeminiSchemaDialect) -> Self {
+        self.schema_dialect = dialect;
+        self
     }
 }
 
@@ -63,8 +77,13 @@ impl RealtimeModel for GeminiRealtimeModel {
     }
 
     async fn connect(&self, config: RealtimeConfig) -> Result<BoxedSession> {
-        let session =
-            GeminiRealtimeSession::connect(self.backend.clone(), &self.model_id, config).await?;
+        let session = GeminiRealtimeSession::connect_with_dialect(
+            self.backend.clone(),
+            &self.model_id,
+            config,
+            self.schema_dialect,
+        )
+        .await?;
         Ok(Box::new(session))
     }
 }

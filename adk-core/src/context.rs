@@ -1,5 +1,5 @@
 use crate::identity::{AdkIdentity, AppName, ExecutionIdentity, InvocationId, SessionId, UserId};
-use crate::{AdkError, Agent, Result, types::Content};
+use crate::{AdkError, Agent, Result, Toolset, types::Content};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -92,6 +92,17 @@ pub trait ReadonlyContext: Send + Sync {
     fn branch(&self) -> &str;
     /// Returns the user's input content for this invocation.
     fn user_content(&self) -> &Content;
+
+    /// Returns the session state when the runtime exposes it to dynamic toolsets.
+    ///
+    /// The default keeps lightweight contexts and third-party implementations
+    /// source-compatible. Consumers must gracefully handle contexts without
+    /// session state. Dynamic [`Toolset`] implementations use
+    /// this to determine their context-specific tool surface without requiring
+    /// mutable access to the session.
+    fn state(&self) -> Option<&dyn State> {
+        None
+    }
 
     /// Returns the application name as a typed [`AppName`].
     ///
@@ -256,6 +267,26 @@ pub trait Session: Send + Sync {
     /// Default implementation delegates to [`conversation_history`](Self::conversation_history).
     fn conversation_history_for_agent(&self, _agent_name: &str) -> Vec<Content> {
         self.conversation_history()
+    }
+    /// Returns conversation history scoped to an agent and a conversation branch.
+    ///
+    /// `branch` is the invocation branch of the agent asking for history. An
+    /// event is visible when its branch equals that branch or is an *ancestor*
+    /// of it, so a sub-agent sees the conversation that led to it but not what
+    /// its siblings produced. `ParallelAgent` relies on this to keep concurrent
+    /// branches from contaminating each other's context, mirroring ADK Python's
+    /// `_is_event_belongs_to_branch` and ADK Go's `eventBelongsToBranch`.
+    ///
+    /// An empty `branch` on either side means "unscoped" and matches everything,
+    /// so implementations that never set [`crate::Event::branch`] are unaffected.
+    ///
+    /// Default implementation ignores `branch` and preserves the agent-name
+    /// filtering behaviour, so existing [`Session`] implementations keep working.
+    fn conversation_history_scoped(&self, agent_name: Option<&str>, _branch: &str) -> Vec<Content> {
+        match agent_name {
+            Some(name) => self.conversation_history_for_agent(name),
+            None => self.conversation_history(),
+        }
     }
     /// Append content to conversation history (for sequential agent support)
     fn append_to_history(&self, _content: Content) {
@@ -498,6 +529,21 @@ pub trait InvocationContext: CallbackContext {
     /// Returns whether the invocation has been ended.
     fn ended(&self) -> bool;
 
+    /// Returns `true` if this invocation has been cancelled.
+    ///
+    /// Agents and tools can poll this during long-running work (LLM streaming,
+    /// HTTP I/O, tool execution) to detect an external cancellation request —
+    /// for example, a user pressing "Stop" or a call to
+    /// [`Runner::interrupt`](https://docs.rs/adk-runner). Checking it at chunk
+    /// or tool boundaries lets an agent exit promptly and perform any graceful
+    /// cleanup instead of running to natural completion.
+    ///
+    /// The default returns `false`. The runtime sets the underlying token when
+    /// `Runner::interrupt()` is called or `RunConfig::cancellation_token` fires.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
     /// Returns the scopes granted to the current user for this invocation.
     ///
     /// When a [`RequestContext`](crate::RequestContext) is present (set by the
@@ -515,6 +561,42 @@ pub trait InvocationContext: CallbackContext {
         HashMap::new()
     }
 
+    /// Whether the run's transfer target list replaces static sub-agent targets.
+    fn authoritative_transfer_targets(&self) -> bool {
+        false
+    }
+
+    /// Current nested agent-as-tool delegation depth.
+    fn delegation_depth(&self) -> u32 {
+        0
+    }
+
+    /// Maximum nested agent-as-tool delegation depth.
+    fn max_delegation_depth(&self) -> Option<u32> {
+        None
+    }
+
+    /// Returns the root invocation that owns this orchestration tree.
+    ///
+    /// Nested agent runs use this stable identifier to aggregate budgets,
+    /// traces, and execution receipts without conflating unrelated runs.
+    fn orchestration_root_invocation_id(&self) -> &str {
+        self.invocation_id()
+    }
+
+    /// Returns the causal relationship execution that started this run.
+    fn orchestration_edge_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns whether a runtime-injected tool requires confirmation.
+    ///
+    /// This additive hook lets composition layers protect relationship tools
+    /// without mutating the concrete agent that receives them.
+    fn requires_tool_confirmation(&self, _tool_name: &str) -> bool {
+        false
+    }
+
     /// Retrieve a secret by name from the configured secret provider.
     ///
     /// Returns `Ok(Some(value))` when a provider is configured and the secret
@@ -522,6 +604,16 @@ pub trait InvocationContext: CallbackContext {
     /// provider failure. The default returns `Ok(None)`.
     async fn get_secret(&self, _name: &str) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Resolves a secret for a described access.
+    ///
+    /// A wrapper context must forward this, and a tool context builds the request from
+    /// the identity the framework gave it. The default drops the description and calls
+    /// [`InvocationContext::get_secret`], which keeps a context that predates the
+    /// request object working.
+    async fn get_secret_for(&self, request: &SecretRequest) -> Result<Option<String>> {
+        self.get_secret(&request.name).await
     }
 }
 
@@ -569,19 +661,43 @@ pub trait Memory: Send + Sync {
         Err(AdkError::memory("delete not implemented"))
     }
 
-    /// Search for memories within a specific project.
-    /// Returns global entries + entries for the given project.
-    /// Default delegates to `search` (global-only results).
-    async fn search_in_project(&self, query: &str, project_id: &str) -> Result<Vec<MemoryEntry>> {
-        let _ = project_id;
-        self.search(query).await
+    /// Whether this memory keeps project-scoped entries isolated.
+    ///
+    /// Returns `false` by default, so a caller can tell real isolation apart from a
+    /// memory that has no project support instead of inferring it from data.
+    fn supports_project_scoping(&self) -> bool {
+        false
     }
 
-    /// Add a memory entry scoped to a specific project.
-    /// Default delegates to `add` (global entry).
+    /// Searches memories within a specific project.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns an error. Delegating to the global search
+    /// would return entries the project boundary is meant to exclude, and nothing in
+    /// the result would say the boundary was ignored.
+    async fn search_in_project(&self, query: &str, project_id: &str) -> Result<Vec<MemoryEntry>> {
+        let _ = (query, project_id);
+        Err(AdkError::memory(
+            "this memory does not implement project scoping, so `search_in_project` cannot \
+             honour the project boundary; check `supports_project_scoping` first, or call \
+             `search` if global scope is intended",
+        ))
+    }
+
+    /// Adds a memory entry scoped to a specific project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error by default. Writing the entry globally would make data
+    /// intended for one project visible everywhere under the same app and user.
     async fn add_to_project(&self, entry: MemoryEntry, project_id: &str) -> Result<()> {
-        let _ = project_id;
-        self.add(entry).await
+        let _ = (entry, project_id);
+        Err(AdkError::memory(
+            "this memory does not implement project scoping, so `add_to_project` cannot honour \
+             the project boundary; check `supports_project_scoping` first, or call `add` if \
+             global scope is intended",
+        ))
     }
 }
 
@@ -615,6 +731,100 @@ pub trait SecretService: Send + Sync {
     ///
     /// Returns the secret string on success, or an [`AdkError`] on failure.
     async fn get_secret(&self, name: &str) -> Result<String>;
+
+    /// Retrieve a secret for a described access.
+    ///
+    /// This is the form an authorizing service implements: the request carries who is
+    /// asking and why, so a decision can be made before the value is fetched. The
+    /// default implementation ignores the context and calls
+    /// [`SecretService::get_secret`], which is correct for a service that has no
+    /// policy of its own.
+    ///
+    /// Every field on [`SecretRequest`] is set by the framework at the call site, not
+    /// supplied by the tool, so a tool cannot present another tool's identity.
+    async fn get_secret_for(&self, request: &SecretRequest) -> Result<String> {
+        self.get_secret(&request.name).await
+    }
+}
+
+/// A described secret access.
+///
+/// Carries the requested name plus the identity the framework observed at the call
+/// site, so a [`SecretService`] can authorize and audit rather than being handed a
+/// bare name with no context.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::SecretRequest;
+///
+/// let request = SecretRequest::new("payments-api-key")
+///     .with_tool_name("charge_card")
+///     .with_purpose("authorize a customer payment");
+///
+/// assert_eq!(request.tool_name.as_deref(), Some("charge_card"));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecretRequest {
+    /// Name of the requested secret.
+    pub name: String,
+    /// The tool making the request, when the access came from a tool.
+    ///
+    /// Set by the framework from the tool it dispatched, never from a value the tool
+    /// provided.
+    pub tool_name: Option<String>,
+    /// Application the run belongs to.
+    pub app_name: Option<String>,
+    /// Authenticated user the run belongs to.
+    pub user_id: Option<String>,
+    /// Session the run belongs to.
+    pub session_id: Option<String>,
+    /// Invocation the access happened in, for correlating audit records.
+    pub invocation_id: Option<String>,
+    /// Why the secret is needed, when the caller states it.
+    pub purpose: Option<String>,
+}
+
+impl SecretRequest {
+    /// Creates a request for `name` with no identity attached.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into(), ..Default::default() }
+    }
+
+    /// Attaches the requesting tool's name.
+    #[must_use]
+    pub fn with_tool_name(mut self, tool_name: impl Into<String>) -> Self {
+        self.tool_name = Some(tool_name.into());
+        self
+    }
+
+    /// Attaches the run's identity.
+    #[must_use]
+    pub fn with_identity(
+        mut self,
+        app_name: impl Into<String>,
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        self.app_name = Some(app_name.into());
+        self.user_id = Some(user_id.into());
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Attaches the invocation the access happened in.
+    #[must_use]
+    pub fn with_invocation_id(mut self, invocation_id: impl Into<String>) -> Self {
+        self.invocation_id = Some(invocation_id.into());
+        self
+    }
+
+    /// Attaches a stated purpose.
+    #[must_use]
+    pub fn with_purpose(mut self, purpose: impl Into<String>) -> Self {
+        self.purpose = Some(purpose.into());
+        self
+    }
 }
 
 /// A single entry returned from memory search.
@@ -660,6 +870,71 @@ pub enum ToolConfirmationDecision {
     Approve,
     /// Deny the tool execution.
     Deny,
+}
+
+/// Produces a canonical fingerprint of a tool call.
+///
+/// The fingerprint is the tool name followed by its arguments in canonical JSON
+/// form, with object keys sorted at every level so that two structurally equal
+/// argument sets always produce the same string. It is deliberately readable
+/// rather than hashed, so a mismatch can be diagnosed by inspection.
+///
+/// Use it with
+/// [`RunConfig::tool_confirmation_fingerprints`](RunConfig::tool_confirmation_fingerprints)
+/// to bind an approval to the exact arguments it was granted for.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::tool_call_fingerprint;
+/// use serde_json::json;
+///
+/// // Key order does not change the fingerprint.
+/// let a = tool_call_fingerprint("delete_file", &json!({ "path": "/tmp/a", "force": true }));
+/// let b = tool_call_fingerprint("delete_file", &json!({ "force": true, "path": "/tmp/a" }));
+/// assert_eq!(a, b);
+///
+/// // A different path does not.
+/// let c = tool_call_fingerprint("delete_file", &json!({ "path": "/etc/passwd", "force": true }));
+/// assert_ne!(a, c);
+/// ```
+pub fn tool_call_fingerprint(tool_name: &str, args: &Value) -> String {
+    let mut out = String::with_capacity(tool_name.len() + 32);
+    out.push_str(tool_name);
+    out.push('\u{1f}');
+    write_canonical(args, &mut out);
+    out
+}
+
+/// Writes `value` as canonical JSON, with object keys sorted at every level.
+fn write_canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String((*key).clone()).to_string());
+                out.push(':');
+                write_canonical(&map[*key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 /// Policy defining which tools require human confirmation before execution.
@@ -716,6 +991,51 @@ pub struct ToolConfirmationRequest {
     pub args: Value,
 }
 
+/// Asynchronous decision source for tool calls that require confirmation.
+///
+/// Front ends and protocol adapters can implement this trait to pause an
+/// invocation while a person or an external policy service reviews the exact
+/// tool call. When no handler is configured, agents preserve the existing
+/// behavior and emit an interrupted confirmation event for a later run.
+///
+/// `LlmAgent` asks for each call as it is dispatched, one `decide` at a time,
+/// while calls that need no approval keep running. An error from `decide` ends the
+/// turn after running tools finish; `decide` calls still waiting in the same batch
+/// are dropped.
+#[async_trait]
+pub trait ToolConfirmationHandler: std::fmt::Debug + Send + Sync {
+    /// Approve or deny one pending tool call.
+    async fn decide(&self, request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision>;
+}
+
+/// A toolset attached to one runner invocation rather than compiled into the
+/// agent definition.
+///
+/// Protocol adapters use this wrapper for session-scoped capabilities such as
+/// MCP servers supplied by an ACP client. The wrapper keeps [`RunConfig`]
+/// debuggable without requiring every toolset implementation to implement
+/// [`std::fmt::Debug`].
+#[derive(Clone)]
+pub struct RuntimeToolset(Arc<dyn Toolset>);
+
+impl RuntimeToolset {
+    /// Wrap a toolset for use during one runner invocation.
+    pub fn new(toolset: Arc<dyn Toolset>) -> Self {
+        Self(toolset)
+    }
+
+    /// Borrow the wrapped toolset.
+    pub fn toolset(&self) -> &Arc<dyn Toolset> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RuntimeToolset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("RuntimeToolset").field(&self.0.name()).finish()
+    }
+}
+
 /// Configuration for a single agent run.
 ///
 /// Controls streaming behavior, tool confirmation, caching, transfer targets,
@@ -724,9 +1044,37 @@ pub struct ToolConfirmationRequest {
 pub struct RunConfig {
     /// The streaming mode for agent responses.
     pub streaming_mode: StreamingMode,
-    /// Optional per-tool confirmation decisions for the current run.
-    /// Keys are tool names.
+    /// Static confirmation decisions for the current run, keyed by **function
+    /// call ID**.
+    ///
+    /// The ID is the one reported on
+    /// [`ToolConfirmationRequest::function_call_id`], so a decision authorizes the
+    /// exact call it was requested for. A decision under a tool *name* is not
+    /// consulted, because one name can cover materially different calls — a
+    /// `delete_file` approval for a scratch path must not authorize a call that
+    /// targets a different path.
+    ///
+    /// Use [`tool_confirmation_fingerprints`](Self::tool_confirmation_fingerprints)
+    /// to additionally bind a decision to the arguments it was granted for. For
+    /// name-wide or policy-driven decisions, supply a
+    /// [`tool_confirmation_handler`](Self::tool_confirmation_handler) instead.
     pub tool_confirmation_decisions: HashMap<String, ToolConfirmationDecision>,
+    /// Optional argument binding for entries in
+    /// [`tool_confirmation_decisions`](Self::tool_confirmation_decisions), keyed by
+    /// the same function call ID.
+    ///
+    /// The value is the fingerprint produced by [`tool_call_fingerprint`] for the
+    /// call the decision was granted for. When an entry is present and the actual
+    /// call does not match it, the decision is ignored and the call is treated as
+    /// unconfirmed — the safe direction. Use this when a decision travels through
+    /// an untrusted round trip, such as a browser, where the arguments could be
+    /// changed while the call ID is replayed.
+    pub tool_confirmation_fingerprints: HashMap<String, String>,
+    /// Optional live decision source for confirmations that have no static
+    /// entry in [`tool_confirmation_decisions`](Self::tool_confirmation_decisions).
+    pub tool_confirmation_handler: Option<Arc<dyn ToolConfirmationHandler>>,
+    /// Toolsets made available only for this invocation.
+    pub runtime_toolsets: Vec<RuntimeToolset>,
     /// Optional cached content name for automatic prompt caching.
     /// When set by the runner's cache lifecycle manager, agents should attach
     /// this name to their `GenerateContentConfig` so the LLM provider can
@@ -778,6 +1126,9 @@ impl Default for RunConfig {
         Self {
             streaming_mode: StreamingMode::SSE,
             tool_confirmation_decisions: HashMap::new(),
+            tool_confirmation_fingerprints: HashMap::new(),
+            tool_confirmation_handler: None,
+            runtime_toolsets: Vec::new(),
             cached_content: None,
             transfer_targets: Vec::new(),
             parent_agent: None,
@@ -841,12 +1192,46 @@ impl RunConfigBuilder {
         self
     }
 
-    /// Sets per-tool confirmation decisions for the current run.
+    /// Sets static confirmation decisions for the current run, keyed by function
+    /// call ID.
+    ///
+    /// The ID is the one carried on `ToolConfirmationRequest::function_call_id`.
     pub fn tool_confirmation_decisions(
         mut self,
         decisions: HashMap<String, ToolConfirmationDecision>,
     ) -> Self {
         self.config.tool_confirmation_decisions = decisions;
+        self
+    }
+
+    /// Binds confirmation decisions to the arguments they were granted for.
+    ///
+    /// Keys are function call IDs and values are fingerprints from
+    /// [`tool_call_fingerprint`]. A decision whose fingerprint does not match the
+    /// actual call is ignored and the call is treated as unconfirmed.
+    pub fn tool_confirmation_fingerprints(mut self, fingerprints: HashMap<String, String>) -> Self {
+        self.config.tool_confirmation_fingerprints = fingerprints;
+        self
+    }
+
+    /// Sets an asynchronous tool confirmation handler for the current run.
+    pub fn tool_confirmation_handler(mut self, handler: Arc<dyn ToolConfirmationHandler>) -> Self {
+        self.config.tool_confirmation_handler = Some(handler);
+        self
+    }
+
+    /// Adds a toolset that is resolved only for this runner invocation.
+    pub fn runtime_toolset(mut self, toolset: Arc<dyn Toolset>) -> Self {
+        self.config.runtime_toolsets.push(RuntimeToolset::new(toolset));
+        self
+    }
+
+    /// Adds several toolsets that are resolved only for this runner invocation.
+    pub fn runtime_toolsets(
+        mut self,
+        toolsets: impl IntoIterator<Item = Arc<dyn Toolset>>,
+    ) -> Self {
+        self.config.runtime_toolsets.extend(toolsets.into_iter().map(RuntimeToolset::new));
         self
     }
 

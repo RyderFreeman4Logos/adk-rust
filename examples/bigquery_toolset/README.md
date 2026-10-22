@@ -8,13 +8,14 @@ lists datasets, inspects table schemas, and executes SQL queries via the BigQuer
 - Creating a `BigQueryToolset` with a Google Cloud project ID
 - Building an `LlmAgent` with the BigQuery toolset attached
 - Four BigQuery tools: `bigquery_list_datasets`, `bigquery_list_tables`, `bigquery_get_table_schema`, `bigquery_execute_sql`
+- `bigquery_execute_sql` is read-only by default — it runs a single `SELECT` or `WITH` query after a BigQuery dry run confirms the statement type; `BigQueryToolset::with_read_only(false)` allows writes
 - Dry-run mode when no project is configured (prints what would happen)
 - Live mode with real BigQuery API calls
 - Full discovery workflow: datasets → tables → schema → query → results
 
 ## Prerequisites
 
-- Rust 1.94+
+- Rust 1.95+
 - `GOOGLE_API_KEY` for the Gemini LLM provider
 - (Optional) A Google Cloud project with BigQuery enabled for live mode
 - (Optional) Application Default Credentials configured via `gcloud auth application-default login`

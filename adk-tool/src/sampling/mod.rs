@@ -354,6 +354,8 @@ pub fn sampling_request_to_llm_request(request: &SamplingRequest, model_name: &s
                 parts: vec![Part::InlineData {
                     mime_type: mime_type.clone(),
                     data: base64_decode_lossy(data),
+                    uri: None,
+                    annotations: None,
                 }],
             },
         };
@@ -405,7 +407,7 @@ fn content_to_sampling_content(content: &Content) -> SamplingContent {
     for part in &content.parts {
         match part {
             Part::Text { text } => return SamplingContent::text(text.clone()),
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 return SamplingContent::image(base64_encode(data), mime_type.clone());
             }
             _ => continue,

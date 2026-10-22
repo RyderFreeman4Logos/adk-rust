@@ -31,7 +31,12 @@ mod index;
 mod injector;
 mod model;
 mod parser;
+#[cfg(feature = "progressive-disclosure")]
+mod progressive;
+#[cfg(feature = "vertex-skill-registry")]
+pub mod registry;
 mod select;
+mod writer;
 
 pub use coordinator::{
     ContextCoordinator, CoordinatorConfig, ResolutionStrategy, SkillContext, ToolRegistry,
@@ -51,4 +56,10 @@ pub use model::{
     SkillSummary,
 };
 pub use parser::{parse_instruction_markdown, parse_skill_markdown};
+#[cfg(feature = "progressive-disclosure")]
+pub use progressive::{
+    ActivatedSkill, DEFAULT_SKILL_SYSTEM_INSTRUCTION, ResourceAccessPolicy, SkillToolset,
+    SkillToolsetConfig, build_skill_system_instruction,
+};
 pub use select::select_skills;
+pub use writer::{SkillDraft, SkillWriter, validate_skill_name};

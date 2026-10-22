@@ -48,7 +48,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-enterprise = "1.0"
+adk-enterprise = "2.3.0"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -57,7 +57,7 @@ Or via the umbrella crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "1.0", features = ["enterprise-client"] }
+adk-rust = { version = "2.3.0", features = ["enterprise-client"] }
 ```
 
 ## Quick Start
@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
     // Create an agent (any model — Gemini, OpenAI, Anthropic, etc.)
     let agent = client.create_agent(CreateAgentParams {
         name: "Hello Agent".into(),
-        model: "gemini-2.5-flash".into(),
+        model: "gemini-3.7-flash".into(),
         system: Some("You are brief and friendly.".into()),
         ..Default::default()
     }).await?;
@@ -173,19 +173,19 @@ use adk_enterprise::{ModelRef, Provider};
 
 // Shorthand (provider inferred from name)
 let agent = client.create_agent(CreateAgentParams {
-    model: "gemini-2.5-flash".into(),
+    model: "gemini-3.7-flash".into(),
     ..Default::default()
 }).await?;
 
 // Explicit provider
 let agent = client.create_agent(CreateAgentParams {
-    model: ModelRef::structured(Provider::Openai, "gpt-4.1"),
+    model: ModelRef::structured(Provider::Openai, "gpt-5.6-terra"),
     ..Default::default()
 }).await?;
 
 // OpenAI-compatible endpoint (DeepSeek, Together, etc.)
 let agent = client.create_agent(CreateAgentParams {
-    model: ModelRef::compatible("deepseek-chat", "https://api.deepseek.com"),
+    model: ModelRef::compatible("deepseek-v4-flash", "https://api.deepseek.com"),
     ..Default::default()
 }).await?;
 ```
@@ -261,7 +261,7 @@ adk-enterprise/src/
 
 ## Requirements
 
-- **Rust 1.85+** (edition 2024)
+- **Rust 1.95+** (edition 2024)
 - **tokio** async runtime
 - Network access to the Enterprise platform (or self-hosted deployment)
 - API key (`adk_live_...` or `adk_test_...`)

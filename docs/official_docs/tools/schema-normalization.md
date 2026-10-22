@@ -60,7 +60,7 @@ Each `Llm` implementation returns its adapter via `schema_adapter()`:
 ```rust
 use adk_core::Llm;
 
-let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 let adapter = model.schema_adapter(); // Returns &GeminiSchemaAdapter
 ```
 
@@ -142,24 +142,26 @@ let adapter = GenericSchemaAdapter;
 Normalized schemas are cached by content hash to avoid redundant computation:
 
 ```rust
-use adk_core::{SchemaCache, GenericSchemaAdapter, SchemaAdapter};
+use adk_core::{GenericSchemaAdapter, SchemaCache};
 use serde_json::json;
+use std::sync::Arc;
 
-let cache = SchemaCache::new();
-let adapter = GenericSchemaAdapter;
+let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
 let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}});
 
 // First call normalizes and caches
-let result = cache.get_or_normalize(&schema, &adapter);
+let result = cache.normalize(&schema);
 
 // Subsequent calls return cached result (no re-normalization)
-let cached = cache.get_or_normalize(&schema, &adapter);
+let cached = cache.normalize(&schema);
 
 // Invalidate when tools change
 cache.clear();
 ```
 
-The cache lives on model instances and is automatically used during `generate_content()`.
+Each cache owns one adapter instance, so entries normalized for different
+providers or adapter configurations cannot collide. Provider clients use these
+caches automatically during `generate_content()`.
 
 ## Tool Name Truncation
 

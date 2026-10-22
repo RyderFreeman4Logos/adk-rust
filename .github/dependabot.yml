@@ -15,24 +15,29 @@ updates:
         update-types:
           - "version-update:semver-patch"
           - "version-update:semver-minor"
-
-  - package-ecosystem: "npm"
-    directory: "/packages/adk-ui-react"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "javascript"
-
-  - package-ecosystem: "npm"
-    directory: "/adk-studio/ui"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "javascript"
+      # syn: ignore the syn 3 major only — deliberately scoped, not a blanket
+      # ignore, so a future syn 4 still gets proposed on its own merits.
+      # syn 3 has been proposed twice (PRs #440 and #453) and closed both times.
+      # The only consumers are adk-rust-macros (the #[tool] macro) and cargo-adk,
+      # and neither needs anything syn 3 adds. Meanwhile serde_derive, thiserror,
+      # and async-trait are all still on syn 2, so adopting syn 3 would compile
+      # syn 2 and syn 3 side by side.
+      # Removal condition: once serde_derive, thiserror, and async-trait are on
+      # syn 3, delete this rule. At that point the bump *removes* a duplicate
+      # compile instead of adding one, so it stops being churn and is worth taking.
+      # See .kiro/specs/dependency-cleanup/requirements.md — its Non-Requirements
+      # section already records that ecosystem-wide splits like syn 1/2 are not
+      # actionable for this repo.
+      - dependency-name: "syn"
+        versions:
+          - ">= 3, < 4"
+    # adk-sandbox passes wasmtime types into wasmtime-wasi, which requires the
+    # same wasmtime major, so bumping either alone fails to compile.
+    groups:
+      wasmtime:
+        patterns:
+          - "wasmtime"
+          - "wasmtime-wasi"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -41,4 +46,3 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
-      - "ci"

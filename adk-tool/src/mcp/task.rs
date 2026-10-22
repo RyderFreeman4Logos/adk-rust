@@ -1,16 +1,19 @@
-// MCP Task Support (SEP-1686)
+// MCP Task Support
 //
 // Implements async task lifecycle for long-running MCP tool operations.
 // Tasks allow tools to be queued and polled rather than blocking.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::time::Duration;
 
+pub use rmcp::model::{CreateTaskResult, Task as TaskInfo, TaskStatus};
+
 /// Configuration for MCP task-based execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct McpTaskConfig {
-    /// Enable task mode for long-running tools
+    /// Allow task mode when a tool and server negotiate MCP task support.
     pub enable_tasks: bool,
     /// Default poll interval in milliseconds
     pub poll_interval_ms: u64,
@@ -18,6 +21,8 @@ pub struct McpTaskConfig {
     pub timeout_ms: Option<u64>,
     /// Maximum number of poll attempts (None = unlimited)
     pub max_poll_attempts: Option<u32>,
+    /// Maximum stateless MRTR input rounds before rejecting a looping peer.
+    pub max_input_rounds: usize,
 }
 
 impl Default for McpTaskConfig {
@@ -27,6 +32,7 @@ impl Default for McpTaskConfig {
             poll_interval_ms: 1000,
             timeout_ms: Some(300_000), // 5 minutes default
             max_poll_attempts: None,
+            max_input_rounds: 10,
         }
     }
 }
@@ -61,6 +67,12 @@ impl McpTaskConfig {
         self
     }
 
+    /// Set the maximum number of MRTR input rounds.
+    pub fn max_input_rounds(mut self, rounds: usize) -> Self {
+        self.max_input_rounds = rounds;
+        self
+    }
+
     /// Get poll interval as Duration
     pub fn poll_duration(&self) -> Duration {
         Duration::from_millis(self.poll_interval_ms)
@@ -70,65 +82,6 @@ impl McpTaskConfig {
     pub fn timeout_duration(&self) -> Option<Duration> {
         self.timeout_ms.map(Duration::from_millis)
     }
-
-    /// Convert to MCP task request parameters
-    pub fn to_task_params(&self) -> Value {
-        json!({
-            "poll_interval_ms": self.poll_interval_ms
-        })
-    }
-}
-
-/// Status of an MCP task
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskStatus {
-    /// Task is queued but not started
-    Pending,
-    /// Task is currently running
-    Running,
-    /// Task completed successfully
-    Completed,
-    /// Task failed with an error
-    Failed,
-    /// Task was cancelled
-    Cancelled,
-}
-
-impl TaskStatus {
-    /// Check if the task is in a terminal state
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
-    }
-
-    /// Check if the task is still in progress
-    pub fn is_in_progress(&self) -> bool {
-        matches!(self, TaskStatus::Pending | TaskStatus::Running)
-    }
-}
-
-/// Information about an MCP task
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskInfo {
-    /// Unique task identifier
-    pub task_id: String,
-    /// Current status
-    pub status: TaskStatus,
-    /// Progress percentage (0-100) if available
-    pub progress: Option<u8>,
-    /// Human-readable status message
-    pub message: Option<String>,
-    /// Estimated time remaining in milliseconds
-    pub eta_ms: Option<u64>,
-}
-
-/// Result of creating a task
-#[derive(Debug, Clone)]
-pub struct CreateTaskResult {
-    /// The task ID for polling
-    pub task_id: String,
-    /// Initial task info
-    pub info: TaskInfo,
 }
 
 /// Error during task operations
@@ -154,6 +107,13 @@ pub enum TaskError {
         /// Error message from the task.
         error: String,
     },
+    /// The remote task paused until more information is supplied.
+    InputRequired {
+        /// ID of the task waiting for input.
+        task_id: String,
+        /// Human-readable explanation supplied by the MCP server.
+        message: String,
+    },
     /// Maximum poll attempts exceeded
     MaxAttemptsExceeded {
         /// ID of the task that exceeded attempts.
@@ -174,6 +134,9 @@ impl std::fmt::Display for TaskError {
             TaskError::Cancelled(task_id) => write!(f, "Task '{}' was cancelled", task_id),
             TaskError::TaskFailed { task_id, error } => {
                 write!(f, "Task '{}' failed: {}", task_id, error)
+            }
+            TaskError::InputRequired { task_id, message } => {
+                write!(f, "Task '{task_id}' requires input: {message}")
             }
             TaskError::MaxAttemptsExceeded { task_id, attempts } => {
                 write!(f, "Task '{}' exceeded {} poll attempts", task_id, attempts)
@@ -216,20 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_task_status_terminal() {
-        assert!(!TaskStatus::Pending.is_terminal());
-        assert!(!TaskStatus::Running.is_terminal());
-        assert!(TaskStatus::Completed.is_terminal());
-        assert!(TaskStatus::Failed.is_terminal());
-        assert!(TaskStatus::Cancelled.is_terminal());
-    }
-
-    #[test]
-    fn test_task_status_in_progress() {
-        assert!(TaskStatus::Pending.is_in_progress());
-        assert!(TaskStatus::Running.is_in_progress());
-        assert!(!TaskStatus::Completed.is_in_progress());
-        assert!(!TaskStatus::Failed.is_in_progress());
-        assert!(!TaskStatus::Cancelled.is_in_progress());
+    fn exports_the_rmcp_task_status_shape() {
+        assert_eq!(TaskStatus::default(), TaskStatus::Working);
     }
 }

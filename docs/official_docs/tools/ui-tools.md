@@ -115,8 +115,8 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 adk-ui = { git = "https://github.com/zavora-ai/adk-ui" }
-adk-agent = "2.0.0"
-adk-model = "2.0.0"
+adk-agent = "2.3.0"
+adk-model = "2.3.0"
 ```
 
 ### Basic Usage
@@ -128,7 +128,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = Arc::new(GeminiModel::from_env("gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::from_env("gemini-3.7-flash")?);
 
     // Get all 10 UI tools
     let ui_tools = UiToolset::all_tools();

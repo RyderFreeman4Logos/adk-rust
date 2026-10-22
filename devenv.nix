@@ -24,13 +24,18 @@
 
   # Load .env file automatically
   dotenv.enable = builtins.pathExists ./.env;
+  # Newer devenv CLIs read `dotenv.resolved` even when dotenv is disabled, while the
+  # pinned modules define it only when enabled; the module's own value wins when set.
+  dotenv.resolved = lib.mkDefault { };
 
   # --------------------------------------------------------------------------
   # Core Languages
   # --------------------------------------------------------------------------
   languages.rust = {
     enable = true;
-    channel = "stable";
+    # Read the same file rustup reads, so a devenv shell and a plain `cargo`
+    # invocation always agree. `channel`/`version` cannot be combined with this.
+    toolchainFile = ./rust-toolchain.toml;
   };
 
   languages.javascript = {
@@ -89,6 +94,10 @@
   ++ lib.optionals pkgs.stdenv.isLinux [
     # Linux-only: faster linking, perf tools
     valgrind
+    # ALSA headers for cpal-based audio (examples/desktop_audio via alsa-sys);
+    # the pre-push examples gate fails without them. CI installs libasound2-dev.
+    pkgs.alsa-lib
+    pkgs.alsa-lib.dev
   ];
 
   # --------------------------------------------------------------------------
@@ -110,8 +119,8 @@
     # Explicitly set PROTOC for build-scripts (e.g., lance-encoding)
     PROTOC = "${pkgs.protobuf}/bin/protoc";
 
-    # Ensure pkg-config can find glib and dbus
-    PKG_CONFIG_PATH = "${pkgs.glib.dev}/lib/pkgconfig:${pkgs.dbus.dev}/lib/pkgconfig:$PKG_CONFIG_PATH";
+    # Ensure pkg-config can find glib, dbus and (on Linux) alsa
+    PKG_CONFIG_PATH = "${pkgs.glib.dev}/lib/pkgconfig:${pkgs.dbus.dev}/lib/pkgconfig${lib.optionalString pkgs.stdenv.isLinux ":${pkgs.alsa-lib.dev}/lib/pkgconfig"}:$PKG_CONFIG_PATH";
   };
 
   # --------------------------------------------------------------------------
@@ -120,7 +129,7 @@
   tasks = {
     "ci:test" = {
       description = "Run full workspace quality gates.";
-      exec = "cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings && cargo nextest run --workspace";
+      exec = "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo nextest run --workspace";
     };
   };
 
@@ -130,7 +139,10 @@
     ws-test.exec = "RUSTC_WRAPPER=sccache cargo nextest run --workspace $@";
     ws-test-ci.exec = "RUSTC_WRAPPER=sccache cargo nextest run --workspace --profile ci $@";
     ws-test-slow.exec = "RUSTC_WRAPPER=sccache cargo test --workspace $@";
-    ws-clippy.exec = "RUSTC_WRAPPER=sccache cargo clippy --workspace $@ -- -D warnings";
+    # --all-targets so tests, examples, and benches are linted too. Without it the
+    # PR-tier clippy gate silently skipped every non-lib target, contradicting the
+    # command documented in AGENTS.md and CONTRIBUTING.md.
+    ws-clippy.exec = "RUSTC_WRAPPER=sccache cargo clippy --workspace --all-targets $@ -- -D warnings";
     ws-summary.exec = ''
       if [ -n "$GITHUB_STEP_SUMMARY" ]; then
         echo "## 🚀 CI Summary" >> "$GITHUB_STEP_SUMMARY"

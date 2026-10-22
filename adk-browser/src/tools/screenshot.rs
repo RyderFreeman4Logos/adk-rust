@@ -82,8 +82,12 @@ impl Tool for ScreenshotTool {
                 .decode(&base64_image)
                 .map_err(|e| adk_core::AdkError::tool(format!("Failed to decode base64: {}", e)))?;
 
-            let part =
-                adk_core::Part::InlineData { mime_type: "image/png".to_string(), data: image_data };
+            let part = adk_core::Part::InlineData {
+                mime_type: "image/png".to_string(),
+                data: image_data,
+                uri: None,
+                annotations: None,
+            };
 
             artifacts.save(artifact_name, &part).await?;
             saved = true;

@@ -15,6 +15,7 @@ readme = "README.md"
 [dependencies]
 adk-core.workspace = true
 adk-telemetry.workspace = true
+adk-tool = { workspace = true, optional = true }
 adk-skill = { workspace = true, optional = true }
 adk-guardrail = { workspace = true, optional = true }
 adk-plugin = { workspace = true, optional = true }
@@ -29,24 +30,40 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 schemars = "1.0"
-jsonschema = { version = "0.28", default-features = false }
+jsonschema = { workspace = true }
 cron = { version = "0.15", optional = true }
 notify = { version = "8", optional = true }
 axum = { version = "0.8", optional = true }
+# Graceful shutdown for the webhook trigger's owned HTTP listener.
+tokio-util = { version = "0.7", optional = true }
+tempfile = { version = "3", optional = true }
 
 [features]
 default = ["skills"]
 guardrails = ["adk-guardrail"]
 enhanced-plugins = ["dep:adk-plugin"]
 skills = ["dep:adk-skill"]
+# Google ADK-style L1/L2/L3 skill tools. Existing `skills` continues to use
+# prompt injection unless callers explicitly register a SkillToolset.
+skills-progressive-disclosure = ["skills", "adk-skill/progressive-disclosure"]
 sandbox = ["dep:adk-sandbox", "adk-sandbox/workspace"]
 coding = ["dep:adk-devtools"]
 codeact = []
+team-tools = ["dep:adk-tool"]
 record-payloads = []
-ambient = ["dep:cron", "dep:notify", "dep:axum"]
+ambient = [
+    "dep:cron",
+    "dep:notify",
+    "dep:axum",
+    "dep:tokio-util",
+    "dep:tempfile",
+]
 
 [dev-dependencies]
+# Drives the webhook trigger over real HTTP in the trust-boundary tests.
+reqwest = { workspace = true }
 # Internal dev-deps are path-only (no version) so cargo strips them from the
 # published manifest — they can never block or reorder a crates.io publish.
 adk-model = { path = "../adk-model", features = ["gemini", "gemini-interactions", "openai"] }
@@ -57,4 +74,9 @@ anyhow = "1"
 dotenvy = "0.15"
 proptest = "1.5"
 tempfile = "3"
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `rt-multi-thread`: the span-parenting regression test must run on a
+# multi-threaded runtime — a current-thread runtime can mask the thread-affinity
+# half of the bug it covers.
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+# Capture layer for the span-parenting regression test.
+tracing-subscriber = { workspace = true }

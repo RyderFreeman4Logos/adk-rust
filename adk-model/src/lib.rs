@@ -13,7 +13,7 @@
 //! - [`GeminiModel`] - Google's Gemini models (3 Pro, 2.5 Flash, etc.)
 //! - `OpenAIClient` - OpenAI models (GPT-5, GPT-5-mini, o3, etc.) — requires `openai` feature
 //! - `AzureOpenAIClient` - Azure OpenAI Service — requires `openai` feature
-//! - `OpenAICompatible` - Any OpenAI-compatible API (xAI, Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, or custom) — requires `openai` feature, use `OpenAICompatibleConfig` presets
+//! - `OpenAICompatible` - Any OpenAI-compatible API (xAI, Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, OrcaRouter, or custom) — requires `openai` feature, use `OpenAICompatibleConfig` presets
 //! - `AnthropicClient` - Anthropic Claude models — requires `anthropic` feature
 //! - `DeepSeekClient` - DeepSeek models — requires `deepseek` feature
 //! - `GroqClient` - Groq ultra-fast inference — requires `groq` feature
@@ -101,7 +101,7 @@
 //! let reasoner = DeepSeekClient::reasoner(std::env::var("DEEPSEEK_API_KEY").unwrap()).unwrap();
 //! ```
 //!
-//! ### OpenAI-Compatible Providers (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI)
+//! ### OpenAI-Compatible Providers (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI, OrcaRouter)
 //!
 //! All OpenAI-compatible providers use `OpenAICompatible` with provider presets:
 //!
@@ -164,42 +164,35 @@
 //! ### Gemini
 //! | Model | Description |
 //! |-------|-------------|
-//! | `gemini-3-pro-preview` | Most intelligent, complex agentic workflows (1M context) |
-//! | `gemini-3-flash-preview` | Frontier intelligence at Flash speed (1M context) |
-//! | `gemini-2.5-pro` | Advanced reasoning and multimodal (1M context) |
-//! | `gemini-2.5-flash` | Balanced speed and capability, recommended (1M context) |
-//! | `gemini-2.5-flash-lite` | Ultra-fast for high-volume tasks (1M context) |
+//! | `gemini-3.7-flash` | Current balanced default (1M context) |
+//! | `gemini-3.6-flash` | Previous balanced generation (1M context) |
+//! | `gemini-3.5-flash-lite` | Cost-efficient high-volume model (1M context) |
 //!
 //! ### OpenAI
 //! | Model | Description |
 //! |-------|-------------|
-//! | `gpt-5` | Strongest coding and agentic model with adaptive reasoning |
-//! | `gpt-5-mini` | Efficient variant for most tasks |
-//! | `o3` | Advanced reasoning model for complex problem solving |
-//! | `o4-mini` | Efficient reasoning model (200K context) |
-//! | `gpt-4.1` | General purpose model with 1M context |
+//! | `gpt-5.6-terra` | Balanced default for agents |
+//! | `gpt-5.6-sol` | Flagship reasoning and coding |
+//! | `gpt-5.6-luna` | Cost-efficient high-volume model |
 //!
 //! ### Anthropic
 //! | Model | Description |
 //! |-------|-------------|
-//! | `claude-opus-4-5-20251101` | Most capable for complex autonomous tasks |
-//! | `claude-sonnet-4-5-20250929` | Best balance of intelligence, speed, and cost |
-//! | `claude-haiku-4-5-20251001` | Ultra-efficient for high-volume workloads |
-//! | `claude-opus-4-20250514` | Hybrid model with extended thinking |
-//! | `claude-sonnet-4-20250514` | Balanced model with extended thinking |
+//! | `claude-sonnet-5` | Balanced default |
+//! | `claude-opus-5` | Flagship capability |
+//! | `claude-fable-5` | Premium creative and long-form work |
 //!
 //! ### DeepSeek
 //! | Model | Description |
 //! |-------|-------------|
-//! | `deepseek-chat` | V3.2 non-thinking mode for fast general-purpose tasks |
-//! | `deepseek-reasoner` | V3.2 thinking mode with chain-of-thought reasoning |
+//! | `deepseek-flash` | Fast balanced default |
+//! | `deepseek-v4-pro` | Advanced reasoning |
 //!
 //! ### Groq
 //! | Model | Description |
 //! |-------|-------------|
-//! | `meta-llama/llama-4-scout-17b-16e-instruct` | Llama 4 Scout via Groq LPU |
-//! | `llama-3.3-70b-versatile` | Versatile large model |
-//! | `llama-3.1-8b-instant` | Ultra-fast at 560 T/s |
+//! | `openai/gpt-oss-120b` | Production default via Groq LPU |
+//! | `openai/gpt-oss-20b` | Lower-latency economy model |
 //!
 //! ### OpenAI-Compatible Providers (via `openai` feature)
 //!
@@ -214,6 +207,7 @@
 //! | Cerebras | `OpenAICompatibleConfig::cerebras()` | `CEREBRAS_API_KEY` |
 //! | SambaNova | `OpenAICompatibleConfig::sambanova()` | `SAMBANOVA_API_KEY` |
 //! | xAI (Grok) | `OpenAICompatibleConfig::xai()` | `XAI_API_KEY` |
+//! | OrcaRouter | `OpenAICompatibleConfig::orcarouter()` | `ORCAROUTER_API_KEY` |
 //!
 //! ### Other Providers
 //!
@@ -260,6 +254,8 @@ pub(crate) mod attachment;
 pub mod azure_ai;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
+/// Curated provider model catalog, lifecycle metadata, and recommended defaults.
+pub mod catalog;
 #[cfg(feature = "deepseek")]
 pub mod deepseek;
 /// Gemini model provider (Google AI Studio and Vertex AI).
@@ -275,12 +271,28 @@ pub mod ollama;
 pub mod openai;
 #[cfg(feature = "openai")]
 pub mod openai_compatible;
+#[cfg(feature = "opencode")]
+pub mod opencode;
 #[cfg(feature = "openrouter")]
 pub mod openrouter;
+/// Conversion outcomes for content parts sent to a provider.
+pub mod part_conversion;
+
 /// Canonical provider identifiers and metadata.
 pub mod provider;
 /// Retry logic with exponential backoff for transient provider errors.
 pub mod retry;
+#[cfg(any(feature = "openai", feature = "deepseek", feature = "azure-ai"))]
+mod sse;
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "deepseek",
+    feature = "groq",
+    feature = "bedrock",
+    feature = "azure-ai"
+))]
+pub(crate) mod tool_args;
 pub mod tool_call_parser;
 #[cfg(any(
     feature = "openai",
@@ -311,7 +323,9 @@ pub use ollama::{OllamaConfig, OllamaModel};
 #[cfg(feature = "openai")]
 pub use openai::{AzureConfig, AzureOpenAIClient, OpenAIClient, OpenAIConfig, ReasoningEffort};
 #[cfg(feature = "openai")]
-pub use openai_compatible::{OpenAICompatible, OpenAICompatibleConfig};
+pub use openai_compatible::{OpenAICompatible, OpenAICompatibleConfig, ReasoningReplayField};
+#[cfg(feature = "opencode")]
+pub use opencode::{OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeService};
 #[cfg(feature = "openrouter")]
 pub use openrouter::{OpenRouterApiMode, OpenRouterClient, OpenRouterConfig};
 pub use provider::ModelProvider;

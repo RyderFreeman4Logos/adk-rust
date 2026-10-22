@@ -8,7 +8,7 @@ This is assembled from a few focused pieces rather than a monolithic framework:
 
 | Piece | What it gives you | Page |
 |-------|-------------------|------|
-| **`adk-devtools`** | The inner-loop tools — `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash` — scoped to a sandboxed workspace | [Dev tools](devtools.md) |
+| **`adk-devtools`** | The inner-loop tools — `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash` — scoped to a workspace directory | [Dev tools](devtools.md) |
 | **`CodingAgent`** (in `adk-agent`, feature `coding`) | A one-call harness wiring those tools + a planning `write_todos` tool + a minimal prompt onto an `LlmAgent` | [Harness](harness.md) |
 | **CLI** (`adk-rust code` / `goal` / `ultracode`) | Native commands: one-shot tasks, autonomous goal mode, and parallel ultra-review | [CLI](cli.md) |
 | **Graph workflows** (`adk-graph`) | Fan out to parallel specialist agents and synthesize — the "ultra" pattern | [Workflows](workflows.md) |
@@ -35,11 +35,11 @@ This is assembled from a few focused pieces rather than a monolithic framework:
 
 ```toml
 # The harness (pulls in the dev tools) + a model provider
-adk-agent = { version = "2.0.0", features = ["coding"] }
-adk-devtools = "2.0.0"
-adk-model = { version = "2.0.0", features = ["gemini"] }
-adk-runner = "2.0.0"
-adk-session = "2.0.0"
+adk-agent = { version = "2.3.0", features = ["coding"] }
+adk-devtools = "2.3.0"
+adk-model = { version = "2.3.0", features = ["gemini"] }
+adk-runner = "2.3.0"
+adk-session = "2.3.0"
 ```
 
 The dev tools are sandbox-first and have no heavy dependencies, so the footprint
@@ -56,7 +56,7 @@ use adk_core::{Content, SessionId, UserId};
 use std::sync::Arc;
 
 # async fn run(model: std::sync::Arc<dyn adk_core::Llm>) -> anyhow::Result<()> {
-// One call builds a coding agent over a sandboxed workspace.
+// One call builds a coding agent over a confined workspace.
 let coding = CodingAgent::builder()
     .model(model)
     .workspace(Workspace::new("./my-repo"))

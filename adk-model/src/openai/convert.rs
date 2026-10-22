@@ -7,18 +7,20 @@ use adk_core::{
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestMessageContentPartAudio, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTool, ChatCompletionTools, CreateChatCompletionResponse,
-    FinishReason as OaiFinishReason, FunctionCall, FunctionObject, ImageDetail, ImageUrl,
-    InputAudio, InputAudioFormat,
+    ChatCompletionRequestMessageContentPartAudio, ChatCompletionRequestMessageContentPartFile,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionTool, ChatCompletionTools,
+    CreateChatCompletionResponse, FinishReason as OaiFinishReason, FunctionCall, FunctionObject,
+    ImageDetail, ImageUrl, InputAudio, InputAudioFormat,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Convert ADK Content to OpenAI ChatCompletionRequestMessage.
-pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
+///
+/// `native_pdf` sends inline PDFs as `file` parts; without it they become text.
+pub fn content_to_message(content: &Content, native_pdf: bool) -> ChatCompletionRequestMessage {
     match content.role.as_str() {
         "user" => {
             let has_attachments = content
@@ -35,25 +37,17 @@ pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
                                 ChatCompletionRequestMessageContentPartText { text: text.clone() },
                             ))
                         }
-                        Part::Thinking { thinking, .. } => {
-                            Some(ChatCompletionRequestUserMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText {
-                                    text: thinking.clone(),
-                                },
-                            ))
-                        }
-                        Part::InlineData { mime_type, data } => {
-                            Some(inline_data_part_to_openai(mime_type, data))
-                        }
-                        Part::FileData { mime_type, file_uri } => {
+                        Part::InlineData { mime_type, data, uri, .. } => Some(
+                            inline_data_part_to_openai(mime_type, data, uri.as_deref(), native_pdf),
+                        ),
+                        Part::FileData { mime_type, file_uri, .. } => {
                             if mime_type.starts_with("image/") {
                                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                                     ChatCompletionRequestMessageContentPartImage {
                                         // Emit an explicit "auto" (the API default) rather than
-                                        // leaving `detail` as `None`. async-openai 0.33's `ImageUrl`
-                                        // has no `skip_serializing_if`, so `None` serializes as an
-                                        // explicit `"detail": null`, which strict OpenAI-compatible
-                                        // gateways reject with HTTP 400. See issue #395.
+                                        // relying on dependency serialization defaults. This keeps
+                                        // requests compatible with strict OpenAI-compatible gateways
+                                        // that reject `"detail": null`. See issue #395.
                                         image_url: ImageUrl {
                                             url: file_uri.clone(),
                                             detail: Some(ImageDetail::Auto),
@@ -126,7 +120,9 @@ pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
         }
         "function" | "tool" => {
             // Tool response message
-            if let Some(Part::FunctionResponse { function_response, id }) = content.parts.first() {
+            if let Some(Part::FunctionResponse { function_response, id, .. }) =
+                content.parts.first()
+            {
                 let tool_call_id = id.clone().unwrap_or_else(|| "unknown".to_string());
                 ChatCompletionRequestToolMessageArgs::default()
                     .tool_call_id(tool_call_id)
@@ -157,6 +153,8 @@ pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
 fn inline_data_part_to_openai(
     mime_type: &str,
     data: &[u8],
+    uri: Option<&str>,
+    native_pdf: bool,
 ) -> ChatCompletionRequestUserMessageContentPart {
     if mime_type.starts_with("image/") {
         let data_uri = format!("data:{mime_type};base64,{}", attachment::encode_base64(data));
@@ -167,6 +165,24 @@ fn inline_data_part_to_openai(
                 image_url: ImageUrl { url: data_uri, detail: Some(ImageDetail::Auto) },
             },
         );
+    }
+
+    if native_pdf && mime_type == "application/pdf" {
+        // async-openai 0.41.1 exposes this wire type through Deserialize only.
+        let file = serde_json::from_value(serde_json::json!({
+            "file_data": format!("data:{mime_type};base64,{}", attachment::encode_base64(data)),
+            "filename": attachment::pdf_filename(uri),
+        }));
+        match file {
+            Ok(file) => {
+                return ChatCompletionRequestUserMessageContentPart::File(
+                    ChatCompletionRequestMessageContentPartFile { file },
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "inline pdf could not be encoded as a file part; sending it as text");
+            }
+        }
     }
 
     if let Some(audio_format) = input_audio_format(mime_type) {
@@ -199,11 +215,26 @@ fn extract_text(parts: &[Part]) -> String {
         .iter()
         .filter_map(|p| match p {
             Part::Text { text } => Some(text.clone()),
-            Part::Thinking { thinking, .. } => Some(thinking.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Extract reasoning content without mixing it into the visible message body.
+pub(crate) fn extract_reasoning_content(parts: &[Part]) -> Option<String> {
+    let reasoning = parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                Some(thinking.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if reasoning.is_empty() { None } else { Some(reasoning) }
 }
 
 /// Get text content if any exists.
@@ -238,8 +269,10 @@ pub fn convert_tools(
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Vec<ChatCompletionTools> {
+    let mut tools = tools.iter().collect::<Vec<_>>();
+    tools.sort_unstable_by_key(|(name, _)| *name);
     tools
-        .iter()
+        .into_iter()
         .map(|(name, decl)| {
             let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 
@@ -251,7 +284,7 @@ pub fn convert_tools(
             let parameters = decl
                 .get("parameters")
                 .cloned()
-                .map(|schema| cache.get_or_normalize(&schema, adapter))
+                .map(|schema| cache.normalize(&schema))
                 .or_else(|| Some(adapter.empty_schema()));
 
             ChatCompletionTools::Function(ChatCompletionTool {
@@ -272,35 +305,48 @@ pub fn convert_tools(
 /// goes through `async-openai`'s typed client.
 #[allow(dead_code)]
 pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse {
-    let content = resp.choices.first().map(|choice| {
-        let mut parts = Vec::new();
+    let content = resp
+        .choices
+        .first()
+        .map(|choice| -> Result<Content, String> {
+            let mut parts = Vec::new();
 
-        // Add text content (skip empty strings from reasoning models)
-        if let Some(text) = &choice.message.content
-            && !text.is_empty()
-        {
-            parts.push(Part::Text { text: text.clone() });
-        }
+            // Add text content (skip empty strings from reasoning models)
+            if let Some(text) = &choice.message.content
+                && !text.is_empty()
+            {
+                parts.push(Part::Text { text: text.clone() });
+            }
 
-        // Add tool calls with IDs
-        if let Some(tool_calls) = &choice.message.tool_calls {
-            for tc in tool_calls {
-                if let ChatCompletionMessageToolCalls::Function(func_call) = tc {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&func_call.function.arguments)
-                            .unwrap_or(serde_json::json!({}));
-                    parts.push(Part::FunctionCall {
-                        name: func_call.function.name.clone(),
-                        args,
-                        id: Some(func_call.id.clone()),
-                        thought_signature: None,
-                    });
+            // Add tool calls with IDs
+            if let Some(tool_calls) = &choice.message.tool_calls {
+                for tc in tool_calls {
+                    if let ChatCompletionMessageToolCalls::Function(func_call) = tc {
+                        let encoded =
+                            serde_json::Value::String(func_call.function.arguments.clone());
+                        let args = decode_tool_call_arguments(Some(&encoded)).map_err(|error| {
+                            format!(
+                                "invalid arguments for tool '{}': {error}",
+                                func_call.function.name
+                            )
+                        })?;
+                        parts.push(Part::FunctionCall {
+                            name: func_call.function.name.clone(),
+                            args,
+                            id: Some(func_call.id.clone()),
+                            thought_signature: None,
+                        });
+                    }
                 }
             }
-        }
 
-        Content { role: "model".to_string(), parts }
-    });
+            Ok(Content { role: "model".to_string(), parts })
+        })
+        .transpose();
+    let (content, argument_error) = match content {
+        Ok(content) => (content, None),
+        Err(error) => (None, Some(error)),
+    };
 
     let usage_metadata = resp.usage.as_ref().map(|u| {
         let mut meta = UsageMetadata {
@@ -327,6 +373,13 @@ pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse 
         OaiFinishReason::ContentFilter => FinishReason::Safety,
         OaiFinishReason::FunctionCall => FinishReason::Stop,
     });
+    let tool_call_turn = argument_error.is_none()
+        && (resp.choices.first().is_some_and(|choice| {
+            matches!(
+                choice.finish_reason,
+                Some(OaiFinishReason::ToolCalls | OaiFinishReason::FunctionCall)
+            )
+        }) || content.as_ref().is_some_and(Content::has_function_calls));
 
     LlmResponse {
         content,
@@ -334,109 +387,118 @@ pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse 
         finish_reason,
         citation_metadata: None,
         partial: false,
-        turn_complete: true,
+        turn_complete: argument_error.is_some() || !tool_call_turn,
         interrupted: false,
-        error_code: None,
-        error_message: None,
+        error_code: argument_error
+            .as_ref()
+            .map(|_| "model.openai.invalid_tool_arguments".to_owned()),
+        error_message: argument_error,
         provider_metadata: None,
         interaction_id: None,
     }
 }
 
+/// Normalize one raw Chat Completions `usage` object while retaining the
+/// provider payload for diagnostics and future provider-specific projections.
+pub(crate) fn usage_metadata_from_raw(usage: &serde_json::Value) -> Option<UsageMetadata> {
+    let usage = usage.as_object()?;
+    let prompt_details = usage.get("prompt_tokens_details");
+    let completion_details = usage.get("completion_tokens_details");
+
+    Some(UsageMetadata {
+        prompt_token_count: json_i32(usage.get("prompt_tokens")).unwrap_or_default(),
+        candidates_token_count: json_i32(usage.get("completion_tokens")).unwrap_or_default(),
+        total_token_count: json_i32(usage.get("total_tokens")).unwrap_or_default(),
+        cache_read_input_token_count: prompt_details
+            .and_then(|details| json_i32(details.get("cached_tokens"))),
+        cache_creation_input_token_count: prompt_details
+            .and_then(|details| json_i32(details.get("cache_write_tokens"))),
+        thinking_token_count: completion_details
+            .and_then(|details| json_i32(details.get("reasoning_tokens"))),
+        audio_input_token_count: prompt_details
+            .and_then(|details| json_i32(details.get("audio_tokens"))),
+        audio_output_token_count: completion_details
+            .and_then(|details| json_i32(details.get("audio_tokens"))),
+        provider_usage: Some(serde_json::Value::Object(usage.clone())),
+        ..Default::default()
+    })
+}
+
+fn json_i32(value: Option<&serde_json::Value>) -> Option<i32> {
+    i32::try_from(value?.as_i64()?).ok()
+}
+
 /// Convert a raw OpenAI JSON response to ADK LlmResponse.
 ///
 /// Unlike [`from_openai_response`], this parses the raw JSON directly so it can
-/// extract fields that `async-openai` 0.33 does not model, such as
-/// `reasoning_content` returned by reasoning models (o3, gpt-5-mini, etc.).
-pub fn from_raw_openai_response(json: &serde_json::Value) -> LlmResponse {
+/// extract fields that `async-openai` does not model, such as `reasoning_content`
+/// returned by reasoning models (o3, gpt-5-mini, etc.).
+///
+/// Text-encoded tool calls are recognised only for tools in `declared_tools`.
+pub(crate) fn from_raw_openai_response(
+    json: &serde_json::Value,
+    declared_tools: &HashSet<String>,
+) -> Result<LlmResponse, String> {
     let choice = json.get("choices").and_then(|c| c.get(0));
 
-    let content = choice.map(|choice| {
-        let message = &choice["message"];
-        let mut parts = Vec::new();
+    let content = choice
+        .map(|choice| -> Result<Content, String> {
+            let message = &choice["message"];
+            let mut parts = Vec::new();
 
-        // Extract reasoning_content (returned by reasoning models like o3, gpt-5-mini)
-        // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
-        let reasoning = message
-            .get("reasoning_content")
-            .or_else(|| message.get("reasoning"))
-            .and_then(|v| v.as_str());
-        if let Some(reasoning) = reasoning
-            && !reasoning.is_empty()
-        {
-            parts.push(Part::Thinking { thinking: reasoning.to_string(), signature: None });
-        }
-
-        // Extract visible text content (skip empty strings)
-        if let Some(text) = message.get("content").and_then(|v| v.as_str())
-            && !text.is_empty()
-        {
-            // Check for text-based tool calls (Qwen, Llama, Mistral Nemo format)
-            // before adding as plain text
-            if let Some(parsed_parts) = crate::tool_call_parser::parse_text_tool_calls(text) {
-                parts.extend(parsed_parts);
-            } else {
-                parts.push(Part::Text { text: text.to_string() });
+            // Extract reasoning_content (returned by reasoning models like o3, gpt-5-mini)
+            // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
+            let reasoning = message
+                .get("reasoning_content")
+                .or_else(|| message.get("reasoning"))
+                .and_then(|v| v.as_str());
+            if let Some(reasoning) = reasoning
+                && !reasoning.is_empty()
+            {
+                parts.push(Part::Thinking { thinking: reasoning.to_string(), signature: None });
             }
-        }
 
-        // Extract structured tool calls (OpenAI native format)
-        if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
-            for tc in tool_calls {
-                let func = &tc["function"];
-                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                    let args: serde_json::Value = func
-                        .get("arguments")
-                        .and_then(|a| a.as_str())
-                        .and_then(|a| serde_json::from_str(a).ok())
-                        .unwrap_or(serde_json::json!({}));
-                    let id = tc.get("id").and_then(|i| i.as_str()).map(String::from);
-                    parts.push(Part::FunctionCall {
-                        name: name.to_string(),
-                        args,
-                        id,
-                        thought_signature: None,
-                    });
+            // Extract visible text content (skip empty strings)
+            if let Some(text) = message.get("content").and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                // Check for text-based tool calls (Qwen, Llama, Mistral Nemo format)
+                // to declared tools before adding as plain text
+                if let Some(parsed_parts) =
+                    crate::tool_call_parser::parse_declared_tool_calls(text, declared_tools)
+                {
+                    parts.extend(parsed_parts);
+                } else {
+                    parts.push(Part::Text { text: text.to_string() });
                 }
             }
-        }
 
-        Content { role: "model".to_string(), parts }
-    });
+            // Extract structured tool calls (OpenAI native format)
+            if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tool_calls {
+                    let func = &tc["function"];
+                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                        let args =
+                            decode_tool_call_arguments(func.get("arguments")).map_err(|error| {
+                                format!("invalid arguments for tool '{name}': {error}")
+                            })?;
+                        let id = tc.get("id").and_then(|i| i.as_str()).map(String::from);
+                        parts.push(Part::FunctionCall {
+                            name: name.to_string(),
+                            args,
+                            id,
+                            thought_signature: None,
+                        });
+                    }
+                }
+            }
+
+            Ok(Content { role: "model".to_string(), parts })
+        })
+        .transpose()?;
 
     // Parse usage metadata
-    let usage_metadata = json.get("usage").map(|u| {
-        let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let completion_tokens =
-            u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let total_tokens = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-
-        let prompt_details = u.get("prompt_tokens_details");
-        let completion_details = u.get("completion_tokens_details");
-
-        UsageMetadata {
-            prompt_token_count: prompt_tokens,
-            candidates_token_count: completion_tokens,
-            total_token_count: total_tokens,
-            cache_read_input_token_count: prompt_details
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            thinking_token_count: completion_details
-                .and_then(|d| d.get("reasoning_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            audio_input_token_count: prompt_details
-                .and_then(|d| d.get("audio_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            audio_output_token_count: completion_details
-                .and_then(|d| d.get("audio_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            ..Default::default()
-        }
-    });
+    let usage_metadata = json.get("usage").and_then(usage_metadata_from_raw);
 
     // Parse finish reason
     let finish_reason =
@@ -448,21 +510,28 @@ pub fn from_raw_openai_response(json: &serde_json::Value) -> LlmResponse {
             "function_call" => FinishReason::Stop,
             _ => FinishReason::Stop,
         });
+    let tool_call_turn = choice
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|reason| matches!(reason, "tool_calls" | "function_call"))
+        || content.as_ref().is_some_and(Content::has_function_calls);
 
-    LlmResponse {
+    Ok(LlmResponse {
         content,
         usage_metadata,
         finish_reason,
         citation_metadata: None,
         partial: false,
-        turn_complete: true,
+        turn_complete: !tool_call_turn,
         interrupted: false,
         error_code: None,
         error_message: None,
         provider_metadata: None,
         interaction_id: None,
-    }
+    })
 }
+
+pub(crate) use crate::tool_args::decode_tool_call_arguments;
 
 #[cfg(test)]
 mod tests {
@@ -478,18 +547,41 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_text_excludes_thinking() {
+        let parts = vec![
+            Part::Thinking { thinking: "private reasoning".to_string(), signature: None },
+            Part::Text { text: "visible answer".to_string() },
+        ];
+
+        assert_eq!(extract_text(&parts), "visible answer");
+        assert_eq!(extract_reasoning_content(&parts).as_deref(), Some("private reasoning"));
+    }
+
+    #[test]
+    fn test_assistant_message_does_not_expose_thinking() {
+        let content = Content {
+            role: "assistant".to_string(),
+            parts: vec![
+                Part::Thinking { thinking: "private reasoning".to_string(), signature: None },
+                Part::Text { text: "visible answer".to_string() },
+            ],
+        };
+
+        let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
+        assert_eq!(message["content"], "visible answer");
+        assert!(!message.to_string().contains("private reasoning"));
+    }
+
+    #[test]
     fn test_user_message_with_inline_data_produces_array_content() {
         let content = Content {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "What is in this image?".to_string() },
-                Part::InlineData {
-                    mime_type: "image/png".to_string(),
-                    data: vec![0x89, 0x50, 0x4E, 0x47], // PNG magic bytes
-                },
+                Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]), // PNG magic bytes
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         // Should produce a user message with Array content (not Text)
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
@@ -519,16 +611,47 @@ mod tests {
     }
 
     #[test]
+    fn test_user_message_with_attachment_does_not_expose_thinking() {
+        let content = Content {
+            role: "user".to_string(),
+            parts: vec![
+                Part::Thinking { thinking: "private reasoning".to_string(), signature: None },
+                Part::Text { text: "Describe this".to_string() },
+                Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
+            ],
+        };
+        let message = content_to_message(&content, false);
+
+        let ChatCompletionRequestMessage::User(user_message) = message else {
+            panic!("Expected User message");
+        };
+        let ChatCompletionRequestUserMessageContent::Array(parts) = user_message.content else {
+            panic!("Expected Array content");
+        };
+
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0],
+            ChatCompletionRequestUserMessageContentPart::Text(text) if text.text == "Describe this"
+        ));
+        assert!(!parts.iter().any(|part| matches!(
+            part,
+            ChatCompletionRequestUserMessageContentPart::Text(text)
+                if text.text.contains("private reasoning")
+        )));
+    }
+
+    #[test]
     fn test_user_message_with_multiple_attachments() {
         let content = Content {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "Compare these".to_string() },
-                Part::InlineData { mime_type: "image/jpeg".to_string(), data: vec![0xFF, 0xD8] },
-                Part::InlineData { mime_type: "image/png".to_string(), data: vec![0x89, 0x50] },
+                Part::inline_data("image/jpeg", vec![0xFF, 0xD8]),
+                Part::inline_data("image/png", vec![0x89, 0x50]),
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -547,13 +670,10 @@ mod tests {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "Transcribe this".to_string() },
-                Part::InlineData {
-                    mime_type: "audio/wav".to_string(),
-                    data: vec![0x52, 0x49, 0x46, 0x46],
-                },
+                Part::inline_data("audio/wav", vec![0x52, 0x49, 0x46, 0x46]),
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -571,31 +691,55 @@ mod tests {
     }
 
     #[test]
-    fn test_user_message_with_pdf_inline_data_falls_back_to_text_part() {
+    fn pdf_inline_data_uses_file_part_for_openai() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::InlineData {
-                mime_type: "application/pdf".to_string(),
-                data: b"%PDF".to_vec(),
-            }],
+            parts: vec![
+                Part::inline_data("application/pdf", b"%PDF".to_vec()),
+                Part::InlineData {
+                    mime_type: "application/pdf".to_string(),
+                    data: b"%PDF".to_vec(),
+                    uri: Some("https://example.com/files/q3-report.pdf?sig=abc".to_string()),
+                    annotations: None,
+                },
+            ],
         };
-        let msg = content_to_message(&content);
-
-        if let ChatCompletionRequestMessage::User(user_msg) = &msg {
-            if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
-                assert_eq!(parts.len(), 1);
-                if let ChatCompletionRequestUserMessageContentPart::Text(text_part) = &parts[0] {
-                    assert!(text_part.text.contains("application/pdf"));
-                    assert!(text_part.text.contains("encoding=\"base64\""));
-                } else {
-                    panic!("Expected fallback text part for pdf inline data");
+        let message = serde_json::to_value(content_to_message(&content, true)).unwrap();
+        assert_eq!(
+            message["content"],
+            serde_json::json!([
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "document.pdf",
+                        "file_data": "data:application/pdf;base64,JVBERg=="
+                    }
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "q3-report.pdf",
+                        "file_data": "data:application/pdf;base64,JVBERg=="
+                    }
                 }
-            } else {
-                panic!("Expected Array content");
-            }
-        } else {
-            panic!("Expected User message");
-        }
+            ])
+        );
+    }
+
+    #[test]
+    fn pdf_inline_data_falls_back_to_text_for_other_compatible_providers() {
+        let content = Content {
+            role: "user".to_string(),
+            parts: vec![Part::inline_data("application/pdf", b"%PDF".to_vec())],
+        };
+        let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
+        assert_eq!(
+            message["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "<attachment mime_type=\"application/pdf\" encoding=\"base64\">JVBERg==</attachment>"
+            }])
+        );
     }
 
     #[test]
@@ -605,9 +749,10 @@ mod tests {
             parts: vec![Part::FileData {
                 mime_type: "application/pdf".to_string(),
                 file_uri: "https://example.com/report.pdf".to_string(),
+                annotations: None,
             }],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -635,10 +780,11 @@ mod tests {
                 Part::FileData {
                     mime_type: "image/jpeg".to_string(),
                     file_uri: "https://example.com/photo.jpg".to_string(),
+                    annotations: None,
                 },
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -664,7 +810,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::Text { text: "Hello".to_string() }],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             assert!(matches!(
@@ -674,6 +820,68 @@ mod tests {
         } else {
             panic!("Expected User message");
         }
+    }
+
+    #[test]
+    fn typed_response_normalizes_empty_tool_arguments() {
+        let response: CreateChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl_empty",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "compatible-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": {"name": "no_args", "arguments": "null"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("typed response should deserialize");
+
+        let converted = from_openai_response(&response);
+        let parts = converted.content.expect("tool content").parts;
+        assert!(matches!(
+            &parts[0],
+            Part::FunctionCall { args, .. } if args == &serde_json::json!({})
+        ));
+        assert!(converted.error_code.is_none());
+        assert!(!converted.turn_complete);
+    }
+
+    #[test]
+    fn typed_response_surfaces_malformed_tool_arguments() {
+        let response: CreateChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl_invalid",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "compatible-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_invalid",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{\"command\":\""}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("typed response should deserialize");
+
+        let converted = from_openai_response(&response);
+        assert_eq!(converted.error_code.as_deref(), Some("model.openai.invalid_tool_arguments"));
+        assert!(converted.content.is_none());
+        assert!(converted.turn_complete);
     }
 
     #[test]
@@ -695,7 +903,7 @@ mod tests {
             }
         });
 
-        let resp = from_raw_openai_response(&json);
+        let resp = from_raw_openai_response(&json, &HashSet::new()).expect("response should parse");
         let content = resp.content.unwrap();
         assert_eq!(content.parts.len(), 2);
         assert!(
@@ -703,6 +911,56 @@ mod tests {
         );
         assert!(matches!(&content.parts[1], Part::Text { text } if text == "Hello!"));
         assert_eq!(resp.usage_metadata.unwrap().thinking_token_count, Some(40));
+    }
+
+    fn raw_text_response(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }]
+        })
+    }
+
+    #[test]
+    fn json_fence_without_declared_tools_stays_text() {
+        let text = "```json\n{\"name\":\"Alice\",\"age\":30}\n```";
+
+        let resp = from_raw_openai_response(&raw_text_response(text), &HashSet::new()).unwrap();
+
+        assert_eq!(resp.content.unwrap().parts, vec![Part::Text { text: text.to_string() }]);
+    }
+
+    #[test]
+    fn json_fence_naming_no_declared_tool_stays_text() {
+        let text = "```json\n{\"name\":\"Alice\",\"age\":30}\n```";
+        let declared = HashSet::from(["lookup".to_string()]);
+
+        let resp = from_raw_openai_response(&raw_text_response(text), &declared).unwrap();
+
+        assert_eq!(resp.content.unwrap().parts, vec![Part::Text { text: text.to_string() }]);
+    }
+
+    #[test]
+    fn json_fence_calling_declared_tool_parses_and_keeps_trailing_text() {
+        let text =
+            "```json\n{\"name\":\"lookup\",\"arguments\":{\"id\":7}}\n```\nThen I will summarize.";
+        let declared = HashSet::from(["lookup".to_string()]);
+
+        let resp = from_raw_openai_response(&raw_text_response(text), &declared).unwrap();
+
+        assert_eq!(
+            resp.content.unwrap().parts,
+            vec![
+                Part::FunctionCall {
+                    name: "lookup".to_string(),
+                    args: serde_json::json!({"id": 7}),
+                    id: None,
+                    thought_signature: None,
+                },
+                Part::Text { text: "\nThen I will summarize.".to_string() },
+            ]
+        );
     }
 
     #[test]
@@ -723,7 +981,7 @@ mod tests {
             }
         });
 
-        let resp = from_raw_openai_response(&json);
+        let resp = from_raw_openai_response(&json, &HashSet::new()).expect("response should parse");
         let content = resp.content.unwrap();
         assert!(content.parts.is_empty(), "empty text should be filtered out");
         assert_eq!(resp.finish_reason, Some(FinishReason::MaxTokens));
@@ -750,7 +1008,7 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30 }
         });
 
-        let resp = from_raw_openai_response(&json);
+        let resp = from_raw_openai_response(&json, &HashSet::new()).expect("response should parse");
         let content = resp.content.unwrap();
         assert_eq!(content.parts.len(), 1);
         if let Part::FunctionCall { name, args, id, .. } = &content.parts[0] {
@@ -760,6 +1018,116 @@ mod tests {
         } else {
             panic!("Expected FunctionCall part");
         }
+        assert!(!resp.turn_complete, "tool-call turns must remain open for execution");
+    }
+
+    #[test]
+    fn test_raw_response_accepts_structured_and_empty_tool_arguments() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_structured",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": {"command": "pwd"}
+                            }
+                        },
+                        {
+                            "id": "call_empty",
+                            "type": "function",
+                            "function": {
+                                "name": "no_args",
+                                "arguments": "   "
+                            }
+                        },
+                        {
+                            "id": "call_empty_array",
+                            "type": "function",
+                            "function": {
+                                "name": "no_args_array",
+                                "arguments": []
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let response = from_raw_openai_response(&json, &HashSet::new())
+            .expect("compatible arguments should parse");
+        let parts = response.content.expect("tool content").parts;
+        assert!(matches!(
+            &parts[0],
+            Part::FunctionCall { name, args, .. }
+                if name == "bash" && args == &serde_json::json!({"command": "pwd"})
+        ));
+        assert!(matches!(
+            &parts[1],
+            Part::FunctionCall { name, args, .. }
+                if name == "no_args" && args == &serde_json::json!({})
+        ));
+        assert!(matches!(
+            &parts[2],
+            Part::FunctionCall { name, args, .. }
+                if name == "no_args_array" && args == &serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn test_raw_response_rejects_truncated_tool_arguments() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_invalid",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\":\""
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let error = from_raw_openai_response(&json, &HashSet::new())
+            .expect_err("truncated tool arguments must remain invalid");
+        assert!(error.contains("bash"));
+    }
+
+    #[test]
+    fn test_raw_response_rejects_non_empty_array_tool_arguments() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_invalid",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": ["pwd"]
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let error = from_raw_openai_response(&json, &HashSet::new())
+            .expect_err("non-empty array arguments must remain invalid");
+        assert!(error.contains("bash"));
+        assert!(error.contains("array"));
     }
 
     #[test]
@@ -772,7 +1140,7 @@ mod tests {
             "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
         });
 
-        let resp = from_raw_openai_response(&json);
+        let resp = from_raw_openai_response(&json, &HashSet::new()).expect("response should parse");
         let content = resp.content.unwrap();
         assert_eq!(content.parts.len(), 1);
         assert!(matches!(&content.parts[0], Part::Text { text } if text == "Hello there!"));
@@ -780,6 +1148,46 @@ mod tests {
         let usage = resp.usage_metadata.unwrap();
         assert_eq!(usage.prompt_token_count, 5);
         assert_eq!(usage.candidates_token_count, 3);
+    }
+
+    #[test]
+    fn raw_response_preserves_complete_provider_usage() {
+        let provider_usage = serde_json::json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+            "prompt_tokens_details": {
+                "cached_tokens": 80,
+                "cache_write_tokens": 12,
+                "audio_tokens": 4
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 18,
+                "audio_tokens": 2
+            },
+            "provider_meter": {"units": 9}
+        });
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": provider_usage.clone()
+        });
+
+        let response =
+            from_raw_openai_response(&json, &HashSet::new()).expect("response should parse");
+        let usage = response.usage_metadata.expect("usage should be parsed");
+
+        assert_eq!(usage.prompt_token_count, 120);
+        assert_eq!(usage.candidates_token_count, 30);
+        assert_eq!(usage.total_token_count, 150);
+        assert_eq!(usage.cache_read_input_token_count, Some(80));
+        assert_eq!(usage.cache_creation_input_token_count, Some(12));
+        assert_eq!(usage.thinking_token_count, Some(18));
+        assert_eq!(usage.audio_input_token_count, Some(4));
+        assert_eq!(usage.audio_output_token_count, Some(2));
+        assert_eq!(usage.provider_usage, Some(provider_usage));
     }
 
     #[test]
@@ -801,13 +1209,37 @@ mod tests {
         );
 
         let adapter = OpenAiSchemaAdapter;
-        let cache = SchemaCache::new();
+        let cache = SchemaCache::for_adapter(std::sync::Arc::new(OpenAiSchemaAdapter));
         let openai_tools = convert_tools(&tools, &adapter, &cache);
         assert_eq!(openai_tools.len(), 1);
         if let ChatCompletionTools::Function(tool) = &openai_tools[0] {
             assert_eq!(tool.function.name, "get_weather");
         } else {
             panic!("Expected Function variant");
+        }
+    }
+
+    #[test]
+    fn convert_tools_has_deterministic_name_order() {
+        use super::super::schema_adapter::OpenAiSchemaAdapter;
+
+        let adapter = OpenAiSchemaAdapter;
+        let cache = SchemaCache::for_adapter(std::sync::Arc::new(OpenAiSchemaAdapter));
+        for _ in 0..32 {
+            let tools = HashMap::from([
+                ("zeta".to_string(), serde_json::json!({})),
+                ("alpha".to_string(), serde_json::json!({})),
+                ("middle".to_string(), serde_json::json!({})),
+            ]);
+            let names = convert_tools(&tools, &adapter, &cache)
+                .into_iter()
+                .map(|tool| match tool {
+                    ChatCompletionTools::Function(tool) => tool.function.name,
+                    ChatCompletionTools::Custom(_) => panic!("expected a function tool"),
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(names, ["alpha", "middle", "zeta"]);
         }
     }
 
@@ -821,20 +1253,18 @@ mod tests {
     #[test]
     fn test_image_detail_serializes_as_auto_not_null() {
         for part in [
-            Part::InlineData {
-                mime_type: "image/png".to_string(),
-                data: vec![0x89, 0x50, 0x4E, 0x47],
-            },
+            Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
             Part::FileData {
                 mime_type: "image/jpeg".to_string(),
                 file_uri: "https://example.com/photo.jpg".to_string(),
+                annotations: None,
             },
         ] {
             let content = Content {
                 role: "user".to_string(),
                 parts: vec![Part::Text { text: "describe".to_string() }, part],
             };
-            let msg = content_to_message(&content);
+            let msg = content_to_message(&content, false);
             let json = serde_json::to_string(&msg).expect("message serializes");
 
             assert!(

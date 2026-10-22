@@ -1,0 +1,1 @@
+- **Agent stream errors stop graph nodes** (`adk-graph`): yielded agent errors propagate before output mapping, state updates, or successor routing.

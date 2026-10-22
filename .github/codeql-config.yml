@@ -5,8 +5,8 @@ name: "ADK-Rust CodeQL Config"
 
 # Exclude paths from analysis
 paths-ignore:
-  # Minified/bundled JavaScript files (vendor code)
-  - "adk-server/assets/webui/*.js"
+  # Generated production bundles; maintained source is in adk-server/webui/src.
+  - "adk-server/assets/webui/**/*.js"
   - "adk-studio/ui/dist/**"
   # Node modules
   - "**/node_modules/**"
@@ -15,9 +15,22 @@ paths-ignore:
   # Test fixtures
   - "**/test_data/**"
   - "**/fixtures/**"
+  # Example crates. These are `publish = false` demo binaries whose whole job is
+  # printing to stdout, so every finding raised in them so far has been a
+  # `println!` false positive (rust/cleartext-logging). Path scoping is the only
+  # way to express this: `query-filters` match on query metadata (id, tags,
+  # problem.severity) and have no path predicate, so excluding a single query for
+  # a single directory is not expressible.
+  - "examples/**"
 
-# Query filters to reduce false positives
+# Query filters to reduce false positives.
+# These match on query metadata only (id, tags, problem.severity, ...) — there is
+# no path predicate available here, so anything path-scoped belongs in
+# `paths-ignore` above.
 query-filters:
-  # Exclude low-severity alerts from minified files
+  # Exclude alerts raised by queries tagged for minified/generated sources.
+  # The key is `tags contain` (a single key with a space), per the CodeQL query
+  # suite syntax; the previous `tags: contain:` form was not valid YAML, which
+  # made the whole config file unparseable.
   - exclude:
-      tags: contain: /minified/
+      tags contain: minified

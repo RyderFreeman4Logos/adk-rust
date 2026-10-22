@@ -1,6 +1,7 @@
 //! # adk-tool
 //!
-//! Tool system for ADK agents (FunctionTool, MCP, Google Search, AgentTool).
+//! Tool system for ADK agents: typed Rust tools, toolset composition, hosted
+//! provider tools, and Model Context Protocol clients and servers.
 //!
 //! ## Overview
 //!
@@ -9,8 +10,10 @@
 //! - [`FunctionTool`] - Create tools from async Rust functions
 //! - [`AgentTool`] - Use agents as callable tools for composition
 //! - [`GoogleSearchTool`] - Web search via Gemini's grounding
-//! - `McpToolset` - Model Context Protocol integration with the `mcp` feature
-//! - `McpServerManager` - Multi-server lifecycle management with the `mcp` feature
+//! - `McpToolset` - MCP tools, resources, prompts, completion, elicitation,
+//!   subscriptions, and negotiated tasks with the `mcp` feature
+//! - `McpServerManager` - Dynamic local MCP server registry, process lifecycle,
+//!   persistence, health monitoring, and bounded restart with the `mcp` feature
 //! - [`BasicToolset`] - Group multiple tools together
 //! - [`ExitLoopTool`] - Control flow for loop agents
 //! - [`LoadArtifactsTool`] - Inject binary artifacts into context
@@ -44,14 +47,17 @@
 //! Connect to MCP servers for external tools:
 //!
 //! ```rust,ignore
-//! use adk_tool::McpToolset;
-//! use rmcp::{ServiceExt, transport::TokioChildProcess};
+//! use adk_tool::{
+//!     McpToolset,
+//!     mcp::rmcp::{ServiceExt, transport::TokioChildProcess},
+//! };
+//! use tokio::process::Command;
 //!
 //! let client = ().serve(TokioChildProcess::new(
-//!     Command::new("npx")
-//!         .arg("-y")
-//!         .arg("@modelcontextprotocol/server-filesystem")
-//!         .arg("/path/to/files")
+//!     Command::new("/opt/company/bin/workspace-mcp")
+//!         .arg("--stdio")
+//!         .arg("--root")
+//!         .arg("/srv/workspace")
 //! )?).await?;
 //!
 //! let toolset = McpToolset::new(client);
@@ -64,7 +70,8 @@ mod agent_tool;
 pub mod builtin;
 mod function_tool;
 #[cfg(feature = "mcp")]
-/// Model Context Protocol (MCP) integration: toolsets, server management, and resources.
+/// Model Context Protocol (MCP) clients, server SDK re-export, catalog APIs,
+/// elicitation, tasks, HTTP transport, and dynamic local-server management.
 pub mod mcp;
 mod simple_context;
 mod stateful_tool;
@@ -92,12 +99,21 @@ pub mod spanner;
 #[cfg(feature = "mcp-sampling")]
 pub mod sampling;
 
+#[cfg(feature = "example-store")]
+pub mod example_store;
+
+#[cfg(feature = "vertex-agent-registry")]
+pub mod vertex;
+
 pub use adk_core::{AdkError, Result, Tool, ToolContext, Toolset};
 pub use adk_rust_macros::tool;
 
 // Re-export async_trait so the #[tool] macro's generated code can reference it
 // without requiring users to add async-trait as a direct dependency.
-pub use agent_tool::{AgentTool, AgentToolConfig};
+pub use agent_tool::{
+    AgentTool, AgentToolConfig, AgentToolFailureMode, AgentToolSessionSnapshot,
+    AgentToolStateMergePolicy,
+};
 pub use async_trait::async_trait;
 pub use builtin::{
     AnthropicBashTool20241022, AnthropicBashTool20250124, AnthropicTextEditorTool20250124,
@@ -109,18 +125,22 @@ pub use builtin::{
     OpenAIFileSearchTool, OpenAIImageGenerationTool, OpenAILocalShellTool, OpenAIMcpTool,
     OpenAIShellTool, OpenAIWebSearchTool, UrlContextTool, WebSearchTool, WebSearchUserLocation,
 };
+#[cfg(feature = "example-store")]
+pub use example_store::{ExampleStoreClient, ExampleStoreConfig, ExampleStoreProvider};
 pub use function_tool::FunctionTool;
 #[cfg(feature = "mcp")]
 pub use mcp::{
     AutoDeclineElicitationHandler, ElicitationHandler, McpAuth, McpHttpClientBuilder,
-    McpServerManager, McpTaskConfig, McpToolset, OAuth2Config, Resource, ResourceContents,
-    ResourceTemplate,
+    McpSchemaLimits, McpServerManager, McpTaskConfig, McpToolset, OAuth2Config, Resource,
+    ResourceContents, ResourceNotificationHandler, ResourceTemplate,
 };
 pub use simple_context::SimpleToolContext;
 pub use stateful_tool::StatefulTool;
 pub use toolset::{
     BasicToolset, FilteredToolset, MergedToolset, PrefixedToolset, string_predicate,
 };
+#[cfg(feature = "vertex-agent-registry")]
+pub use vertex::agent_registry::{AgentRegistryClient, AgentRegistryConfig, AgentSearchTool};
 
 #[cfg(feature = "code")]
 pub use code_execution::CodeTool;
@@ -133,3 +153,9 @@ pub use code_execution::JavaScriptCodeTool;
 
 #[cfg(feature = "code")]
 pub use code_execution::PythonCodeTool;
+
+#[cfg(feature = "code")]
+pub use code_execution::MontyPythonCodeTool;
+
+#[cfg(feature = "code-embedded-python")]
+pub use code_execution::MontyPythonCodeToolBuilder;

@@ -42,7 +42,8 @@ pub enum ExecutionLanguage {
     JavaScript,
     /// WebAssembly guest module execution.
     Wasm,
-    /// Python — container-backed execution.
+    /// Python — in-process Monty execution (`embedded-python` feature) or
+    /// container-backed execution.
     Python,
     /// Raw command execution (shell, interpreter, etc.).
     Command,
@@ -254,6 +255,25 @@ impl SandboxPolicy {
             filesystem: FilesystemPolicy::None,
             environment: EnvironmentPolicy::None,
             timeout: Duration::from_secs(5),
+            max_stdout_bytes: ONE_MB,
+            max_stderr_bytes: ONE_MB,
+            working_directory: None,
+        }
+    }
+
+    /// Strict policy for embedded Python (Monty) execution.
+    ///
+    /// - No network access (Monty has no network surface regardless)
+    /// - No filesystem access
+    /// - No environment variables
+    /// - 30-second timeout
+    /// - 1 MB stdout/stderr limits
+    pub fn strict_python() -> Self {
+        Self {
+            network: NetworkPolicy::Disabled,
+            filesystem: FilesystemPolicy::None,
+            environment: EnvironmentPolicy::None,
+            timeout: Duration::from_secs(30),
             max_stdout_bytes: ONE_MB,
             max_stderr_bytes: ONE_MB,
             working_directory: None,

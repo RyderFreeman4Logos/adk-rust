@@ -187,6 +187,31 @@ impl adk_core::Agent for StreamingTestAgent {
     }
 }
 
+struct ErrorStreamingTestAgent;
+
+#[async_trait]
+impl adk_core::Agent for ErrorStreamingTestAgent {
+    fn name(&self) -> &str {
+        "error-stream-test-agent"
+    }
+
+    fn description(&self) -> &str {
+        "Streaming error test agent"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn adk_core::Agent>] {
+        &[]
+    }
+
+    async fn run(
+        &self,
+        _ctx: Arc<dyn adk_core::InvocationContext>,
+    ) -> adk_core::Result<Pin<Box<dyn futures::Stream<Item = adk_core::Result<Event>> + Send>>>
+    {
+        Ok(Box::pin(stream::once(async { Err(adk_core::AdkError::model("provider unavailable")) })))
+    }
+}
+
 struct PartialReasoningStreamingTestAgent;
 
 #[async_trait]
@@ -1337,6 +1362,84 @@ async fn test_run_sse_compat_emits_profile_wrapped_event() {
 }
 
 #[tokio::test]
+async fn test_run_sse_adk_ui_emits_runtime_error_event() {
+    let agent = Arc::new(ErrorStreamingTestAgent);
+    let config = adk_server::ServerConfig::new(
+        Arc::new(adk_core::SingleAgentLoader::new(agent)),
+        Arc::new(adk_session::InMemorySessionService::new()),
+    );
+    let app = create_app(config);
+
+    let body = serde_json::json!({
+        "appName": "error-stream-test-agent",
+        "userId": "user1",
+        "sessionId": "session1",
+        "newMessage": {
+            "role": "user",
+            "parts": [{ "text": "hello" }]
+        }
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/run_sse")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body_str.contains("provider unavailable"));
+    assert!(body_str.contains("error_code"));
+}
+
+#[tokio::test]
+async fn test_run_sse_wrapped_profile_emits_runtime_error_event() {
+    let agent = Arc::new(ErrorStreamingTestAgent);
+    let config = adk_server::ServerConfig::new(
+        Arc::new(adk_core::SingleAgentLoader::new(agent)),
+        Arc::new(adk_session::InMemorySessionService::new()),
+    );
+    let app = create_app(config);
+
+    let body = serde_json::json!({
+        "appName": "error-stream-test-agent",
+        "userId": "user1",
+        "sessionId": "session1",
+        "newMessage": {
+            "role": "user",
+            "parts": [{ "text": "hello" }]
+        },
+        "uiProtocol": "a2ui"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/run_sse")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body_str.contains("\"ui_protocol\":\"a2ui\""));
+    assert!(body_str.contains("provider unavailable"));
+    assert!(body_str.contains("error_code"));
+}
+
+#[tokio::test]
 async fn test_run_sse_compat_supports_protocol_native_ag_ui_transport_and_input() {
     let agent = Arc::new(StreamingTestAgent);
     let session_service = Arc::new(adk_session::InMemorySessionService::new());
@@ -1983,4 +2086,172 @@ async fn test_ui_resources_reject_invalid_csp_domains() {
         .unwrap();
 
     assert_eq!(register_response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── UI routes under configured authentication ──────────────────────────
+//
+// `ui_api_router` was merged without `auth_layer` while the session, artifact, and
+// debug routers received it. With authentication configured, an unauthenticated
+// caller could create and mutate bridge state under any chosen identity tuple, poll
+// notifications, and list, read, or overwrite globally registered resources.
+
+fn authed_app() -> axum::Router {
+    let config =
+        adk_server::ServerConfig::new(Arc::new(MockAgentLoader), Arc::new(MockSessionService))
+            .with_request_context(Arc::new(HeaderExtractor));
+    create_app(config)
+}
+
+async fn status_without_auth(method: &str, uri: &str, body: Option<Value>) -> StatusCode {
+    let builder = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(json) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    authed_app().oneshot(request).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn ui_bridge_routes_require_auth_when_configured() {
+    let bridge_body = json!({
+        "appName": "victim-app",
+        "userId": "victim",
+        "sessionId": "victim-session",
+        "params": {}
+    });
+
+    for (method, uri) in [
+        ("POST", "/api/ui/initialize"),
+        ("POST", "/api/ui/message"),
+        ("POST", "/api/ui/update-model-context"),
+        ("POST", "/api/ui/notifications/poll"),
+        ("POST", "/api/ui/notifications/resources-list-changed"),
+        ("POST", "/api/ui/notifications/tools-list-changed"),
+    ] {
+        let status = status_without_auth(method, uri, Some(bridge_body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} accepted an unauthenticated request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ui_resource_routes_require_auth_when_configured() {
+    assert_eq!(
+        status_without_auth("GET", "/api/ui/resources", None).await,
+        StatusCode::UNAUTHORIZED,
+        "resource listing accepted an unauthenticated request"
+    );
+    assert_eq!(
+        status_without_auth("GET", "/api/ui/resources/read?uri=ui://app/panel", None).await,
+        StatusCode::UNAUTHORIZED,
+        "resource read accepted an unauthenticated request"
+    );
+
+    let register = json!({
+        "uri": "ui://app/panel",
+        "name": "panel",
+        "mimeType": "text/html;profile=mcp-app",
+        "text": "<p>injected</p>"
+    });
+    assert_eq!(
+        status_without_auth("POST", "/api/ui/resources/register", Some(register)).await,
+        StatusCode::UNAUTHORIZED,
+        "resource registration accepted an unauthenticated request"
+    );
+}
+
+#[tokio::test]
+async fn a_ui_resource_cannot_be_overwritten_by_another_user() {
+    let uri = "ui://ownership-test/panel";
+    let register = |text: &str| {
+        json!({
+            "uri": uri,
+            "name": "panel",
+            "mimeType": "text/html;profile=mcp-app",
+            "text": text
+        })
+    };
+
+    let owner_response = authed_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ui/resources/register")
+                .header("authorization", "Bearer owner")
+                .header("content-type", "application/json")
+                .body(Body::from(register("<p>mine</p>").to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_response.status(), StatusCode::CREATED);
+
+    // A different authenticated user must not be able to replace the content.
+    let attacker_response = authed_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ui/resources/register")
+                .header("authorization", "Bearer attacker")
+                .header("content-type", "application/json")
+                .body(Body::from(register("<p>substituted</p>").to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        attacker_response.status(),
+        StatusCode::FORBIDDEN,
+        "another user replaced the registered resource content"
+    );
+
+    // Nor read it.
+    let read_response = authed_app()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/ui/resources/read?uri={uri}"))
+                .header("authorization", "Bearer attacker")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_response.status(),
+        StatusCode::NOT_FOUND,
+        "another user read the resource content"
+    );
+
+    // The owner still can.
+    let owner_read = authed_app()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/ui/resources/read?uri={uri}"))
+                .header("authorization", "Bearer owner")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_read.status(), StatusCode::OK, "the owner must still read its own resource");
+}
+
+#[tokio::test]
+async fn ui_routes_stay_open_when_no_extractor_is_configured() {
+    // Authentication is opt-in; a server without an extractor keeps working.
+    let config =
+        adk_server::ServerConfig::new(Arc::new(MockAgentLoader), Arc::new(MockSessionService));
+    let app = create_app(config);
+
+    let response = app
+        .oneshot(Request::builder().uri("/api/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

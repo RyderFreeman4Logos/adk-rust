@@ -366,7 +366,7 @@ pub(crate) fn translate_client_message(role: &str, parts: Vec<adk_core::types::P
             adk_core::types::Part::Text { text } => {
                 content.push(json!({ "type": "input_text", "text": text }));
             }
-            adk_core::types::Part::InlineData { mime_type, data } => {
+            adk_core::types::Part::InlineData { mime_type, data, .. } => {
                 if mime_type.starts_with("audio/") {
                     use base64::Engine;
                     let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -394,6 +394,12 @@ pub(crate) fn translate_client_message(role: &str, parts: Vec<adk_core::types::P
             }
             adk_core::types::Part::ServerToolResponse { .. } => {
                 tracing::warn!("dropping unsupported ServerToolResponse part in OpenAI session");
+            }
+            adk_core::types::Part::EmbeddedResource { resource } => {
+                tracing::warn!(
+                    "dropping unsupported EmbeddedResource part in OpenAI session: {}",
+                    resource.uri()
+                );
             }
         }
     }
@@ -429,7 +435,7 @@ mod tests {
     fn test_openai_translate_text_and_audio() {
         let parts = vec![
             Part::Text { text: "Listen:".to_string() },
-            Part::InlineData { mime_type: "audio/wav".to_string(), data: vec![0x1, 0x2, 0x3] },
+            Part::inline_data("audio/wav", vec![0x1, 0x2, 0x3]),
         ];
         let value = translate_client_message("user", parts);
         let content = value["item"]["content"].as_array().unwrap();
@@ -444,7 +450,7 @@ mod tests {
     fn test_openai_skips_unsupported_parts() {
         let parts = vec![
             Part::Text { text: "First".to_string() },
-            Part::InlineData { mime_type: "image/png".to_string(), data: vec![0x1] },
+            Part::inline_data("image/png", vec![0x1]),
             Part::Thinking { thinking: "Hmm".to_string(), signature: None },
             Part::Text { text: "Last".to_string() },
         ];

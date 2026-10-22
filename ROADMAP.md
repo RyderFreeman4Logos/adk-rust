@@ -48,7 +48,7 @@ Autonomous agents that do vertically integrated tasks well, demonstrating:
 | Capability | Status | Implementation |
 |-----------|--------|----------------|
 | Deployment workflows | ✅ | `cargo adk deploy`, composable templates (8 base + 9 addons + 5 enterprise patterns) |
-| Observability | ✅ | `adk-telemetry` (OpenTelemetry 0.31), structured logging, GenAI semantic conventions |
+| Observability | ✅ | `adk-telemetry` (OpenTelemetry 0.32), structured logging, GenAI semantic conventions |
 | Scaling | ✅ | Tokio async runtime, concurrent agent throughput, connection pooling |
 | Secure configuration | ✅ | `adk-auth` (JWT, OAuth2, OIDC, SSO, cloud secret providers), encrypted sessions (AES-256-GCM) |
 | Rollback and release | ✅ | `adk-eval` regression baselines, `adk-bench` regression detection (exit code 2) |
@@ -127,7 +127,7 @@ These capabilities form the foundation and are stable:
 | `adk-bench` | Framework benchmarking, cross-framework comparison, regression CI | ✅ New |
 | `adk-auth` | JWT, OAuth2, OIDC, SSO, RBAC, cloud secret providers | ✅ Stable |
 | `adk-guardrail` | PII redaction, content filtering, validation | ✅ Stable |
-| `adk-telemetry` | OpenTelemetry 0.31, GenAI semantic conventions | ✅ Stable |
+| `adk-telemetry` | OpenTelemetry 0.32, GenAI semantic conventions | ✅ Stable |
 | `adk-browser` | 46 WebDriver tools | ✅ Stable |
 | `adk-audio` | STT/TTS, Deepgram, ONNX models, desktop audio | ✅ Stable |
 | `adk-rag` | Document chunking, embeddings, vector search | ✅ Stable |
@@ -145,6 +145,28 @@ These capabilities form the foundation and are stable:
 | `awp-types` | AWP protocol types (zero adk deps) | ✅ Stable |
 
 ---
+
+## Two Orchestration APIs, Both Supported
+
+ADK-Rust keeps the workflow agents (`SequentialAgent`, `ParallelAgent`,
+`LoopAgent`) **and** `adk-graph`. Neither supersedes the other, and neither is
+deprecated.
+
+| | Workflow agents | `adk-graph` |
+|---|---|---|
+| Topology | Implied by the list of sub-agents | Declared as nodes and edges |
+| Control flow | Fixed when written | May depend on results at run time |
+| Durability | None beyond the session | Checkpointed per super-step |
+| Cost to adopt | One constructor | A state schema and a compile step |
+
+They compose in both directions: a workflow agent is an `AgentNode`, and
+`GraphAgent` is an `Agent` a workflow agent can hold. Tests in
+`adk-graph/tests/trio_composition_tests.rs` pin both, so neither API can become
+something the other cannot carry.
+
+This is a deliberate divergence from the other ADK implementations, where the
+classic orchestrators are deprecated in favour of a workflow engine. Short linear
+pipelines are common, and requiring a graph for them costs more than it returns.
 
 ## Benchmark Results (June 2026)
 
@@ -177,7 +199,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 | Project | Focus |
 |---------|-------|
-| [ADK-Rust](https://github.com/zavora-ai/adk-rust) | Core framework (36 crates) |
+| [ADK-Rust](https://github.com/zavora-ai/adk-rust) | Core framework (43 crates) |
 | [ADK-Studio](https://github.com/zavora-ai/adk-studio) | Visual agent builder |
 | [ADK-UI](https://github.com/zavora-ai/adk-ui) | Dynamic UI generation |
 | [ADK-Playground](https://github.com/zavora-ai/adk-playground) | 120+ working examples |

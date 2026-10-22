@@ -103,6 +103,7 @@ impl adk_core::Llm for SpyLlm {
 struct TestContext {
     content: Content,
     config: RunConfig,
+    session: DummySession,
 }
 
 impl TestContext {
@@ -113,7 +114,12 @@ impl TestContext {
                 parts: vec![Part::Text { text: message.to_string() }],
             },
             config: RunConfig::default(),
+            session: DummySession::default(),
         }
+    }
+
+    fn with_history(message: &str, history: Vec<Content>) -> Self {
+        Self { session: DummySession { history }, ..Self::new(message) }
     }
 }
 
@@ -165,12 +171,15 @@ impl InvocationContext for TestContext {
         false
     }
     fn session(&self) -> &dyn adk_core::Session {
-        &DummySession
+        &self.session
     }
 }
 
 // Dummy session for testing
-struct DummySession;
+#[derive(Default)]
+struct DummySession {
+    history: Vec<Content>,
+}
 
 impl adk_core::Session for DummySession {
     fn id(&self) -> &str {
@@ -186,7 +195,7 @@ impl adk_core::Session for DummySession {
         &DummyState
     }
     fn conversation_history(&self) -> Vec<adk_core::Content> {
-        Vec::new()
+        self.history.clone()
     }
 }
 
@@ -425,7 +434,7 @@ fn test_llm_agent_builder_with_callbacks() {
 
 #[cfg(feature = "skills")]
 #[tokio::test]
-async fn test_llm_agent_injects_skill_prompt_block() {
+async fn test_llm_agent_injects_skill_after_cacheable_prefix() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     std::fs::create_dir_all(root.join(".skills")).unwrap();
@@ -435,12 +444,15 @@ async fn test_llm_agent_injects_skill_prompt_block() {
     )
     .unwrap();
 
-    let model = SpyLlm::new("ok");
+    let model = SpyLlm::new("{}");
     let captured = model.last_request.clone();
 
     let builder = LlmAgentBuilder::new("skill_agent")
         .description("Agent with skills")
         .model(Arc::new(model))
+        .global_instruction("GLOBAL INSTRUCTION")
+        .instruction("AGENT INSTRUCTION")
+        .output_schema(serde_json::json!({"type": "object"}))
         .with_skills_from_root(root)
         .unwrap()
         .with_skill_policy(SelectionPolicy {
@@ -450,7 +462,14 @@ async fn test_llm_agent_injects_skill_prompt_block() {
         });
 
     let agent = builder.build().unwrap();
-    let ctx = Arc::new(TestContext::new("Please search this repository"));
+    let ctx = Arc::new(TestContext::with_history(
+        "Please search this repository",
+        vec![
+            Content::new("user").with_text("Earlier question"),
+            Content::new("model").with_text("Earlier answer"),
+            Content::new("user").with_text("Please search this repository"),
+        ],
+    ));
     let mut stream = agent.run(ctx).await.unwrap();
 
     use futures::StreamExt;
@@ -459,16 +478,21 @@ async fn test_llm_agent_injects_skill_prompt_block() {
     }
 
     let request = captured.lock().unwrap().clone().expect("expected captured request");
-    let combined = request
+    let messages = request
         .contents
         .iter()
-        .flat_map(|c| c.parts.iter())
-        .filter_map(|p| p.text())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|content| content.parts.iter().filter_map(Part::text).collect::<Vec<_>>().join("\n"))
+        .collect::<Vec<_>>();
 
-    assert!(combined.contains("[skill:search]"));
-    assert!(combined.contains("Use rg --files then rg <pattern>."));
+    assert_eq!(messages.len(), 6);
+    assert_eq!(messages[0], "GLOBAL INSTRUCTION");
+    assert_eq!(messages[1], "AGENT INSTRUCTION");
+    assert!(messages[2].starts_with("You MUST respond with valid JSON"));
+    assert_eq!(messages[3], "Earlier question");
+    assert_eq!(messages[4], "Earlier answer");
+    assert!(messages[5].starts_with("[skill:search]"));
+    assert!(messages[5].contains("Use rg --files then rg <pattern>."));
+    assert!(messages[5].ends_with("Please search this repository"));
 }
 
 #[tokio::test]

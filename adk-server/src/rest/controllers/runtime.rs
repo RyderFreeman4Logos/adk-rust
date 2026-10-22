@@ -311,6 +311,13 @@ fn serialize_runtime_event(event: &adk_core::Event, profile: UiProfile) -> Optio
     .ok()
 }
 
+fn serialize_runtime_error(error: &adk_core::AdkError, profile: UiProfile) -> Option<String> {
+    let mut event = adk_core::Event::new(String::new());
+    event.llm_response.error_code = Some(error.code.to_string());
+    event.llm_response.error_message = Some(error.to_string());
+    serialize_runtime_event(&event, profile)
+}
+
 fn infer_sse_request_protocol(req: &RunSseRequest) -> Option<&str> {
     req.ui_protocol
         .as_deref()
@@ -581,6 +588,8 @@ fn build_content_with_attachments(
                 content.parts.push(adk_core::Part::InlineData {
                     mime_type: attachment.mime_type.clone(),
                     data,
+                    uri: None,
+                    annotations: None,
                 });
             }
             Err(e) => {
@@ -621,6 +630,8 @@ fn build_content_from_parts(parts: &[MessagePart]) -> Result<adk_core::Content, 
                     content.parts.push(adk_core::Part::InlineData {
                         mime_type: inline_data.mime_type.clone(),
                         data,
+                        uri: None,
+                        annotations: None,
                     });
                 }
                 Err(e) => {
@@ -715,7 +726,12 @@ fn serialize_ag_ui_tool_call_delta(args: &Value, allow_raw_string_delta: bool) -
     serde_json::to_string(args).unwrap_or_else(|_| args.to_string())
 }
 
-fn translate_ag_ui_event(event: &adk_core::Event, thread_id: &str, run_id: &str) -> Vec<Value> {
+fn translate_ag_ui_event(
+    event: &adk_core::Event,
+    thread_id: &str,
+    run_id: &str,
+    open: &AgUiMessages,
+) -> Vec<Value> {
     let mut translated = Vec::new();
     let timestamp = timestamp_millis(event);
     let is_partial = event.llm_response.partial;
@@ -743,10 +759,25 @@ fn translate_ag_ui_event(event: &adk_core::Event, thread_id: &str, run_id: &str)
         return translated;
     };
 
+    let mut text_seen = false;
+    let mut thinking_seen = false;
     for (index, part) in content.parts.iter().enumerate() {
         match part {
-            adk_core::Part::Text { text } if !text.trim().is_empty() => {
-                let message_id = format!("{}-text-{}", event.id, index);
+            adk_core::Part::Text { .. } if !text_seen => {
+                text_seen = true;
+                let text: String = content
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        adk_core::Part::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if text.is_empty() && (is_partial || open.text.is_none()) {
+                    continue;
+                }
+                let message_id =
+                    open.text.clone().unwrap_or_else(|| format!("{}-text-{}", event.id, index));
                 if is_partial {
                     translated.push(json!({
                         "type": "TEXT_MESSAGE_CHUNK",
@@ -756,27 +787,46 @@ fn translate_ag_ui_event(event: &adk_core::Event, thread_id: &str, run_id: &str)
                         "timestamp": timestamp,
                     }));
                 } else {
-                    translated.push(json!({
+                    if open.text.is_none() {
+                        translated.push(json!({
                         "type": "TEXT_MESSAGE_START",
                         "messageId": message_id,
                         "role": "assistant",
                         "timestamp": timestamp,
-                    }));
-                    translated.push(json!({
+                        }));
+                    }
+                    if !text.is_empty() {
+                        translated.push(json!({
                         "type": "TEXT_MESSAGE_CONTENT",
-                        "messageId": format!("{}-text-{}", event.id, index),
+                        "messageId": message_id,
                         "delta": text,
                         "timestamp": timestamp,
-                    }));
+                        }));
+                    }
                     translated.push(json!({
                         "type": "TEXT_MESSAGE_END",
-                        "messageId": format!("{}-text-{}", event.id, index),
+                        "messageId": message_id,
                         "timestamp": timestamp,
                     }));
                 }
             }
-            adk_core::Part::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                let message_id = format!("{}-reasoning-{}", event.id, index);
+            adk_core::Part::Thinking { .. } if !thinking_seen => {
+                thinking_seen = true;
+                let thinking: String = content
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        adk_core::Part::Thinking { thinking, .. } => Some(thinking.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if thinking.is_empty() && (is_partial || open.reasoning.is_none()) {
+                    continue;
+                }
+                let message_id = open
+                    .reasoning
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-reasoning-{}", event.id, index));
                 if is_partial {
                     translated.push(json!({
                         "type": "REASONING_MESSAGE_CHUNK",
@@ -786,26 +836,30 @@ fn translate_ag_ui_event(event: &adk_core::Event, thread_id: &str, run_id: &str)
                     }));
                 } else {
                     let reasoning_id = format!("{}-reasoning-phase-{}", event.id, index);
-                    translated.push(json!({
-                        "type": "REASONING_START",
-                        "messageId": reasoning_id,
-                        "timestamp": timestamp,
-                    }));
-                    translated.push(json!({
+                    if open.reasoning.is_none() {
+                        translated.push(json!({
+                            "type": "REASONING_START",
+                            "messageId": reasoning_id,
+                            "timestamp": timestamp,
+                        }));
+                        translated.push(json!({
                         "type": "REASONING_MESSAGE_START",
                         "messageId": message_id,
                         "role": "assistant",
                         "timestamp": timestamp,
-                    }));
-                    translated.push(json!({
+                        }));
+                    }
+                    if !thinking.is_empty() {
+                        translated.push(json!({
                         "type": "REASONING_MESSAGE_CONTENT",
-                        "messageId": format!("{}-reasoning-{}", event.id, index),
+                        "messageId": message_id,
                         "delta": thinking,
                         "timestamp": timestamp,
-                    }));
+                        }));
+                    }
                     translated.push(json!({
                         "type": "REASONING_MESSAGE_END",
-                        "messageId": format!("{}-reasoning-{}", event.id, index),
+                        "messageId": message_id,
                         "timestamp": timestamp,
                     }));
                     translated.push(json!({
@@ -848,7 +902,7 @@ fn translate_ag_ui_event(event: &adk_core::Event, thread_id: &str, run_id: &str)
                     }));
                 }
             }
-            adk_core::Part::FunctionResponse { function_response, id } => {
+            adk_core::Part::FunctionResponse { function_response, id, .. } => {
                 let tool_call_id =
                     id.clone().unwrap_or_else(|| format!("{}-tool-result-{}", event.id, index));
                 let response_content = serde_json::to_string(&function_response.response)
@@ -1002,11 +1056,62 @@ fn apply_mcp_apps_runtime_envelope(
     }
 }
 
-fn direct_ag_ui_events(event: &adk_core::Event, thread_id: &str, run_id: &str) -> Vec<String> {
-    translate_ag_ui_event(event, thread_id, run_id)
-        .into_iter()
-        .filter_map(|item| serde_json::to_string(&item).ok())
-        .collect()
+#[derive(Default)]
+struct AgUiMessages {
+    text: Option<String>,
+    reasoning: Option<String>,
+}
+
+#[derive(Default)]
+struct AgUiStream {
+    deltas: adk_core::EventTextDeltas,
+    messages: HashMap<(String, String), AgUiMessages>,
+}
+
+impl AgUiStream {
+    fn translate(&mut self, event: &adk_core::Event, thread_id: &str, run_id: &str) -> Vec<Value> {
+        let key = (event.invocation_id.clone(), event.id.clone());
+        let mut open = self.messages.remove(&key).unwrap_or_default();
+        let mut delta = self.deltas.push(event);
+        if !event.llm_response.partial {
+            let parts = delta.content().map(|content| content.parts.as_slice()).unwrap_or(&[]);
+            let mut endings = Vec::new();
+            if open.text.is_some()
+                && !parts.iter().any(|part| matches!(part, adk_core::Part::Text { .. }))
+            {
+                endings.push(adk_core::Part::Text { text: String::new() });
+            }
+            if open.reasoning.is_some()
+                && !parts.iter().any(|part| matches!(part, adk_core::Part::Thinking { .. }))
+            {
+                endings.push(adk_core::Part::Thinking { thinking: String::new(), signature: None });
+            }
+            if !endings.is_empty() {
+                delta
+                    .to_mut()
+                    .llm_response
+                    .content
+                    .get_or_insert_with(|| adk_core::Content::new("model"))
+                    .parts
+                    .extend(endings);
+            }
+        }
+        let translated = translate_ag_ui_event(&delta, thread_id, run_id, &open);
+        if event.llm_response.partial {
+            for item in &translated {
+                let id = item.get("messageId").and_then(Value::as_str).map(str::to_owned);
+                match item.get("type").and_then(Value::as_str) {
+                    Some("TEXT_MESSAGE_CHUNK") => open.text = id,
+                    Some("REASONING_MESSAGE_CHUNK") => open.reasoning = id,
+                    _ => {}
+                }
+            }
+            if open.text.is_some() || open.reasoning.is_some() {
+                self.messages.insert(key, open);
+            }
+        }
+        translated
+    }
 }
 
 fn build_runtime_sse_stream<S>(
@@ -1032,6 +1137,7 @@ where
     Box::pin(async_stream::stream! {
         let native_ag_ui = profile == UiProfile::AgUi && transport == UiTransportMode::ProtocolNative;
         let mut started = false;
+        let mut ag_ui_stream = AgUiStream::default();
         let mut active_run_id = ag_ui_input.as_ref().and_then(|input| input.run_id.clone());
 
         while let Some(item) = event_stream.next().await {
@@ -1078,8 +1184,8 @@ where
                             started = true;
                         }
 
-                        for payload in direct_ag_ui_events(&event, &selected_thread_id, &run_id) {
-                            yield Ok(Event::default().data(payload));
+                        for payload in ag_ui_stream.translate(&event, &selected_thread_id, &run_id) {
+                            yield Ok(Event::default().data(payload.to_string()));
                         }
                     } else if let Some(payload) = serialize_runtime_event(&event, profile) {
                         yield Ok(Event::default().data(payload));
@@ -1102,6 +1208,8 @@ where
                             "runId": run_id,
                             "message": error.to_string(),
                         }).to_string()));
+                    } else if let Some(payload) = serialize_runtime_error(&error, profile) {
+                        yield Ok(Event::default().data(payload));
                     }
                     return;
                 }
@@ -1419,3 +1527,139 @@ pub async fn run_sse_compat(
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
 }
+
+/// POST /run - plain-JSON, non-streaming endpoint (Google ADK api_server parity)
+///
+/// Accepts the same JSON body as `POST /run_sse`, runs the agent to
+/// completion, and returns every produced event as a JSON array instead of
+/// an SSE stream. The `streaming` body field is ignored — the run always
+/// uses `StreamingMode::None`.
+pub async fn run_collect(
+    State(controller): State<RuntimeController>,
+    headers: HeaderMap,
+    Json(req): Json<RunSseRequest>,
+) -> Result<Json<Vec<adk_core::Event>>, RuntimeError> {
+    let app_name = req.app_name.clone();
+    let user_id = req.user_id.clone();
+    let session_id = req.session_id.clone();
+
+    info!(
+        app_name = %app_name,
+        user_id = %user_id,
+        session_id = %session_id,
+        "POST /run request received"
+    );
+
+    // Extract request context from auth middleware bridge if configured.
+    // This returns Err (401/500) when the extractor is present but auth
+    // fails, ensuring authorization checks are never bypassed.
+    let request_context =
+        extract_request_context(controller.config.request_context_extractor.as_deref(), &headers)
+            .await?;
+
+    // Explicit authenticated user override: when an auth extractor is
+    // configured and succeeds, the authenticated user_id takes precedence
+    // over the request body value. This prevents callers from impersonating
+    // other users via the JSON payload while keeping the body param as a
+    // fallback for unauthenticated deployments (no extractor configured).
+    let effective_user_id = request_context.as_ref().map_or(user_id, |rc| rc.user_id.clone());
+
+    let new_message = req
+        .new_message
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "newMessage is required".to_string()))?;
+
+    // Build content from message parts (includes both text and inline_data)
+    let content = build_content_from_parts(&new_message.parts)?;
+
+    let state_delta = body_state_delta(req.state_delta.as_ref())?;
+
+    // Validate session exists or create it (same behavior as /run_sse)
+    let session_result = controller
+        .config
+        .session_service
+        .get(adk_session::GetRequest {
+            app_name: app_name.clone(),
+            user_id: effective_user_id.clone(),
+            session_id: session_id.clone(),
+            num_recent_events: None,
+            after: None,
+        })
+        .await;
+
+    if session_result.is_err() {
+        controller
+            .config
+            .session_service
+            .create(adk_session::CreateRequest {
+                app_name: app_name.clone(),
+                user_id: effective_user_id.clone(),
+                session_id: Some(session_id.clone()),
+                state: state_delta.clone(),
+            })
+            .await
+            .map_err(adk_err_to_runtime)?;
+    } else {
+        apply_state_delta_to_session(
+            &controller.config.session_service,
+            &app_name,
+            &effective_user_id,
+            &session_id,
+            state_delta,
+        )
+        .await?;
+    }
+
+    // Load agent
+    let agent =
+        controller.config.agent_loader.load_agent(&app_name).await.map_err(adk_err_to_runtime)?;
+
+    // Create runner — always non-streaming for the plain-JSON endpoint
+    let mut runner_builder = adk_runner::Runner::builder()
+        .app_name(app_name)
+        .agent(agent)
+        .session_service(controller.config.session_service.clone())
+        .run_config(
+            adk_core::RunConfig::builder().streaming_mode(adk_core::StreamingMode::None).build(),
+        );
+    if let Some(ref artifact_service) = controller.config.artifact_service {
+        runner_builder = runner_builder.artifact_service(artifact_service.clone());
+    }
+    if let Some(ref memory_service) = controller.config.memory_service {
+        runner_builder = runner_builder.memory_service(memory_service.clone());
+    }
+    if let Some(ref compaction_config) = controller.config.compaction_config {
+        runner_builder = runner_builder.compaction_config(compaction_config.clone());
+    }
+    if let Some(ref context_cache_config) = controller.config.context_cache_config {
+        runner_builder = runner_builder.context_cache_config(context_cache_config.clone());
+    }
+    if let Some(ref cache_capable) = controller.config.cache_capable {
+        runner_builder = runner_builder.cache_capable(cache_capable.clone());
+    }
+    if let Some(request_context) = request_context {
+        runner_builder = runner_builder.request_context(request_context);
+    }
+    let runner = runner_builder.build().map_err(adk_err_to_runtime)?;
+
+    // Run agent to completion, collecting every event
+    let typed_user_id =
+        UserId::new(effective_user_id).map_err(|err| adk_err_to_runtime(err.into()))?;
+    let typed_session_id =
+        SessionId::new(session_id).map_err(|err| adk_err_to_runtime(err.into()))?;
+    let mut event_stream =
+        runner.run(typed_user_id, typed_session_id, content).await.map_err(adk_err_to_runtime)?;
+
+    let mut events = Vec::new();
+    while let Some(event) = event_stream.next().await {
+        events.push(event.map_err(adk_err_to_runtime)?);
+    }
+
+    info!(event_count = events.len(), "POST /run completed");
+
+    Ok(Json(events))
+}
+
+#[cfg(test)]
+#[path = "runtime_stream_tests.rs"]
+mod stream_tests;

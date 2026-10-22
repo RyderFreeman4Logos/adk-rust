@@ -59,10 +59,16 @@ pub trait SchemaAdapter: Send + Sync + Debug {
 Normalized schemas are cached by content hash to avoid redundant computation:
 
 ```rust
-let cache = SchemaCache::new();
-let normalized = cache.get_or_normalize(&raw_schema, &adapter);
+use adk_core::{GenericSchemaAdapter, SchemaCache};
+use serde_json::json;
+use std::sync::Arc;
+
+let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+let raw_schema = json!({"type": "object"});
+let normalized = cache.normalize(&raw_schema);
 // Second call returns cached result
-let cached = cache.get_or_normalize(&raw_schema, &adapter);
+let cached = cache.normalize(&raw_schema);
+assert_eq!(normalized, cached);
 ```
 
 ### Tool Name Truncation

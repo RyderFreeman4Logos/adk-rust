@@ -114,10 +114,18 @@ pub struct GeminiModel {
     /// Faithful-to-API options for the Interactions transport.
     #[cfg(feature = "gemini-interactions")]
     interaction_options: InteractionOptions,
+    /// Server-side RAG grounding declaration attached to every request.
+    /// Vertex AI backend only; see [`GeminiModel::with_vertex_rag_store`].
+    #[cfg(feature = "gemini-vertex")]
+    vertex_rag_store: Option<adk_gemini::VertexRagStore>,
+    /// Whether the wrapped client targets the Vertex AI backend (as opposed
+    /// to AI Studio). Set by the `new_google_cloud*` constructors.
+    #[cfg(feature = "gemini-vertex")]
+    vertex_backend: bool,
 }
 
 /// Convert a Gemini client error to a structured `AdkError` with proper category and retry hints.
-fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
+pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
     fn format_error_chain(e: &dyn std::error::Error) -> String {
         let mut msg = e.to_string();
         let mut source = e.source();
@@ -130,6 +138,13 @@ fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
     }
 
     let message = format_error_chain(e);
+    // Vertex no longer replays a failed request over REST, so a transport failure
+    // is left to the configured retry policy instead.
+    #[cfg(feature = "gemini-vertex")]
+    let transport_failure =
+        adk_gemini::backend::vertex::VertexBackend::is_transport_error(&message);
+    #[cfg(not(feature = "gemini-vertex"))]
+    let transport_failure = false;
 
     // Extract status code from BadResponse variant via Display output
     // BadResponse format: "bad response from server; code {code}; description: ..."
@@ -155,6 +170,8 @@ fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
         (ErrorCategory::NotFound, "model.gemini.not_found", Some(404))
     } else if message.contains("invalid generation config") {
         (ErrorCategory::InvalidInput, "model.gemini.invalid_config", None)
+    } else if transport_failure {
+        (ErrorCategory::Unavailable, "model.gemini.unavailable", None)
     } else {
         (ErrorCategory::Internal, "model.gemini.internal", None)
     };
@@ -209,9 +226,121 @@ fn interaction_terminal_error(code: &'static str, message: &str) -> adk_core::Ad
     .with_provider("gemini")
 }
 
+/// Returns the value of the environment variable `name` when it is set and
+/// non-empty (after trimming whitespace).
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Returns `true` when an opt-in flag value selects the Vertex AI backend:
+/// `1` or a case-insensitive `true`.
+fn env_flag_truthy(value: &str) -> bool {
+    let v = value.trim();
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
+/// Reports whether the environment opts in to the Vertex AI backend.
+///
+/// Consults `GOOGLE_GENAI_USE_ENTERPRISE` first and, when that variable is
+/// unset or empty, the deprecated `GOOGLE_GENAI_USE_VERTEXAI`. A flag is
+/// truthy when its value is `1` or a case-insensitive `true`.
+/// `GOOGLE_GENAI_USE_ENTERPRISE` takes precedence when both are set.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// if adk_model::gemini::vertex_env_requested() {
+///     // route Gemini traffic through Vertex AI
+/// }
+/// ```
+pub fn vertex_env_requested() -> bool {
+    // `GOOGLE_GENAI_USE_VERTEXAI` is the deprecated name adk-python still
+    // honors. Deliberately no deprecation warning for it —
+    // google/adk-python#6168 documents the churn such a warning caused.
+    if let Some(v) = env_non_empty("GOOGLE_GENAI_USE_ENTERPRISE") {
+        return env_flag_truthy(&v);
+    }
+    env_non_empty("GOOGLE_GENAI_USE_VERTEXAI").is_some_and(|v| env_flag_truthy(&v))
+}
+
+/// Reads `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`, erroring with a
+/// message that names whichever variable is missing.
+#[cfg(feature = "gemini-vertex")]
+fn vertex_target_from_env() -> Result<(String, String)> {
+    let project = env_non_empty("GOOGLE_CLOUD_PROJECT");
+    let location = env_non_empty("GOOGLE_CLOUD_LOCATION");
+    if let (Some(project), Some(location)) = (&project, &location) {
+        return Ok((project.clone(), location.clone()));
+    }
+    let mut missing = Vec::new();
+    if project.is_none() {
+        missing.push("GOOGLE_CLOUD_PROJECT");
+    }
+    if location.is_none() {
+        missing.push("GOOGLE_CLOUD_LOCATION");
+    }
+    Err(adk_core::AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::InvalidInput,
+        "model.gemini.vertex_env_incomplete",
+        format!(
+            "Vertex AI backend selected via GOOGLE_GENAI_USE_ENTERPRISE/GOOGLE_GENAI_USE_VERTEXAI, but {} not set. Set the missing variable(s) to your Google Cloud project ID and region (e.g. us-central1).",
+            missing.join(" and ")
+        ),
+    )
+    .with_provider("gemini"))
+}
+
 impl GeminiModel {
     fn gemini_part_thought_signature(value: &serde_json::Value) -> Option<String> {
         value.get("thoughtSignature").and_then(serde_json::Value::as_str).map(str::to_string)
+    }
+
+    fn validate_request_contract(&self, req: &LlmRequest) -> Result<()> {
+        // Server-side RAG grounding is a Vertex AI capability; reject it on
+        // the AI Studio backend before any network IO (mirrors the request-
+        // time gating the Vertex backend applies to Studio-only fields).
+        #[cfg(feature = "gemini-vertex")]
+        if self.vertex_rag_store.is_some() && !self.vertex_backend {
+            return Err(adk_core::AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::Unsupported,
+                "model.gemini.rag_store_requires_vertex",
+                "Vertex RAG store grounding requires the Vertex AI backend. Construct the model with new_google_cloud/new_google_cloud_adc (or set GOOGLE_GENAI_USE_VERTEXAI with GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION) instead of an AI Studio API key.",
+            )
+            .with_provider("gemini"));
+        }
+
+        let model = self.model_name.strip_prefix("models/").unwrap_or(&self.model_name);
+        if !matches!(model, "gemini-3.6-flash" | "gemini-3.7-flash") {
+            return Ok(());
+        }
+
+        if let Some(config) = &req.config
+            && (config.temperature.is_some() || config.top_p.is_some() || config.top_k.is_some())
+        {
+            return Err(adk_core::AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::InvalidInput,
+                "model.gemini.sampling_unsupported",
+                format!(
+                    "{model} does not accept temperature, top_p, or top_k; remove explicit sampling parameters"
+                ),
+            )
+            .with_provider("gemini"));
+        }
+        if self.thinking_config.as_ref().is_some_and(|config| config.thinking_budget.is_some()) {
+            return Err(adk_core::AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::InvalidInput,
+                "model.gemini.thinking_budget_unsupported",
+                format!(
+                    "{model} uses thinking levels instead of token budgets; set thinking_level and clear thinking_budget"
+                ),
+            )
+            .with_provider("gemini"));
+        }
+        Ok(())
     }
 
     /// Builds a `GeminiModel` from a constructed client and model name with all
@@ -219,7 +348,7 @@ impl GeminiModel {
     ///
     /// Centralizing struct construction here keeps the cfg-gated Interactions
     /// fields out of every public constructor's `Self { .. }` literal.
-    fn from_client(client: Gemini, model_name: String) -> Self {
+    pub(crate) fn from_client(client: Gemini, model_name: String) -> Self {
         Self {
             client,
             model_name,
@@ -231,15 +360,56 @@ impl GeminiModel {
             interaction_target: None,
             #[cfg(feature = "gemini-interactions")]
             interaction_options: InteractionOptions::default(),
+            #[cfg(feature = "gemini-vertex")]
+            vertex_rag_store: None,
+            #[cfg(feature = "gemini-vertex")]
+            vertex_backend: false,
         }
     }
 
     /// Create a new Gemini model client with an API key and model name.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Result<Self> {
         let model_name = model.into();
+        crate::catalog::warn_if_obsolete("gemini", &model_name);
         let client = Gemini::with_model(api_key.into(), model_name.clone())
             .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
 
+        Ok(Self::from_client(client, model_name))
+    }
+
+    /// Create an API-key model using an explicit REST base URL.
+    ///
+    /// The base URL includes the API version and ends with a slash. No environment
+    /// variable is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base_url` is not a valid URL or the client cannot be built.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::GeminiModel;
+    ///
+    /// let model = GeminiModel::new_with_base_url(
+    ///     "api-key",
+    ///     "gemini-3.7-flash",
+    ///     "https://gateway.example.com/v1beta/",
+    /// )?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    pub fn new_with_base_url(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+    ) -> Result<Self> {
+        let model_name = model.into();
+        let base_url = base_url
+            .as_ref()
+            .parse()
+            .map_err(|_| adk_core::AdkError::model("Invalid Gemini base URL"))?;
+        let client = Gemini::with_model_and_base_url(api_key.into(), model_name.clone(), base_url)
+            .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
         Ok(Self::from_client(client, model_name))
     }
 
@@ -262,7 +432,53 @@ impl GeminiModel {
         )
         .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
 
-        Ok(Self::from_client(client, model_name))
+        let mut model = Self::from_client(client, model_name);
+        model.vertex_backend = true;
+        Ok(model)
+    }
+
+    /// Use an explicit Vertex endpoint and either a supplied key or execution-host ADC.
+    ///
+    /// Requires `gemini-vertex` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Application Default Credentials are requested
+    /// (`api_key` is `None`) but unavailable, or when the client cannot be built.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use adk_model::GeminiModel;
+    ///
+    /// let model = GeminiModel::new_google_cloud_endpoint(
+    ///     None,
+    ///     "my-project",
+    ///     "us-central1",
+    ///     "gemini-3.7-flash",
+    ///     "https://us-central1-aiplatform.googleapis.com",
+    /// )?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    #[cfg(feature = "gemini-vertex")]
+    pub fn new_google_cloud_endpoint(
+        api_key: Option<&str>,
+        project: &str,
+        location: &str,
+        model_name: &str,
+        endpoint: &str,
+    ) -> Result<Self> {
+        let mut builder = adk_gemini::GeminiBuilder::new(api_key.unwrap_or_default())
+            .with_model(model_name.to_owned())
+            .with_google_cloud(project, location)
+            .with_google_cloud_endpoint(endpoint);
+        if api_key.is_none() {
+            builder = builder.with_google_cloud_adc().map_err(|e| gemini_error_to_adk(&e))?;
+        }
+        let client = builder.build().map_err(|e| gemini_error_to_adk(&e))?;
+        let mut model = Self::from_client(client, model_name.to_owned());
+        model.vertex_backend = true;
+        Ok(model)
     }
 
     /// Create a Gemini model via Vertex AI with service account JSON.
@@ -284,7 +500,9 @@ impl GeminiModel {
         )
         .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
 
-        Ok(Self::from_client(client, model_name))
+        let mut model = Self::from_client(client, model_name);
+        model.vertex_backend = true;
+        Ok(model)
     }
 
     /// Create a Gemini model via Vertex AI with Application Default Credentials.
@@ -304,7 +522,9 @@ impl GeminiModel {
         )
         .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
 
-        Ok(Self::from_client(client, model_name))
+        let mut model = Self::from_client(client, model_name);
+        model.vertex_backend = true;
+        Ok(model)
     }
 
     /// Create a Gemini model via Vertex AI with Workload Identity Federation.
@@ -326,7 +546,77 @@ impl GeminiModel {
         )
         .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
 
-        Ok(Self::from_client(client, model_name))
+        let mut model = Self::from_client(client, model_name);
+        model.vertex_backend = true;
+        Ok(model)
+    }
+
+    /// Create a Gemini model from environment variables.
+    ///
+    /// When `GOOGLE_GENAI_USE_ENTERPRISE` or `GOOGLE_GENAI_USE_VERTEXAI` is
+    /// truthy (`1` or a case-insensitive `true`), builds a Vertex AI client
+    /// with Application Default Credentials from `GOOGLE_CLOUD_PROJECT` and
+    /// `GOOGLE_CLOUD_LOCATION` — this path requires the `gemini-vertex`
+    /// feature. Otherwise builds a Gemini API (AI Studio) client from
+    /// `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
+    ///
+    /// `GOOGLE_GENAI_USE_ENTERPRISE` takes precedence when both flags are set.
+    ///
+    /// The Vertex path builds Application Default Credentials, which requires
+    /// a Tokio runtime to be current — call from async code or under
+    /// `#[tokio::main]`.
+    ///
+    /// # Errors
+    ///
+    /// - A Vertex flag is truthy but `GOOGLE_CLOUD_PROJECT` or
+    ///   `GOOGLE_CLOUD_LOCATION` is not set.
+    /// - A Vertex flag is truthy but the `gemini-vertex` feature is not
+    ///   compiled.
+    /// - No Vertex flag is truthy and neither `GOOGLE_API_KEY` nor
+    ///   `GEMINI_API_KEY` is set.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_model::gemini::GeminiModel;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> adk_core::Result<()> {
+    /// let model = GeminiModel::from_env("gemini-2.5-flash")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_env(model: &str) -> Result<Self> {
+        if vertex_env_requested() {
+            #[cfg(feature = "gemini-vertex")]
+            {
+                let (project, location) = vertex_target_from_env()?;
+                return Self::new_google_cloud_adc(project, location, model);
+            }
+            #[cfg(not(feature = "gemini-vertex"))]
+            {
+                return Err(adk_core::AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::Unsupported,
+                    "model.gemini.vertex_feature_missing",
+                    "Vertex AI backend selected via GOOGLE_GENAI_USE_ENTERPRISE/GOOGLE_GENAI_USE_VERTEXAI, but the `gemini-vertex` feature is not compiled. Enable the `gemini-vertex` feature (or `gemini-agent-platform` on the adk-rust umbrella crate) to route Gemini traffic through Vertex AI.",
+                )
+                .with_provider("gemini"));
+            }
+        }
+
+        let Some(api_key) =
+            env_non_empty("GOOGLE_API_KEY").or_else(|| env_non_empty("GEMINI_API_KEY"))
+        else {
+            return Err(adk_core::AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::InvalidInput,
+                "model.gemini.api_key_missing",
+                "No Gemini API key found. Set GOOGLE_API_KEY or GEMINI_API_KEY, or set GOOGLE_GENAI_USE_ENTERPRISE=true with GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION for Vertex AI.",
+            )
+            .with_provider("gemini"));
+        };
+        Self::new(api_key, model)
     }
 
     /// Set the retry configuration (builder pattern).
@@ -383,6 +673,42 @@ impl GeminiModel {
     /// Returns the current thinking configuration, if set.
     pub fn thinking_config(&self) -> Option<&adk_gemini::ThinkingConfig> {
         self.thinking_config.as_ref()
+    }
+
+    /// Ground every request in a Vertex AI RAG store (server-side retrieval).
+    ///
+    /// Declares a `retrieval` tool on each outgoing `generateContent` request
+    /// so Vertex AI retrieves grounding context from the referenced RAG
+    /// corpora before generating. Requires a Vertex AI backend — requests on
+    /// an AI Studio model fail with the structured error
+    /// `model.gemini.rag_store_requires_vertex` before any network IO.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_gemini::VertexRagStore;
+    /// use adk_model::gemini::GeminiModel;
+    ///
+    /// # fn main() -> adk_core::Result<()> {
+    /// let store = VertexRagStore::corpus("projects/p/locations/us-central1/ragCorpora/123")
+    ///     .with_top_k(5);
+    /// let model =
+    ///     GeminiModel::new_google_cloud("api-key", "p", "us-central1", "gemini-3.7-flash")?
+    ///         .with_vertex_rag_store(store);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "gemini-vertex")]
+    #[must_use]
+    pub fn with_vertex_rag_store(mut self, store: adk_gemini::VertexRagStore) -> Self {
+        self.vertex_rag_store = Some(store);
+        self
+    }
+
+    /// Returns the configured Vertex RAG store, if set.
+    #[cfg(feature = "gemini-vertex")]
+    pub fn vertex_rag_store(&self) -> Option<&adk_gemini::VertexRagStore> {
+        self.vertex_rag_store.as_ref()
     }
 
     /// Enable (or disable) the Interactions API transport.
@@ -499,6 +825,8 @@ impl GeminiModel {
                         converted_parts.push(Part::InlineData {
                             mime_type: inline_data.mime_type.clone(),
                             data: decoded,
+                            uri: None,
+                            annotations: None,
                         });
                     }
                     adk_gemini::Part::FunctionCall { function_call, thought_signature } => {
@@ -519,6 +847,7 @@ impl GeminiModel {
                                     .unwrap_or(serde_json::Value::Null),
                             ),
                             id: None,
+                            annotations: None,
                         });
                     }
                     adk_gemini::Part::ToolCall { .. } | adk_gemini::Part::ExecutableCode { .. } => {
@@ -536,36 +865,9 @@ impl GeminiModel {
                         converted_parts.push(Part::FileData {
                             mime_type: file_data.mime_type.clone(),
                             file_uri: file_data.file_uri.clone(),
+                            annotations: None,
                         });
                     }
-                }
-            }
-        }
-
-        // Add grounding metadata as text if present (required for Google Search grounding compliance)
-        if let Some(grounding) = resp.candidates.first().and_then(|c| c.grounding_metadata.as_ref())
-        {
-            if let Some(queries) = &grounding.web_search_queries
-                && !queries.is_empty()
-            {
-                let search_info = format!("\n\n🔍 **Searched:** {}", queries.join(", "));
-                converted_parts.push(Part::Text { text: search_info });
-            }
-            if let Some(chunks) = &grounding.grounding_chunks {
-                let sources: Vec<String> = chunks
-                    .iter()
-                    .filter_map(|c| {
-                        c.web.as_ref().and_then(|w| match (&w.title, &w.uri) {
-                            (Some(title), Some(uri)) => Some(format!("[{}]({})", title, uri)),
-                            (Some(title), None) => Some(title.clone()),
-                            (None, Some(uri)) => Some(uri.to_string()),
-                            (None, None) => None,
-                        })
-                    })
-                    .collect();
-                if !sources.is_empty() {
-                    let sources_info = format!("\n📚 **Sources:** {}", sources.join(" | "));
-                    converted_parts.push(Part::Text { text: sources_info });
                 }
             }
         }
@@ -575,13 +877,19 @@ impl GeminiModel {
         } else {
             Some(Content { role: "model".to_string(), parts: converted_parts })
         };
+        let tool_call_turn = content.as_ref().is_some_and(Content::has_function_calls);
 
         let usage_metadata = resp.usage_metadata.as_ref().map(|u| UsageMetadata {
             prompt_token_count: u.prompt_token_count.unwrap_or(0),
-            candidates_token_count: u.candidates_token_count.unwrap_or(0),
+            // Gemini's candidate count excludes the separately reported thoughts.
+            candidates_token_count: u
+                .candidates_token_count
+                .unwrap_or(0)
+                .saturating_add(u.thoughts_token_count.unwrap_or(0)),
             total_token_count: u.total_token_count.unwrap_or(0),
             thinking_token_count: u.thoughts_token_count,
             cache_read_input_token_count: u.cached_content_token_count,
+            provider_usage: serde_json::to_value(u).ok(),
             ..Default::default()
         });
 
@@ -613,7 +921,7 @@ impl GeminiModel {
             });
 
         // Serialize grounding metadata into provider_metadata so consumers
-        // can access structured grounding data (search queries, sources, supports).
+        // can display search queries and sources without changing the answer.
         let provider_metadata = resp
             .candidates
             .first()
@@ -626,7 +934,7 @@ impl GeminiModel {
             finish_reason,
             citation_metadata,
             partial: false,
-            turn_complete: true,
+            turn_complete: !tool_call_turn,
             interrupted: false,
             error_code: None,
             error_message: None,
@@ -682,7 +990,7 @@ impl GeminiModel {
                 // adapter's empty_schema fallback when none is provided.
                 let schema =
                     tool_decl.get("parameters").cloned().unwrap_or_else(|| adapter.empty_schema());
-                let normalized_schema = cache.get_or_normalize(&schema, adapter);
+                let normalized_schema = cache.normalize(&schema);
 
                 // Build the FunctionDeclaration with normalized values
                 let description =
@@ -696,7 +1004,7 @@ impl GeminiModel {
 
                 // Preserve response schema if present (normalized like parameters)
                 if let Some(response) = tool_decl.get("response") {
-                    func_decl_json["response"] = cache.get_or_normalize(response, adapter);
+                    func_decl_json["response"] = cache.normalize(response);
                 }
 
                 // Preserve behavior if present
@@ -760,7 +1068,8 @@ impl GeminiModel {
         }
 
         response.partial = false;
-        response.turn_complete = true;
+        response.turn_complete =
+            response.content.as_ref().is_none_or(|content| !content.has_function_calls());
 
         if saw_partial_chunk {
             return (vec![response], true);
@@ -828,7 +1137,7 @@ impl GeminiModel {
                                     thought_signature: signature.clone(),
                                 });
                             }
-                            Part::InlineData { data, mime_type } => {
+                            Part::InlineData { data, mime_type, .. } => {
                                 let encoded = attachment::encode_base64(data);
                                 gemini_parts.push(adk_gemini::Part::InlineData {
                                     inline_data: adk_gemini::Blob {
@@ -837,7 +1146,7 @@ impl GeminiModel {
                                     },
                                 });
                             }
-                            Part::FileData { mime_type, file_uri } => {
+                            Part::FileData { mime_type, file_uri, .. } => {
                                 gemini_parts.push(adk_gemini::Part::Text {
                                     text: attachment::file_attachment_to_text(mime_type, file_uri),
                                     thought: None,
@@ -949,7 +1258,7 @@ impl GeminiModel {
                     // recovered from the preceding FunctionCall (Gemini 3.x requirement)
                     let mut gemini_parts = Vec::new();
                     for part in &content.parts {
-                        if let Part::FunctionResponse { function_response, id } = part {
+                        if let Part::FunctionResponse { function_response, id, .. } = part {
                             let sig = fn_call_signatures.get(&function_response.name).cloned();
 
                             // Build nested FunctionResponsePart entries for multimodal data
@@ -1042,7 +1351,9 @@ impl GeminiModel {
         if !req.tools.is_empty() {
             let adapter = self.schema_adapter();
             use std::sync::LazyLock;
-            static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(SchemaCache::new);
+            static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(|| {
+                SchemaCache::for_adapter(std::sync::Arc::new(GeminiSchemaAdapter::new()))
+            });
             let (gemini_tools, tool_config) =
                 Self::build_gemini_tools(&req.tools, adapter, &SCHEMA_CACHE)?;
             for tool in gemini_tools {
@@ -1051,6 +1362,14 @@ impl GeminiModel {
             if tool_config != adk_gemini::ToolConfig::default() {
                 builder = builder.with_tool_config(tool_config);
             }
+        }
+
+        // Declare server-side RAG grounding; the Vertex backend injects it
+        // as a `retrieval` tool at send time (validate_request_contract has
+        // already rejected the Studio backend at this point).
+        #[cfg(feature = "gemini-vertex")]
+        if let Some(store) = &self.vertex_rag_store {
+            builder = builder.with_vertex_rag_store(store.clone());
         }
 
         if stream {
@@ -1125,7 +1444,9 @@ impl GeminiModel {
 
         let adapter = self.schema_adapter();
         use std::sync::LazyLock;
-        static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(SchemaCache::new);
+        static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(|| {
+            SchemaCache::for_adapter(std::sync::Arc::new(GeminiSchemaAdapter::new()))
+        });
         let (gemini_tools, tool_config) = Self::build_gemini_tools(tools, adapter, &SCHEMA_CACHE)?;
         if !gemini_tools.is_empty() {
             cache_builder = cache_builder.with_tools(gemini_tools);
@@ -1427,6 +1748,7 @@ impl Llm for GeminiModel {
     )]
     async fn generate_content(&self, req: LlmRequest, stream: bool) -> Result<LlmResponseStream> {
         adk_telemetry::info!("Generating content");
+        self.validate_request_contract(&req)?;
         let usage_span = adk_telemetry::llm_generate_span("gemini", &self.model_name, stream);
 
         // Dispatch on the configured transport. The default `GenerateContent`
@@ -1481,7 +1803,7 @@ mod native_tool_tests {
     }
 
     fn test_cache() -> SchemaCache {
-        SchemaCache::new()
+        SchemaCache::for_adapter(std::sync::Arc::new(GeminiSchemaAdapter::new()))
     }
 
     #[test]
@@ -1714,6 +2036,16 @@ mod tests {
     };
 
     #[test]
+    fn env_flag_truthy_accepts_one_and_case_insensitive_true() {
+        for truthy in ["1", "true", "TRUE", "True", " true ", "tRuE"] {
+            assert!(env_flag_truthy(truthy), "expected {truthy:?} to be truthy");
+        }
+        for falsy in ["0", "false", "FALSE", "yes", "on", "", "2", "vertex"] {
+            assert!(!env_flag_truthy(falsy), "expected {falsy:?} to be falsy");
+        }
+    }
+
+    #[test]
     fn constructor_is_backward_compatible_and_sync() {
         fn accepts_sync_constructor<F>(_f: F)
         where
@@ -1771,6 +2103,30 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert!(!chunks[0].partial);
         assert!(chunks[0].turn_complete);
+    }
+
+    #[test]
+    fn stream_chunks_from_response_keeps_tool_call_turn_open() {
+        let response = LlmResponse {
+            content: Some(Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({"city": "Boston"}),
+                    id: Some("call-1".to_string()),
+                    thought_signature: None,
+                }],
+            }),
+            finish_reason: Some(FinishReason::Stop),
+            turn_complete: true,
+            ..Default::default()
+        };
+
+        let (chunks, _) = GeminiModel::stream_chunks_from_response(response, true);
+
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].partial);
+        assert!(!chunks[0].turn_complete);
     }
 
     #[tokio::test]
@@ -1882,6 +2238,41 @@ mod tests {
     }
 
     #[test]
+    fn convert_response_keeps_function_call_turn_open() {
+        let response = adk_gemini::GenerationResponse {
+            candidates: vec![adk_gemini::Candidate {
+                content: adk_gemini::Content {
+                    role: Some(adk_gemini::Role::Model),
+                    parts: Some(vec![adk_gemini::Part::FunctionCall {
+                        function_call: adk_gemini::FunctionCall {
+                            name: "get_weather".to_string(),
+                            args: serde_json::json!({"city": "Boston"}),
+                            id: Some("call-1".to_string()),
+                            thought_signature: None,
+                        },
+                        thought_signature: None,
+                    }]),
+                },
+                safety_ratings: None,
+                citation_metadata: None,
+                grounding_metadata: None,
+                finish_reason: Some(adk_gemini::FinishReason::Stop),
+                index: Some(0),
+            }],
+            prompt_feedback: None,
+            usage_metadata: None,
+            model_version: None,
+            response_id: None,
+        };
+
+        let converted =
+            GeminiModel::convert_response(&response).expect("conversion should succeed");
+
+        assert!(!converted.turn_complete);
+        assert!(converted.content.is_some_and(|content| content.has_function_calls()));
+    }
+
+    #[test]
     fn convert_response_handles_inline_data_from_model() {
         let image_bytes = vec![0x89, 0x50, 0x4E, 0x47];
         let encoded = crate::attachment::encode_base64(&image_bytes);
@@ -1928,7 +2319,7 @@ mod tests {
         assert!(content.parts.iter().any(|part| {
             matches!(
                 part,
-                Part::InlineData { mime_type, data }
+                Part::InlineData { mime_type, data, .. }
                     if mime_type == "image/png" && data.as_slice() == image_bytes.as_slice()
             )
         }));
@@ -2009,6 +2400,8 @@ mod tests {
             vec![adk_core::InlineDataPart {
                 mime_type: "image/png".to_string(),
                 data: vec![0x89, 0x50, 0x4E, 0x47],
+                uri: None,
+                annotations: None,
             }],
         );
         let gemini_fr = convert_function_response_to_gemini_fr(&frd);
@@ -2031,6 +2424,7 @@ mod tests {
             vec![adk_core::FileDataPart {
                 mime_type: "application/pdf".to_string(),
                 file_uri: "gs://bucket/report.pdf".to_string(),
+                annotations: None,
             }],
         );
         let gemini_fr = convert_function_response_to_gemini_fr(&frd);
@@ -2050,12 +2444,23 @@ mod tests {
             "multi",
             serde_json::json!({}),
             vec![
-                adk_core::InlineDataPart { mime_type: "image/png".to_string(), data: vec![1, 2] },
-                adk_core::InlineDataPart { mime_type: "image/jpeg".to_string(), data: vec![3, 4] },
+                adk_core::InlineDataPart {
+                    mime_type: "image/png".to_string(),
+                    data: vec![1, 2],
+                    uri: None,
+                    annotations: None,
+                },
+                adk_core::InlineDataPart {
+                    mime_type: "image/jpeg".to_string(),
+                    data: vec![3, 4],
+                    uri: None,
+                    annotations: None,
+                },
             ],
             vec![adk_core::FileDataPart {
                 mime_type: "application/pdf".to_string(),
                 file_uri: "gs://b/f.pdf".to_string(),
+                annotations: None,
             }],
         );
         let gemini_fr = convert_function_response_to_gemini_fr(&frd);
@@ -2070,6 +2475,7 @@ mod tests {
 #[cfg(all(test, feature = "gemini-interactions"))]
 mod interactions_transport_tests {
     use super::*;
+    use adk_core::GenerateContentConfig;
 
     /// **Feature: gemini-interactions-runtime, Property 2: Default options match the API**
     /// *For any* default `InteractionOptions`, `store == true`, `stateful == true`,
@@ -2258,5 +2664,110 @@ mod interactions_transport_tests {
             .expect_err("failed interaction must surface an error");
         assert_eq!(err.category, adk_core::ErrorCategory::Internal);
         assert_eq!(err.details.provider.as_deref(), Some("gemini"));
+    }
+    #[test]
+    fn gemini_37_rejects_sampling_before_network_io() {
+        let model = GeminiModel::new("test-key", "gemini-3.7-flash").expect("construct model");
+        let mut request = LlmRequest::new("gemini-3.7-flash", Vec::new());
+        request.config =
+            Some(GenerateContentConfig { temperature: Some(0.2), ..Default::default() });
+
+        let error = model
+            .validate_request_contract(&request)
+            .expect_err("sampling must be rejected locally");
+        assert_eq!(error.code, "model.gemini.sampling_unsupported");
+    }
+
+    #[test]
+    fn gemini_37_rejects_token_budget_thinking() {
+        let model = GeminiModel::new("test-key", "gemini-3.7-flash")
+            .expect("construct model")
+            .with_thinking_config(adk_gemini::ThinkingConfig {
+                thinking_budget: Some(1024),
+                include_thoughts: None,
+                thinking_level: None,
+            });
+
+        let error = model
+            .validate_request_contract(&LlmRequest::new("gemini-3.7-flash", Vec::new()))
+            .expect_err("token budgets must be rejected locally");
+        assert_eq!(error.code, "model.gemini.thinking_budget_unsupported");
+    }
+}
+
+#[cfg(all(test, feature = "gemini-vertex"))]
+mod vertex_rag_tests {
+    use super::*;
+    use adk_gemini::VertexRagStore;
+
+    fn test_store() -> VertexRagStore {
+        VertexRagStore::corpus("projects/p/locations/us-central1/ragCorpora/123").with_top_k(5)
+    }
+
+    fn vertex_model() -> GeminiModel {
+        GeminiModel::new_google_cloud("test-key", "p", "us-central1", "gemini-3.7-flash")
+            .expect("construct vertex model")
+    }
+
+    // The Vertex constructor builds credential plumbing that requires a
+    // current Tokio runtime, so this test is async.
+    #[tokio::test]
+    async fn vertex_backend_accepts_and_stores_the_rag_store() {
+        let model = vertex_model().with_vertex_rag_store(test_store());
+
+        model
+            .validate_request_contract(&LlmRequest::new("gemini-3.7-flash", Vec::new()))
+            .expect("vertex backend must accept the rag store");
+
+        // The stored store is handed to adk-gemini's ContentBuilder per
+        // request; the exact wire-shape injection is asserted in adk-gemini's
+        // backend tests.
+        assert_eq!(model.vertex_rag_store(), Some(&test_store()));
+    }
+
+    #[test]
+    fn studio_backend_rejects_rag_store_before_network_io() {
+        let model = GeminiModel::new("test-key", "gemini-3.7-flash")
+            .expect("construct studio model")
+            .with_vertex_rag_store(test_store());
+
+        let error = model
+            .validate_request_contract(&LlmRequest::new("gemini-3.7-flash", Vec::new()))
+            .expect_err("studio backend must reject the rag store locally");
+        assert_eq!(error.code, "model.gemini.rag_store_requires_vertex");
+        assert_eq!(error.category, adk_core::ErrorCategory::Unsupported);
+        assert_eq!(error.details.provider.as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn no_rag_store_means_no_gate() {
+        let model = GeminiModel::new("test-key", "gemini-3.7-flash").expect("construct model");
+        assert_eq!(model.vertex_rag_store(), None);
+        model
+            .validate_request_contract(&LlmRequest::new("gemini-3.7-flash", Vec::new()))
+            .expect("no store configured, nothing to reject");
+    }
+}
+
+#[cfg(all(test, feature = "gemini-vertex"))]
+mod vertex_transport_tests {
+    use super::*;
+
+    #[test]
+    fn vertex_transport_failures_are_retryable() {
+        let error = adk_gemini::ClientError::Io {
+            source: std::io::Error::other(
+                "the transport reports an error: client error (SendRequest): http2 error",
+            ),
+        };
+        let mapped = gemini_error_to_adk(&error);
+        assert_eq!(
+            (mapped.category, mapped.code, mapped.is_retryable()),
+            (ErrorCategory::Unavailable, "model.gemini.unavailable", true)
+        );
+
+        let denied =
+            adk_gemini::ClientError::Io { source: std::io::Error::other("permission denied") };
+        assert_eq!(gemini_error_to_adk(&denied).category, ErrorCategory::Internal);
     }
 }

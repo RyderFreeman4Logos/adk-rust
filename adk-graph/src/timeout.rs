@@ -211,6 +211,9 @@ async fn execute_once_with_timeout(
     // call `report_progress()` to reset the idle timeout.
     let mut timeout_ctx = NodeContext::new(ctx.state.clone(), ctx.config.clone(), ctx.step);
     timeout_ctx.set_progress_handle(progress_handle.clone());
+    if let Some(run_config) = ctx.run_config() {
+        timeout_ctx.set_run_config(run_config);
+    }
 
     tokio::select! {
         result = node.execute(&timeout_ctx) => {
@@ -286,6 +289,22 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Returns how long a streaming node may take to produce its next event.
+///
+/// The budget is the smaller of the remaining run timeout and the idle timeout.
+/// For a stream, "idle" means no event was produced within `idle_timeout`, which
+/// is the streaming analogue of a node that never calls `report_progress()`.
+/// Returns `None` when the policy sets no applicable limit.
+pub fn item_timeout_budget(policy: &TimeoutPolicy, elapsed: Duration) -> Option<Duration> {
+    let remaining_run = policy.run_timeout.map(|limit| limit.saturating_sub(elapsed));
+    match (remaining_run, policy.idle_timeout) {
+        (Some(run), Some(idle)) => Some(run.min(idle)),
+        (Some(run), None) => Some(run),
+        (None, Some(idle)) => Some(idle),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]

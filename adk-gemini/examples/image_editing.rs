@@ -1,4 +1,4 @@
-use adk_gemini::Gemini;
+use adk_gemini::{Gemini, Model};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use display_error_chain::DisplayErrorChain;
 use std::env;
@@ -33,7 +33,7 @@ async fn do_main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY environment variable not set");
 
     // Create client with the image generation model
-    let client = Gemini::with_model(api_key, "models/gemini-2.5-flash-image-preview".to_string())
+    let client = Gemini::with_model(api_key, Model::Gemini31FlashImage)
         .expect("unable to create Gemini API client");
 
     info!("starting image editing example with Gemini");
@@ -141,10 +141,8 @@ fn save_generated_images(
         if let Some(parts) = &candidate.content.parts {
             for part in parts.iter() {
                 match part {
-                    adk_gemini::Part::Text { text, .. } => {
-                        if !text.trim().is_empty() {
-                            info!(text = text.trim(), prefix = prefix, "model text response");
-                        }
+                    adk_gemini::Part::Text { text, .. } if !text.trim().is_empty() => {
+                        info!(text = text.trim(), prefix = prefix, "model text response");
                     }
                     adk_gemini::Part::InlineData { inline_data } => {
                         image_count += 1;

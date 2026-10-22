@@ -5,9 +5,12 @@ use super::responses::{
     OpenRouterResponseInputItem,
 };
 use super::{OpenRouterReasoningReplay, OpenRouterResponseOutputItem, OpenRouterResponsesRequest};
-use adk_core::{AdkError, Content, Part};
+use adk_core::{AdkError, Content, EmbeddedResource, Part};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+/// MIME type used when an embedded resource blob does not declare one.
+const DEFAULT_BLOB_MIME_TYPE: &str = "application/octet-stream";
 
 /// Convert ADK contents into OpenRouter Responses API input items.
 pub fn adk_contents_to_response_input(
@@ -82,11 +85,11 @@ fn adk_content_to_response_item(
             Part::Thinking { thinking, .. } => {
                 push_text_fragment(thinking, &mut text_fragments, &mut structured_parts)
             }
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 flush_text_fragments(&mut text_fragments, &mut structured_parts);
                 structured_parts.push(response_part_from_inline_data(mime_type, data));
             }
-            Part::FileData { mime_type, file_uri } => {
+            Part::FileData { mime_type, file_uri, .. } => {
                 flush_text_fragments(&mut text_fragments, &mut structured_parts);
                 structured_parts.push(response_part_from_file_uri(mime_type, file_uri));
             }
@@ -100,7 +103,7 @@ fn adk_content_to_response_item(
                     ..Default::default()
                 });
             }
-            Part::FunctionResponse { function_response, id } => {
+            Part::FunctionResponse { function_response, id, .. } => {
                 return Ok(OpenRouterResponseInputItem {
                     kind: "function_call_output".to_string(),
                     id: id.clone(),
@@ -111,6 +114,22 @@ fn adk_content_to_response_item(
                     ..Default::default()
                 });
             }
+            // Embedded resources are user-supplied content, so they are forwarded:
+            // text folds into the text stream, blobs route through the inline-data path.
+            Part::EmbeddedResource { resource } => match resource {
+                EmbeddedResource::Text(text_resource) => push_text_fragment(
+                    &text_resource.text,
+                    &mut text_fragments,
+                    &mut structured_parts,
+                ),
+                EmbeddedResource::Blob(blob_resource) => {
+                    flush_text_fragments(&mut text_fragments, &mut structured_parts);
+                    structured_parts.push(response_part_from_inline_data(
+                        blob_resource.mime_type.as_deref().unwrap_or(DEFAULT_BLOB_MIME_TYPE),
+                        &blob_resource.data,
+                    ));
+                }
+            },
             // Server-side tool parts are Gemini-specific; skip for OpenRouter responses
             Part::ServerToolCall { .. } | Part::ServerToolResponse { .. } => {}
         }
@@ -279,7 +298,7 @@ mod tests {
         OpenRouterResponseInput, OpenRouterResponseOutputItem, OpenRouterResponsesRequest,
     };
     use crate::openrouter::{OpenRouterReasoningConfig, OpenRouterReasoningReplay};
-    use adk_core::Content;
+    use adk_core::{BlobResourceContents, Content, EmbeddedResource, Part, TextResourceContents};
 
     #[test]
     fn responses_input_maps_image_pdf_audio_and_video_parts() {
@@ -306,6 +325,49 @@ mod tests {
         assert_eq!(parts[2].kind, "input_audio");
         assert_eq!(parts[3].kind, "input_file");
         assert_eq!(parts[3].file_url.as_deref(), Some("https://example.com/demo.mp4"));
+    }
+
+    #[test]
+    fn responses_input_maps_embedded_text_and_blob_resources() {
+        let input = adk_contents_to_response_input(&[Content {
+            role: "user".to_string(),
+            parts: vec![
+                Part::EmbeddedResource {
+                    resource: EmbeddedResource::Text(TextResourceContents::new(
+                        "file:///project/src/main.rs",
+                        Some("text/x-rust".to_string()),
+                        "fn main() {}",
+                    )),
+                },
+                Part::EmbeddedResource {
+                    resource: EmbeddedResource::Blob(
+                        BlobResourceContents::new(
+                            "file:///logo.png",
+                            Some("image/png".to_string()),
+                            vec![0x89, 0x50, 0x4e, 0x47],
+                        )
+                        .expect("blob should build"),
+                    ),
+                },
+            ],
+        }])
+        .expect("input should convert");
+
+        let items = match input {
+            OpenRouterResponseInput::Items(items) => items,
+            other => panic!("expected item input, got {other:?}"),
+        };
+        let parts = match items[0].content.as_ref() {
+            Some(crate::openrouter::responses::OpenRouterResponseInputContent::Parts(parts)) => {
+                parts
+            }
+            other => panic!("expected structured parts, got {other:?}"),
+        };
+
+        assert_eq!(parts[0].kind, "input_text");
+        assert_eq!(parts[0].text.as_deref(), Some("fn main() {}"));
+        assert_eq!(parts[1].kind, "input_image");
+        assert_eq!(parts[1].image_url.as_deref(), Some("data:image/png;base64,iVBORw=="));
     }
 
     #[test]

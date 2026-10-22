@@ -15,10 +15,10 @@ Action nodes are the building blocks of visual and programmatic workflow graphs.
 
 ```toml
 [dependencies]
-adk-action = "2.0.0"
+adk-action = "2.3.0"
 
 # Or specific action features via umbrella crate
-adk-rust = { version = "2.0.0", features = ["action"] }
+adk-rust = { version = "2.3.0", features = ["action"] }
 ```
 
 ## Node Types (14)
@@ -33,12 +33,72 @@ adk-rust = { version = "2.0.0", features = ["action"] }
 | `Loop` | Iterate over collections or until a condition | Control |
 | `Merge` | Join multiple branches back together | Control |
 | `Wait` | Pause execution for a duration or until event | Control |
-| `Code` | Execute arbitrary code (JavaScript/Python/Rust) | Compute |
-| `Database` | Query databases (SQL, key-value, document) | I/O |
-| `Email` | Send emails via SMTP or provider APIs | I/O |
+| `Code` | Execute arbitrary code (Rust; **JS/TS not implemented**) | Compute |
+| `Database` | Query databases — **not implemented** | I/O |
+| `Email` | Send emails via SMTP — **not implemented** | I/O |
 | `Notification` | Send notifications (Slack, webhook, push) | I/O |
 | `RSS` | Read and parse RSS/Atom feeds | I/O |
 | `File` | Read, write, and transform files | I/O |
+
+## Availability Is Checked When the Graph Is Built
+
+Some node types accept and validate a configuration while their backend does not exist.
+Those are refused by `StateGraph::compile()`, not part-way through a run:
+
+| Configuration | Status |
+|---------------|--------|
+| `Database` (any type) | Rejected — no driver is integrated |
+| `Email` (monitor or send) | Rejected — IMAP and SMTP are not implemented |
+| `Code` with `language: javascript` or `typescript` | Rejected — no sandboxed runtime; use `rust` |
+| `Http` without the `action-http` feature | Rejected — enable the feature |
+
+A rejection names the node and the reason, so a workflow that cannot run fails while it
+is being assembled rather than after earlier nodes have already had side effects.
+
+Implement `Node::validate` on a custom node to take part in the same check.
+
+A node that bypasses the build-time check and executes anyway fails with an error
+saying its node type is not implemented. Enabling `action-db`, `action-email`, or
+`action-code` does not change that: those features compile the placeholders, not a
+backend.
+
+## Untrusted Paths and URLs
+
+File paths and HTTP URLs are interpolated from workflow state, so `ActionNodeExecutor`
+confines both.
+
+**File nodes** operate only inside the allowed roots — the current working directory
+unless `with_file_roots` names others:
+
+| Path | Outcome |
+|------|---------|
+| Relative | Resolved against the first root |
+| Contains a `..` component | Rejected |
+| Resolves outside every root, including through a symbolic link | Rejected |
+| Ends in a dangling symbolic link | Rejected |
+
+Listing does not follow or report symbolic links. Reported paths are the resolved
+absolute paths.
+
+**HTTP nodes** check the URL, and every redirect, against an `HttpActionPolicy`:
+
+| Setting | Default | Builder |
+|---------|---------|---------|
+| Schemes | `https` and `http`; `file:` and others are rejected | `allow_schemes` |
+| Hosts | Any | `allow_hosts` — exact names or `*.example.com` |
+| Redirects | Up to 5, each re-checked | `max_redirects`; `0` follows none |
+
+Logs and errors show the URL without its query string or credentials.
+
+```rust,ignore
+use adk_graph::action::ActionNodeExecutor;
+use adk_graph::action::http::HttpActionPolicy;
+
+let files = ActionNodeExecutor::new(file_config).with_file_roots(["/srv/workflow-data"]);
+let fetch = ActionNodeExecutor::new(http_config).with_http_policy(
+    HttpActionPolicy::new().allow_schemes(["https"]).allow_hosts(["api.example.com"]),
+);
+```
 
 ## StandardProperties
 

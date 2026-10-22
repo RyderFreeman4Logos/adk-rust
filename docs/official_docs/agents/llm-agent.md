@@ -15,7 +15,7 @@ Add dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-rust = "2.0.0"
+adk-rust = "2.3.0"
 tokio = { version = "1.40", features = ["full"] }
 dotenvy = "0.15"
 serde_json = "1.0"
@@ -40,7 +40,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     let agent = LlmAgentBuilder::new("my_agent")
         .instruction("You are a helpful assistant.")
@@ -181,7 +181,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // 1. Agent with templated instruction
     let agent = LlmAgentBuilder::new("personalized")
@@ -297,7 +297,7 @@ Add dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.0.0", features = ["tools"] }
+adk-rust = { version = "2.3.0", features = ["tools"] }
 tokio = { version = "1.40", features = ["full"] }
 dotenvy = "0.15"
 serde_json = "1.0"
@@ -321,7 +321,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // Tool 1: Weather lookup
     let weather_tool = FunctionTool::new(
@@ -407,7 +407,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     let extractor = LlmAgentBuilder::new("entity_extractor")
         .instruction("Extract entities from the given text.")
@@ -436,6 +436,27 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### How Providers Enforce the Schema
+
+`output_schema` reaches the provider as `GenerateContentConfig::response_schema`.
+What the provider does with it differs, and the agent validates the result either
+way:
+
+| Provider | Native enforcement |
+|----------|--------------------|
+| Gemini | Full schema, sent as the response schema |
+| OpenAI and OpenAI-compatible | Full schema, sent as a strict `json_schema` response format |
+| OpenRouter | Full schema |
+| DeepSeek | JSON **syntax** only — DeepSeek's JSON Output mode has no `json_schema` variant, so the schema is enforced by the agent's validation |
+
+Where a provider enforces syntax only, or nothing at all, the agent still injects the
+schema as an instruction and validates the reply, so a non-conforming answer costs a
+retry rather than returning bad data.
+
+> **Note:** DeepSeek requires the word "json" to appear in the prompt whenever JSON
+> Output is on, otherwise the API can return empty content. The adapter adds that
+> mention itself when your prompt does not already contain it.
 
 ### JSON Output Example
 
@@ -517,6 +538,7 @@ Intercept agent behavior:
 | `include_contents(mode)` | History visibility |
 | `max_iterations(n)` | Maximum LLM round-trips (default: 100) |
 | `tool_execution_strategy(strategy)` | Tool dispatch mode: `Sequential`, `Parallel`, or `Auto` |
+| `parallelize_agent_delegations(bool)` | Overlap consecutive agent-delegation calls without parallelizing ordinary tools |
 | `default_retry_budget(RetryBudget)` | Retry failed tools up to N times with delay |
 | `tool_retry_budget(name, RetryBudget)` | Per-tool retry override |
 | `circuit_breaker_threshold(u32)` | Disable tool after N consecutive failures |
@@ -604,23 +626,32 @@ use adk_core::ToolExecutionStrategy;
 let agent = LlmAgentBuilder::new("fast_agent")
     .model(Arc::new(model))
     .instruction("You are a research assistant. Use multiple tools in parallel.")
-    // Read-only tools run concurrently, mutable tools run sequentially
+    // Auto requires both safety signals for concurrent inclusion
     .tool_execution_strategy(ToolExecutionStrategy::Auto)
-    .tool(Arc::new(search_tool.with_read_only(true)))
-    .tool(Arc::new(lookup_tool.with_read_only(true)))
-    .tool(Arc::new(save_tool))  // mutable — runs after read-only batch
+    .tool(Arc::new(
+        search_tool
+            .with_read_only(true)
+            .with_concurrency_safe(true),
+    ))
+    .tool(Arc::new(
+        lookup_tool
+            .with_read_only(true)
+            .with_concurrency_safe(true),
+    ))
+    .tool(Arc::new(save_tool)) // runs after the concurrent safe subset
     .build()?;
 ```
 
 Three strategies are available:
 
 - `Sequential` (default) — tools execute one at a time in LLM order
-- `Parallel` — all tools execute concurrently via `join_all`
-- `Auto` — read-only tools (`is_read_only() == true`) run concurrently first, then mutable tools run sequentially
+- `Parallel` — all tools execute concurrently; this explicit override bypasses safety metadata, so the caller owns safety
+- `Auto` — calls whose tools are both read-only and concurrency-safe run concurrently first; all remaining calls then run sequentially
 
 Results are always returned in the original LLM order regardless of strategy. Failed tools produce a JSON error response without aborting the batch.
 
 The strategy is set per-agent via `LlmAgentBuilder::tool_execution_strategy()`. If not set, the default is `Sequential`.
+Use `LlmAgentBuilder::parallelize_agent_delegations(true)` when only consecutive agent-delegation calls should overlap. Ordinary tools remain sequential and keep their original phase ordering.
 
 ## Tool Resilience
 
@@ -684,7 +715,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // Weather tool
     let weather = FunctionTool::new(

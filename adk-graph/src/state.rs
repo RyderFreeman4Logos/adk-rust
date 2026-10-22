@@ -114,6 +114,27 @@ impl StateSchema {
         self.channels.get(channel).map(|c| &c.reducer).unwrap_or(&Reducer::Overwrite)
     }
 
+    /// Returns the first of `keys` that this schema does not declare.
+    ///
+    /// Returns `None` when the schema declares no channels, because then there
+    /// is nothing to check against.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::state::StateSchema;
+    ///
+    /// let schema = StateSchema::simple(&["kept"]);
+    /// assert_eq!(schema.first_undeclared(["kept"]), None);
+    /// assert_eq!(schema.first_undeclared(["kept", "typo"]), Some("typo"));
+    /// ```
+    pub fn first_undeclared<'a>(&self, keys: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+        if self.channels.is_empty() {
+            return None;
+        }
+        keys.into_iter().find(|key| !self.channels.contains_key(*key))
+    }
+
     /// Get the default value for a channel
     pub fn get_default(&self, channel: &str) -> Option<&Value> {
         self.channels.get(channel).and_then(|c| c.default.as_ref())
@@ -221,6 +242,29 @@ pub struct Checkpoint {
     pub metadata: HashMap<String, Value>,
     /// Creation timestamp
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The node whose static interrupt produced this checkpoint.
+    ///
+    /// A static interrupt is raised before the node runs, so the checkpoint holds
+    /// a frontier that still contains it. Without this marker the resumed run
+    /// reaches the same conclusion and raises the same interrupt, and the node
+    /// never executes. The executor clears the marker once that node has run, so
+    /// a cycle returning to the same gate asks again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_interrupt: Option<String>,
+    /// How many times each node has been attempted, for retry policies.
+    ///
+    /// Held here so a retry budget survives a resume. adk-python does not persist
+    /// its attempt count, so a resumed node there starts its budget again.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub attempts: HashMap<String, u32>,
+    /// Outputs of children invoked imperatively from a node body, keyed by child
+    /// path.
+    ///
+    /// A resumed parent re-runs from the top, so without this every child would
+    /// run again. Only successful outputs are recorded: a failed or interrupted
+    /// child must re-run.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub child_ledger: HashMap<String, Value>,
 }
 
 impl Checkpoint {
@@ -234,7 +278,16 @@ impl Checkpoint {
             pending_nodes,
             metadata: HashMap::new(),
             created_at: chrono::Utc::now(),
+            cleared_interrupt: None,
+            attempts: HashMap::new(),
+            child_ledger: HashMap::new(),
         }
+    }
+
+    /// Record the node whose static interrupt produced this checkpoint.
+    pub fn with_cleared_interrupt(mut self, node: impl Into<String>) -> Self {
+        self.cleared_interrupt = Some(node.into());
+        self
     }
 
     /// Add metadata to the checkpoint

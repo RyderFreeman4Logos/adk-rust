@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 pub const GROQ_API_BASE: &str = "https://api.groq.com/openai/v1";
 
 /// Configuration for Groq API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GroqConfig {
-    /// Groq API key.
+    /// Groq API key. Never serialized; deserializing a config without it yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
     /// Model name.
     pub model: String,
@@ -23,11 +26,23 @@ pub struct GroqConfig {
     pub max_tokens: Option<u32>,
 }
 
+impl std::fmt::Debug for GroqConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroqConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("reasoning_enabled", &self.reasoning_enabled)
+            .field("max_tokens", &self.max_tokens)
+            .finish()
+    }
+}
+
 impl Default for GroqConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            model: "llama-3.3-70b-versatile".to_string(),
+            model: crate::catalog::GROQ_DEFAULT.to_string(),
             base_url: None,
             reasoning_enabled: false,
             max_tokens: None,
@@ -41,9 +56,18 @@ impl GroqConfig {
         Self { api_key: api_key.into(), model: model.into(), ..Default::default() }
     }
 
-    /// Create a config for llama-3.3-70b-versatile model.
+    /// Create a config for the legacy `llama-3.3-70b-versatile` model.
+    ///
+    /// This model was removed from Groq's free and developer tiers on
+    /// 2026-08-16. Enterprise committed-spend plans may retain access. Prefer
+    /// [`GroqConfig::gpt_oss_120b`] for portable new deployments.
     pub fn llama70b(api_key: impl Into<String>) -> Self {
         Self::new(api_key, "llama-3.3-70b-versatile")
+    }
+
+    /// Create a config for Groq's production `openai/gpt-oss-120b` model.
+    pub fn gpt_oss_120b(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, crate::catalog::GROQ_DEFAULT)
     }
 
     /// Create a config for llama-3.1-8b-instant model (faster, smaller).

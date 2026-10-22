@@ -1,7 +1,8 @@
 //! Configuration types for DeepSeek provider.
 //!
-//! Supports DeepSeek V4 models (`deepseek-v4-pro`, `deepseek-v4-flash`) and
-//! legacy models (`deepseek-chat`, `deepseek-reasoner`).
+//! Supports the current DeepSeek models (`deepseek-flash`, `deepseek-v4-pro`).
+//! `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `deepseek-chat` and
+//! `deepseek-reasoner` aliases were retired on 2026-07-24.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,11 +69,15 @@ impl std::fmt::Display for ReasoningEffort {
 /// let pro_max = DeepSeekConfig::v4_pro("api-key")
 ///     .with_reasoning_effort(ReasoningEffort::Max);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeepSeekConfig {
-    /// DeepSeek API key.
+    /// DeepSeek API key. Never serialized; deserializing a config without it
+    /// yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
-    /// Model name (e.g., `"deepseek-v4-pro"`, `"deepseek-v4-flash"`, `"deepseek-chat"`).
+    /// Model name (e.g., `"deepseek-flash"`, `"deepseek-v4-pro"`).
     pub model: String,
     /// Optional custom base URL.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,11 +107,27 @@ pub struct DeepSeekConfig {
     pub thinking_enabled: bool,
 }
 
+impl std::fmt::Debug for DeepSeekConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeepSeekConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("thinking", &self.thinking)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("max_tokens", &self.max_tokens)
+            .field("beta", &self.beta)
+            .field("strict_tools", &self.strict_tools)
+            .field("thinking_enabled", &self.thinking_enabled)
+            .finish()
+    }
+}
+
 impl Default for DeepSeekConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            model: "deepseek-v4-flash".to_string(),
+            model: crate::catalog::DEEPSEEK_DEFAULT.to_string(),
             base_url: None,
             thinking: None,
             reasoning_effort: None,
@@ -138,27 +159,30 @@ impl DeepSeekConfig {
         }
     }
 
-    /// Create a config for `deepseek-v4-flash` (fast, cost-efficient).
+    /// Create a config for `deepseek-flash` (fast, cost-efficient, vision-capable).
     pub fn v4_flash(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-            model: "deepseek-v4-flash".to_string(),
-            ..Default::default()
-        }
+        Self { api_key: api_key.into(), model: "deepseek-flash".to_string(), ..Default::default() }
     }
 
-    // --- Legacy model constructors (backward compatible) ---
+    // --- Named-role constructors ---
 
-    /// Create a config for `deepseek-chat` model.
+    /// Create a config for DeepSeek's balanced chat model.
+    ///
+    /// Resolves to [`crate::catalog::DEEPSEEK_DEFAULT`]. Previously this selected
+    /// `deepseek-chat`, which DeepSeek retired on 2026-07-24.
     pub fn chat(api_key: impl Into<String>) -> Self {
-        Self::new(api_key, "deepseek-chat")
+        Self::new(api_key, crate::catalog::DEEPSEEK_DEFAULT)
     }
 
-    /// Create a config for `deepseek-reasoner` model with thinking enabled.
+    /// Create a config for DeepSeek's reasoning-oriented model with thinking enabled.
+    ///
+    /// Resolves to `deepseek-v4-pro`. Previously this selected
+    /// `deepseek-reasoner`, which DeepSeek retired on 2026-07-24. Thinking is a
+    /// per-request mode on the V4 models rather than a separate model.
     pub fn reasoner(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
-            model: "deepseek-reasoner".to_string(),
+            model: "deepseek-v4-pro".to_string(),
             thinking: Some(ThinkingMode::Enabled),
             thinking_enabled: true,
             max_tokens: Some(8192),
@@ -254,7 +278,7 @@ mod tests {
     #[test]
     fn test_default_model_is_v4_flash() {
         let config = DeepSeekConfig::default();
-        assert_eq!(config.model, "deepseek-v4-flash");
+        assert_eq!(config.model, "deepseek-flash");
     }
 
     #[test]
@@ -269,21 +293,21 @@ mod tests {
     #[test]
     fn test_v4_flash_constructor() {
         let config = DeepSeekConfig::v4_flash("key");
-        assert_eq!(config.model, "deepseek-v4-flash");
+        assert_eq!(config.model, "deepseek-flash");
         assert!(config.thinking.is_none());
     }
 
     #[test]
     fn test_legacy_chat_constructor() {
         let config = DeepSeekConfig::chat("key");
-        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(config.model, crate::catalog::DEEPSEEK_DEFAULT);
         assert!(!config.is_thinking_enabled());
     }
 
     #[test]
     fn test_legacy_reasoner_constructor() {
         let config = DeepSeekConfig::reasoner("key");
-        assert_eq!(config.model, "deepseek-reasoner");
+        assert_eq!(config.model, "deepseek-v4-pro");
         assert!(config.is_thinking_enabled());
     }
 

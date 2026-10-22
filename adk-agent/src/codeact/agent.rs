@@ -32,8 +32,8 @@ use adk_core::{
     EventActions, EventStream, GenerateContentConfig, GlobalInstructionProvider, IncludeContents,
     InstructionProvider, InvocationContext, Llm, LlmRequest, LlmResponse, MemoryEntry,
     OnToolErrorCallback, Part, ReadonlyContext, RetryBudget, SharedState, Tool,
-    ToolCallbackContext, ToolConfirmationDecision, ToolConfirmationPolicy, ToolConfirmationRequest,
-    ToolContext, ToolOutcome, Toolset,
+    ToolCallbackContext, ToolConfirmationDecision, ToolConfirmationHandler, ToolConfirmationPolicy,
+    ToolConfirmationRequest, ToolContext, ToolOutcome, Toolset,
 };
 use async_stream::stream;
 use async_trait::async_trait;
@@ -104,6 +104,7 @@ struct LoopInputs {
     tools: Vec<Arc<dyn Tool>>,
     policy: ToolConfirmationPolicy,
     decisions: HashMap<String, ToolConfirmationDecision>,
+    confirmation_handler: Option<Arc<dyn ToolConfirmationHandler>>,
     /// The live invocation context; a fresh [`CodeToolContext`] is built from it
     /// per tool call so each call carries its own function-call id and actions.
     invocation_ctx: Arc<dyn InvocationContext>,
@@ -210,7 +211,7 @@ impl ToolPolicy<'_> {
 fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>> {
     stream! {
         let LoopInputs {
-            model, runtime, tools, policy, decisions, invocation_ctx, incoming, system_prompt, conversation,
+            model, runtime, tools, policy, decisions, confirmation_handler, invocation_ctx, incoming, system_prompt, conversation,
             pending, invocation_id, agent_name, max_iterations, max_error_chars, supports_suspension,
             transfer_targets, generate_content_config, tool_timeout, output_key,
             default_retry_budget, tool_retry_budgets, circuit_breaker_threshold, on_tool_error,
@@ -222,6 +223,8 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
         } = input;
 
         let tool_map = build_tool_map(&tools);
+        let mut live_confirmation_decisions =
+            HashMap::<String, ToolConfirmationDecision>::new();
         let roster = roster(&tool_map);
 
         // Tool-robustness state for this invocation.
@@ -302,7 +305,34 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                         Some(resume_to_record(with))
                     }
                     Disposition::Resolved(rec) => Some(rec.clone()),
-                    Disposition::AwaitingConfirmation => match decisions.get(&cp.call.tool).copied() {
+                    Disposition::AwaitingConfirmation => {
+                        let call_id = cp.call.call_id.to_string();
+                        // Static decisions are keyed by call ID, so a resumed
+                        // checkpoint is authorized only for its own call.
+                        let mut decision = live_confirmation_decisions
+                            .get(&call_id)
+                            .copied()
+                            .or_else(|| decisions.get(&call_id).copied());
+                        if decision.is_none()
+                            && let Some(handler) = confirmation_handler.as_ref()
+                        {
+                            let request = ToolConfirmationRequest {
+                                tool_name: cp.call.tool.clone(),
+                                function_call_id: Some(cp.call.call_id.to_string()),
+                                args: cp.call.args.clone(),
+                            };
+                            match handler.decide(&request).await {
+                                Ok(value) => {
+                                    live_confirmation_decisions.insert(call_id, value);
+                                    decision = Some(value);
+                                }
+                                Err(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            }
+                        }
+                        match decision {
                         Some(ToolConfirmationDecision::Approve) => {
                             let (with, control) = execute_for_resume(
                                 &tool_map, &invocation_ctx, &cp.call, &mut pending_actions,
@@ -316,7 +346,8 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                             Some(ResolutionRecord::Raise(denied_message(&cp.call.tool)))
                         }
                         None => None,
-                    },
+                        }
+                    }
                     Disposition::AwaitingCompletion { .. } => {
                         completion_for(&incoming, &cp.call.tool, cp.call.call_id)
                             .map(ResolutionRecord::Value)
@@ -461,7 +492,32 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
 
                         // Confirmation gate.
                         if policy.requires_confirmation(&name) {
-                            match decisions.get(&name).copied() {
+                            let call_id_key = call_id.to_string();
+                            let mut decision = live_confirmation_decisions
+                                .get(&call_id_key)
+                                .copied()
+                                .or_else(|| decisions.get(&call_id_key).copied());
+                            if decision.is_none()
+                                && let Some(handler) = confirmation_handler.as_ref()
+                            {
+                                let request = ToolConfirmationRequest {
+                                    tool_name: name.clone(),
+                                    function_call_id: Some(call_id.to_string()),
+                                    args: args.clone(),
+                                };
+                                match handler.decide(&request).await {
+                                    Ok(value) => {
+                                        live_confirmation_decisions
+                                            .insert(call_id_key, value);
+                                        decision = Some(value);
+                                    }
+                                    Err(error) => {
+                                        yield Err(error);
+                                        return;
+                                    }
+                                }
+                            }
+                            match decision {
                                 Some(ToolConfirmationDecision::Approve) => {}
                                 Some(ToolConfirmationDecision::Deny) => {
                                     match call.resume(ResumeWith::Raise(denied_message(&name))) {
@@ -1303,7 +1359,7 @@ pub fn extract_code_block(text: &str) -> String {
 fn completion_for(content: &Content, tool: &str, call_id: u64) -> Option<Value> {
     let want_id = call_id.to_string();
     let by_id = content.parts.iter().find_map(|part| match part {
-        Part::FunctionResponse { function_response, id }
+        Part::FunctionResponse { function_response, id, .. }
             if function_response.name == tool && id.as_deref() == Some(want_id.as_str()) =>
         {
             Some(function_response.response.clone())
@@ -1314,7 +1370,7 @@ fn completion_for(content: &Content, tool: &str, call_id: u64) -> Option<Value> 
         return by_id;
     }
     content.parts.iter().find_map(|part| match part {
-        Part::FunctionResponse { function_response, id }
+        Part::FunctionResponse { function_response, id, .. }
             if function_response.name == tool && id.is_none() =>
         {
             Some(function_response.response.clone())
@@ -1403,7 +1459,7 @@ fn runtime_err(err: RuntimeError) -> AdkError {
 /// Build one with [`CodeActAgent::builder`], supplying a [`Llm`] and a
 /// [`CodeRuntime`]. The agent then drives the CodeAct loop: each turn the model
 /// writes one script, tools are exposed as callable functions, and the script
-/// returns a tagged [`ScriptOutput`](crate::codeact::ScriptOutput).
+/// returns a tagged [`ScriptOutput`].
 ///
 /// # Example
 ///
@@ -1522,14 +1578,19 @@ impl CodeActAgent {
         &self,
         ctx: &Arc<dyn InvocationContext>,
     ) -> adk_core::Result<Vec<Arc<dyn Tool>>> {
-        if self.toolsets.is_empty() {
+        if self.toolsets.is_empty() && ctx.run_config().runtime_toolsets.is_empty() {
             return Ok(self.tools.clone());
         }
         let mut resolved = self.tools.clone();
         let static_names: std::collections::HashSet<String> =
             self.tools.iter().map(|t| t.name().to_string()).collect();
         let mut source: HashMap<String, String> = HashMap::new();
-        for toolset in &self.toolsets {
+        let mut active_toolsets: Vec<&dyn Toolset> =
+            self.toolsets.iter().map(AsRef::as_ref).collect();
+        active_toolsets.extend(
+            ctx.run_config().runtime_toolsets.iter().map(|runtime| runtime.toolset().as_ref()),
+        );
+        for toolset in active_toolsets {
             let provided = toolset.tools(ctx.clone() as Arc<dyn ReadonlyContext>).await?;
             for tool in provided {
                 let name = tool.name().to_string();
@@ -1590,7 +1651,9 @@ impl CodeActAgent {
         match self.include_contents {
             IncludeContents::None => vec![current],
             IncludeContents::Default => {
-                let mut history = if ctx.run_config().transfer_targets.is_empty() {
+                let mut history = if ctx.run_config().transfer_targets.is_empty()
+                    && !ctx.authoritative_transfer_targets()
+                {
                     ctx.session().conversation_history()
                 } else {
                     ctx.session().conversation_history_for_agent(&self.name)
@@ -1632,6 +1695,17 @@ impl Agent for CodeActAgent {
         &self.sub_agents
     }
 
+    fn capabilities(&self) -> adk_core::AgentCapabilities {
+        adk_core::AgentCapabilities {
+            runtime_tools: true,
+            handoff: true,
+            relationship_confirmation: false,
+            checkpoint_resume: false,
+            shared_state: true,
+            invocation_metadata: true,
+        }
+    }
+
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> adk_core::Result<EventStream> {
         // Input guardrails run first; a block aborts the run, a transform
         // (e.g. PII redaction) rewrites the user content downstream.
@@ -1648,8 +1722,11 @@ impl Agent for CodeActAgent {
         // the `disallow_transfer_to_parent`/`disallow_transfer_to_peers` flags
         // (which apply only to the runner-provided parent/peers, never to
         // sub-agents). Mirrors LlmAgent.
-        let mut transfer_targets: Vec<String> =
-            self.sub_agents.iter().map(|a| a.name().to_string()).collect();
+        let mut transfer_targets: Vec<String> = if ctx.authoritative_transfer_targets() {
+            Vec::new()
+        } else {
+            self.sub_agents.iter().map(|a| a.name().to_string()).collect()
+        };
         let parent = ctx.run_config().parent_agent.as_deref();
         for target in &ctx.run_config().transfer_targets {
             if transfer_targets.contains(target) {
@@ -1702,6 +1779,7 @@ impl Agent for CodeActAgent {
             tools: resolved_tools,
             policy: self.policy.clone(),
             decisions: ctx.run_config().tool_confirmation_decisions.clone(),
+            confirmation_handler: ctx.run_config().tool_confirmation_handler.clone(),
             invocation_ctx: ctx.clone(),
             incoming: ctx.user_content().clone(),
             system_prompt,
@@ -2167,9 +2245,9 @@ impl CodeActAgentBuilder {
     /// Add a before-model callback, invoked before each model request.
     ///
     /// A callback may rewrite the request
-    /// ([`BeforeModelResult::Continue`](adk_core::BeforeModelResult::Continue))
+    /// ([`BeforeModelResult::Continue`])
     /// or skip the model call entirely with a synthetic response
-    /// ([`BeforeModelResult::Skip`](adk_core::BeforeModelResult::Skip)).
+    /// ([`BeforeModelResult::Skip`]).
     pub fn before_model_callback(mut self, callback: BeforeModelCallback) -> Self {
         self.before_model_callbacks.push(callback);
         self
@@ -2533,11 +2611,54 @@ impl ToolContext for CodeToolContext {
             None => Ok(vec![]),
         }
     }
+    fn memory(&self) -> Option<Arc<dyn adk_core::Memory>> {
+        self.inner.memory()
+    }
+    fn session(&self) -> Option<&dyn adk_core::Session> {
+        Some(self.inner.session())
+    }
+    fn run_config(&self) -> Option<&adk_core::RunConfig> {
+        Some(self.inner.run_config())
+    }
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+    fn request_metadata(&self) -> HashMap<String, serde_json::Value> {
+        self.inner.request_metadata()
+    }
+    fn delegation_depth(&self) -> u32 {
+        self.inner.delegation_depth()
+    }
+    fn max_delegation_depth(&self) -> Option<u32> {
+        self.inner.max_delegation_depth()
+    }
+
+    fn orchestration_root_invocation_id(&self) -> &str {
+        self.inner.orchestration_root_invocation_id()
+    }
+
+    fn orchestration_edge_id(&self) -> Option<&str> {
+        self.inner.orchestration_edge_id()
+    }
     fn user_scopes(&self) -> Vec<String> {
         self.inner.user_scopes()
     }
     async fn get_secret(&self, name: &str) -> adk_core::Result<Option<String>> {
         self.inner.get_secret(name).await
+    }
+
+    async fn get_secret_for_purpose(
+        &self,
+        name: &str,
+        purpose: &str,
+    ) -> adk_core::Result<Option<String>> {
+        // Inline code runs under the CodeAct agent rather than a named tool, so the
+        // identity presented is the run's, with the stated purpose attached.
+        let request = adk_core::SecretRequest::new(name)
+            .with_identity(self.inner.app_name(), self.inner.user_id(), self.inner.session_id())
+            .with_invocation_id(self.inner.invocation_id())
+            .with_purpose(purpose);
+        self.inner.get_secret_for(&request).await
     }
 }
 
@@ -2663,6 +2784,7 @@ mod tests {
             tools: vec![],
             policy: ToolConfirmationPolicy::Never,
             decisions: HashMap::new(),
+            confirmation_handler: None,
             invocation_ctx: Arc::new(MockInvocationContext::new(incoming.clone())),
             conversation: vec![incoming.clone()],
             incoming,
@@ -2854,6 +2976,7 @@ mod tests {
             parts: vec![Part::FunctionResponse {
                 function_response: adk_core::FunctionResponseData::new("slow", json!({"ok": true})),
                 id: None,
+                annotations: None,
             }],
         };
         let events = drive(
@@ -2996,6 +3119,7 @@ mod tests {
             parts: vec![Part::FunctionResponse {
                 function_response: FunctionResponseData::new("slow", json!({"ok": true})),
                 id: None,
+                annotations: None,
             }],
         };
         let ctx2 = Arc::new(MockInvocationContext::new(completion).with_state(state));

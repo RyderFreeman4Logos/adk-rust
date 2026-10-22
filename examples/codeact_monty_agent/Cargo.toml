@@ -6,8 +6,8 @@ publish = false
 description = "Runs the ADK-Rust CodeActAgent against a real Python interpreter via the Monty-backed CodeRuntime"
 
 # Standalone example crate with its own workspace, like the other examples. It
-# depends (transitively, through adk-codeact-monty) on `monty` via git, which
-# also requires rustc 1.95+ — see rust-toolchain.toml.
+# depends (transitively, through adk-codeact-monty) on `monty` from crates.io,
+# which requires rustc 1.95+ — see rust-toolchain.toml.
 [workspace]
 
 [dependencies]

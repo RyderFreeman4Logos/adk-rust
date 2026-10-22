@@ -17,6 +17,14 @@
 //! - **DeepSeek**: `` ```json\n{"name":"...","arguments":{...}}\n``` `` with `<｜tool▁call▁end｜>`
 //! - **Gemma 4**: `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>`
 //! - **Action tags**: `<|action_start|>JSON<|action_end|>`
+//!
+//! Provider clients call [`parse_declared_tool_calls`] and
+//! [`ToolCallBuffer::for_declared_tools`], which accept a parse only when every
+//! call names a tool the request declared. A markdown ` ```json ` fence is
+//! ordinary model output, so the DeepSeek format also requires an `arguments`
+//! or `parameters` object.
+
+use std::collections::HashSet;
 
 use adk_core::Part;
 
@@ -78,6 +86,45 @@ pub fn parse_text_tool_calls(text: &str) -> Option<Vec<Part>> {
     None
 }
 
+/// Parse text-based tool calls, accepting them only when they call declared tools.
+///
+/// Returns `None` — the caller keeps the text as text — when `declared_tools`
+/// is empty, when no tool call is detected, or when any parsed call names a
+/// tool outside `declared_tools`. This keeps ordinary output such as a JSON
+/// example with a `"name"` key from being turned into a tool call.
+///
+/// # Example
+///
+/// ```rust
+/// use std::collections::HashSet;
+///
+/// use adk_core::Part;
+/// use adk_model::tool_call_parser::parse_declared_tool_calls;
+///
+/// let declared = HashSet::from(["lookup".to_string()]);
+/// let example = "```json\n{\"name\": \"Alice\", \"age\": 30}\n```";
+/// assert!(parse_declared_tool_calls(example, &declared).is_none());
+///
+/// let call = "<tool_call>{\"name\": \"lookup\", \"arguments\": {\"id\": 7}}</tool_call>";
+/// let parts = parse_declared_tool_calls(call, &declared).unwrap();
+/// assert!(matches!(&parts[0], Part::FunctionCall { name, .. } if name == "lookup"));
+/// ```
+pub fn parse_declared_tool_calls(
+    text: &str,
+    declared_tools: &HashSet<String>,
+) -> Option<Vec<Part>> {
+    if declared_tools.is_empty() {
+        return None;
+    }
+    let parts = parse_text_tool_calls(text)?;
+    let all_declared = parts.iter().all(|part| match part {
+        Part::FunctionCall { name, .. } => declared_tools.contains(name),
+        _ => true,
+    });
+    let has_call = parts.iter().any(|part| matches!(part, Part::FunctionCall { .. }));
+    (all_declared && has_call).then_some(parts)
+}
+
 /// Parse Qwen/Hermes format tool calls.
 ///
 /// Handles two sub-formats:
@@ -91,7 +138,7 @@ fn parse_qwen_format(text: &str, _parts: &mut Vec<Part>) -> Option<Vec<Part>> {
         let start = remaining.find("<tool_call>")?;
 
         // Add any text before the tool call
-        let before = remaining[..start].trim();
+        let before = &remaining[..start];
         if !before.is_empty() {
             result.push(Part::Text { text: before.to_string() });
         }
@@ -117,7 +164,7 @@ fn parse_qwen_format(text: &str, _parts: &mut Vec<Part>) -> Option<Vec<Part>> {
 
         remaining = &after_open[end + "</tool_call>".len()..];
         if remaining.trim().is_empty() || !remaining.contains("<tool_call>") {
-            let trailing = remaining.trim();
+            let trailing = remaining;
             if !trailing.is_empty() {
                 result.push(Part::Text { text: trailing.to_string() });
             }
@@ -172,7 +219,7 @@ fn parse_llama_format(text: &str, _parts: &mut Vec<Part>) -> Option<Vec<Part>> {
     let start = text.find(tag)?;
 
     let mut result = Vec::new();
-    let before = text[..start].trim();
+    let before = &text[..start];
     if !before.is_empty() {
         result.push(Part::Text { text: before.to_string() });
     }
@@ -193,7 +240,7 @@ fn parse_mistral_nemo_format(text: &str, _parts: &mut Vec<Part>) -> Option<Vec<P
     let start = text.find(tag)?;
 
     let mut result = Vec::new();
-    let before = text[..start].trim();
+    let before = &text[..start];
     if !before.is_empty() {
         result.push(Part::Text { text: before.to_string() });
     }
@@ -215,10 +262,18 @@ fn parse_mistral_nemo_format(text: &str, _parts: &mut Vec<Part>) -> Option<Vec<P
     if result.is_empty() { None } else { Some(result) }
 }
 
+/// DeepSeek end-of-call markers that may follow the closing fence.
+const DEEPSEEK_END_MARKERS: &[&str] = &[
+    "<\u{ff5c}tool\u{2581}call\u{2581}end\u{ff5c}>",
+    "<\u{ff5c}tool\u{2581}calls\u{2581}end\u{ff5c}>",
+];
+
 /// Parse DeepSeek format: ` ```json\n{"name":"...","arguments":{...}}\n``` `
 ///
 /// DeepSeek models wrap tool calls in markdown JSON fences, optionally
-/// followed by `<｜tool▁call▁end｜>` (full-width Unicode delimiters).
+/// followed by `<｜tool▁call▁end｜>` (full-width Unicode delimiters). A fence
+/// is also ordinary markdown, so every object must carry a name and an
+/// `arguments` or `parameters` object; text after the fence is kept.
 fn parse_deepseek_format(text: &str) -> Option<Vec<Part>> {
     let fence_start = text.find("```json")?;
     let json_start = fence_start + "```json".len();
@@ -226,36 +281,49 @@ fn parse_deepseek_format(text: &str) -> Option<Vec<Part>> {
     let fence_end = after_fence.find("```")?;
     let json_str = after_fence[..fence_end].trim();
 
-    let mut result = Vec::new();
-    let before = text[..fence_start].trim();
-    if !before.is_empty() {
-        result.push(Part::Text { text: before.to_string() });
-    }
-
-    // Could be a single object or an array
-    if let Some(part) = parse_json_tool_call(json_str) {
-        result.push(part);
-    } else if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
-        for item in &arr {
-            if let Some(obj) = item.as_object() {
-                let name = obj
-                    .get("name")
-                    .or_else(|| obj.get("function"))
-                    .and_then(|v| v.as_str())?
-                    .to_string();
-                let args = obj
-                    .get("arguments")
-                    .or_else(|| obj.get("parameters"))
-                    .cloned()
-                    .unwrap_or(serde_json::json!({}));
-                result.push(Part::FunctionCall { name, args, id: None, thought_signature: None });
-            }
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let calls = match &value {
+        serde_json::Value::Array(items) => {
+            items.iter().map(parse_fenced_tool_call).collect::<Option<Vec<_>>>()?
         }
-    } else {
+        object => vec![parse_fenced_tool_call(object)?],
+    };
+    if calls.is_empty() {
         return None;
     }
 
-    if result.is_empty() { None } else { Some(result) }
+    let mut result = Vec::new();
+    let before = &text[..fence_start];
+    if !before.is_empty() {
+        result.push(Part::Text { text: before.to_string() });
+    }
+    result.extend(calls);
+
+    let mut trailing = &after_fence[fence_end + "```".len()..];
+    while let Some(rest) =
+        DEEPSEEK_END_MARKERS.iter().find_map(|m| trailing.trim_start().strip_prefix(m))
+    {
+        trailing = rest;
+    }
+    if !trailing.is_empty() {
+        result.push(Part::Text { text: trailing.to_string() });
+    }
+
+    Some(result)
+}
+
+/// Parse one fenced tool-call object; `arguments`/`parameters` must be present
+/// and be an object, never defaulted.
+fn parse_fenced_tool_call(value: &serde_json::Value) -> Option<Part> {
+    let obj = value.as_object()?;
+    let name = obj.get("name").or_else(|| obj.get("function")).and_then(|v| v.as_str())?;
+    let args = obj.get("arguments").or_else(|| obj.get("parameters")).filter(|v| v.is_object())?;
+    Some(Part::FunctionCall {
+        name: name.to_string(),
+        args: args.clone(),
+        id: None,
+        thought_signature: None,
+    })
 }
 
 /// Parse Gemma 4 format: `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>`
@@ -268,7 +336,7 @@ fn parse_gemma4_format(text: &str) -> Option<Vec<Part>> {
 
     loop {
         let start = remaining.find("<|tool_call>")?;
-        let before = remaining[..start].trim();
+        let before = &remaining[..start];
         if !before.is_empty() {
             result.push(Part::Text { text: before.to_string() });
         }
@@ -300,7 +368,7 @@ fn parse_gemma4_format(text: &str) -> Option<Vec<Part>> {
 
         remaining = &after_open[end + "<tool_call|>".len()..];
         if remaining.trim().is_empty() || !remaining.contains("<|tool_call>") {
-            let trailing = remaining.trim();
+            let trailing = remaining;
             if !trailing.is_empty() {
                 result.push(Part::Text { text: trailing.to_string() });
             }
@@ -322,7 +390,7 @@ fn parse_action_tag_format(text: &str) -> Option<Vec<Part>> {
     let start = text.find(start_tag)?;
     let mut result = Vec::new();
 
-    let before = text[..start].trim();
+    let before = &text[..start];
     if !before.is_empty() {
         result.push(Part::Text { text: before.to_string() });
     }
@@ -337,7 +405,7 @@ fn parse_action_tag_format(text: &str) -> Option<Vec<Part>> {
         return None;
     }
 
-    let trailing = after_open[end + end_tag.len()..].trim();
+    let trailing = &after_open[end + end_tag.len()..];
     if !trailing.is_empty() {
         result.push(Part::Text { text: trailing.to_string() });
     }
@@ -385,6 +453,8 @@ const MAX_BUFFER_SIZE: usize = 4096;
 pub struct ToolCallBuffer {
     buffer: String,
     buffering: bool,
+    /// Tools the request declared; `None` accepts any parsed call.
+    declared_tools: Option<HashSet<String>>,
 }
 
 /// Action returned by `ToolCallBuffer::push()`.
@@ -396,9 +466,33 @@ pub enum BufferAction {
 }
 
 impl ToolCallBuffer {
-    /// Create a new empty buffer.
+    /// Create a new empty buffer that accepts a parsed call to any tool name.
     pub fn new() -> Self {
-        Self { buffer: String::new(), buffering: false }
+        Self { buffer: String::new(), buffering: false, declared_tools: None }
+    }
+
+    /// Create a buffer that emits a parsed call only when every call names one of
+    /// `declared_tools`, as [`parse_declared_tool_calls`] does.
+    ///
+    /// With no declared tools the buffer never holds text back: every chunk is
+    /// emitted as text immediately.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::collections::HashSet;
+    ///
+    /// use adk_core::Part;
+    /// use adk_model::tool_call_parser::{BufferAction, ToolCallBuffer};
+    ///
+    /// let mut buffer = ToolCallBuffer::for_declared_tools(HashSet::new());
+    /// let BufferAction::Emit(parts) = buffer.push("<tool_call>{\"name\":\"x\"}</tool_call>") else {
+    ///     panic!("nothing is buffered without declared tools");
+    /// };
+    /// assert!(matches!(&parts[0], Part::Text { .. }));
+    /// ```
+    pub fn for_declared_tools(declared_tools: HashSet<String>) -> Self {
+        Self { buffer: String::new(), buffering: false, declared_tools: Some(declared_tools) }
     }
 
     /// Push a text chunk into the buffer.
@@ -408,10 +502,18 @@ impl ToolCallBuffer {
     pub fn push(&mut self, text: &str) -> BufferAction {
         self.buffer.push_str(text);
 
+        if self.declared_tools.as_ref().is_some_and(HashSet::is_empty) {
+            return self.flush_as_emit();
+        }
+
         if self.buffering {
             // Check if we have a complete tool call
             if self.has_complete_tool_call() {
                 return self.try_parse_and_emit();
+            }
+            // A prefix-like chunk can become ordinary text once more data arrives.
+            if !self.starts_tool_call_prefix() && !self.has_partial_prefix() {
+                return self.flush_as_emit();
             }
             // Safety valve: if buffer is too large, flush as text
             if self.buffer.len() > MAX_BUFFER_SIZE {
@@ -446,7 +548,7 @@ impl ToolCallBuffer {
         }
 
         // Try to parse as tool calls one last time
-        if let Some(parts) = parse_text_tool_calls(&self.buffer) {
+        if let Some(parts) = self.parse_buffer() {
             self.buffer.clear();
             self.buffering = false;
             return parts;
@@ -455,7 +557,14 @@ impl ToolCallBuffer {
         // Otherwise emit as text
         let text = std::mem::take(&mut self.buffer);
         self.buffering = false;
-        if text.trim().is_empty() { Vec::new() } else { vec![Part::Text { text }] }
+        if text.is_empty() { Vec::new() } else { vec![Part::Text { text }] }
+    }
+
+    fn parse_buffer(&self) -> Option<Vec<Part>> {
+        match &self.declared_tools {
+            Some(declared_tools) => parse_declared_tool_calls(&self.buffer, declared_tools),
+            None => parse_text_tool_calls(&self.buffer),
+        }
     }
 
     fn starts_tool_call_prefix(&self) -> bool {
@@ -492,7 +601,7 @@ impl ToolCallBuffer {
     }
 
     fn try_parse_and_emit(&mut self) -> BufferAction {
-        if let Some(parts) = parse_text_tool_calls(&self.buffer) {
+        if let Some(parts) = self.parse_buffer() {
             self.buffer.clear();
             self.buffering = false;
             BufferAction::Emit(parts)
@@ -505,7 +614,7 @@ impl ToolCallBuffer {
     fn flush_as_emit(&mut self) -> BufferAction {
         let text = std::mem::take(&mut self.buffer);
         self.buffering = false;
-        if text.trim().is_empty() {
+        if text.is_empty() {
             BufferAction::Emit(Vec::new())
         } else {
             BufferAction::Emit(vec![Part::Text { text }])
@@ -578,12 +687,17 @@ mod tests {
 
     #[test]
     fn test_multiple_tool_calls() {
+        // The two tool-call markups are separated by a single `\n`. After the
+        // whitespace-preservation fix, that separating newline is emitted as a
+        // `Part::Text` between the two `Part::FunctionCall`s (byte-exact
+        // reconstruction per Requirements 2.5/2.6), yielding 3 parts.
         let text = r#"<tool_call>{"name": "a", "arguments": {}}</tool_call>
 <tool_call>{"name": "b", "arguments": {"x": 1}}</tool_call>"#;
         let parts = parse_text_tool_calls(text).unwrap();
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 3);
         assert!(matches!(&parts[0], Part::FunctionCall { name, .. } if name == "a"));
-        assert!(matches!(&parts[1], Part::FunctionCall { name, .. } if name == "b"));
+        assert!(matches!(&parts[1], Part::Text { text } if text == "\n"));
+        assert!(matches!(&parts[2], Part::FunctionCall { name, .. } if name == "b"));
     }
 
     #[test]
@@ -740,6 +854,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_buffer_markdown_link_is_not_mistaken_for_tool_call() {
+        let mut buf = ToolCallBuffer::new();
+
+        assert!(matches!(buf.push("["), BufferAction::Buffering));
+
+        match buf.push("documentation](https://example.com) trailing text") {
+            BufferAction::Emit(parts) => {
+                assert_eq!(
+                    parts,
+                    vec![Part::Text {
+                        text: "[documentation](https://example.com) trailing text".to_string()
+                    }]
+                );
+            }
+            BufferAction::Buffering => panic!("markdown link must not stay buffered"),
+        }
+
+        assert!(buf.flush().is_empty());
+    }
+
+    #[test]
+    fn test_buffer_mistral_prefix_can_still_span_chunks() {
+        let mut buf = ToolCallBuffer::new();
+
+        assert!(matches!(buf.push("["), BufferAction::Buffering));
+        assert!(matches!(buf.push("TOOL"), BufferAction::Buffering));
+
+        match buf.push(r#"_CALLS][{"name":"search","arguments":{"q":"rust"}}]"#) {
+            BufferAction::Emit(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(
+                    &parts[0],
+                    Part::FunctionCall { name, .. } if name == "search"
+                ));
+            }
+            BufferAction::Buffering => panic!("should emit parsed tool call"),
+        }
+    }
+
     // ===== DeepSeek format tests =====
 
     #[test]
@@ -764,6 +918,78 @@ mod tests {
         let has_fn_call =
             parts.iter().any(|p| matches!(p, Part::FunctionCall { name, .. } if name == "search"));
         assert!(has_fn_call);
+    }
+
+    fn declared(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn json_example_without_declared_tools_stays_text() {
+        let text = "Here is the record:\n```json\n{\"name\":\"Alice\",\"age\":30}\n```\nDone.";
+
+        assert_eq!(parse_declared_tool_calls(text, &declared(&[])), None);
+    }
+
+    #[test]
+    fn json_example_with_other_declared_tool_stays_text() {
+        let text = "Here is the record:\n```json\n{\"name\":\"Alice\",\"age\":30}\n```\nDone.";
+
+        assert_eq!(parse_declared_tool_calls(text, &declared(&["lookup"])), None);
+        // The fence carries no arguments, so it is not a call even without the filter.
+        assert_eq!(parse_text_tool_calls(text), None);
+    }
+
+    #[test]
+    fn fenced_call_to_undeclared_tool_stays_text() {
+        let text = "```json\n{\"name\":\"delete_all\",\"arguments\":{}}\n```";
+
+        assert_eq!(parse_declared_tool_calls(text, &declared(&["lookup"])), None);
+    }
+
+    #[test]
+    fn fenced_call_to_declared_tool_parses_and_keeps_trailing_text() {
+        let text = "Checking.\n```json\n{\"name\":\"lookup\",\"arguments\":{\"id\":7}}\n```\nI will report back.";
+
+        assert_eq!(
+            parse_declared_tool_calls(text, &declared(&["lookup"])),
+            Some(vec![
+                Part::Text { text: "Checking.\n".to_string() },
+                Part::FunctionCall {
+                    name: "lookup".to_string(),
+                    args: serde_json::json!({"id": 7}),
+                    id: None,
+                    thought_signature: None,
+                },
+                Part::Text { text: "\nI will report back.".to_string() },
+            ])
+        );
+    }
+
+    #[test]
+    fn deepseek_end_marker_is_not_kept_as_text() {
+        let text = "```json\n{\"name\":\"lookup\",\"arguments\":{}}\n```\n<｜tool▁call▁end｜>";
+
+        assert_eq!(
+            parse_text_tool_calls(text),
+            Some(vec![Part::FunctionCall {
+                name: "lookup".to_string(),
+                args: serde_json::json!({}),
+                id: None,
+                thought_signature: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn declared_buffer_keeps_undeclared_calls_as_text() {
+        let text = "<tool_call>{\"name\":\"rm\",\"arguments\":{}}</tool_call>";
+        let mut buffer = ToolCallBuffer::for_declared_tools(declared(&["lookup"]));
+
+        let BufferAction::Emit(parts) = buffer.push(text) else {
+            panic!("a complete tag is resolved immediately");
+        };
+        assert_eq!(parts, vec![Part::Text { text: text.to_string() }]);
     }
 
     // ===== Gemma 4 format tests =====
@@ -817,5 +1043,170 @@ mod tests {
         let has_fn_call =
             parts.iter().any(|p| matches!(p, Part::FunctionCall { name, .. } if name == "search"));
         assert!(has_fn_call);
+    }
+
+    // ===== Whitespace-preservation regression tests =====
+
+    /// Stream a sequence of deltas through `ToolCallBuffer` (push each, then
+    /// flush) and return the concatenation of all emitted `Part::Text` values.
+    fn stream_and_reconstruct(deltas: &[&str]) -> String {
+        let mut buf = ToolCallBuffer::new();
+        let mut out = String::new();
+        let mut collect = |parts: Vec<Part>| {
+            for part in parts {
+                if let Part::Text { text } = part {
+                    out.push_str(&text);
+                }
+            }
+        };
+        for delta in deltas {
+            if let BufferAction::Emit(parts) = buf.push(delta) {
+                collect(parts);
+            }
+        }
+        collect(buf.flush());
+        out
+    }
+
+    #[test]
+    fn test_regression_markdown_structure_reconstructs() {
+        // Counterexample 1 (Requirements 2.1, 2.2, 2.3): whitespace-only deltas
+        // between visible text must be preserved so Markdown structure survives.
+        let reconstructed =
+            stream_and_reconstruct(&["Heading", "\n\n", "- first", "\n", "- second"]);
+        assert_eq!(reconstructed, "Heading\n\n- first\n- second");
+    }
+
+    #[test]
+    fn test_regression_single_space_reconstructs() {
+        // Counterexample 2 (Requirements 2.1, 2.4): a single-space delta between
+        // words must be preserved.
+        let reconstructed = stream_and_reconstruct(&["Hello", " ", "world"]);
+        assert_eq!(reconstructed, "Hello world");
+    }
+
+    #[test]
+    fn test_flush_as_emit_whitespace_only_emits_text() {
+        // Requirement 2.1: a whitespace-only delta must be emitted as Part::Text
+        // (previously dropped by the `text.trim().is_empty()` guard).
+        let mut buf = ToolCallBuffer::new();
+        match buf.push("\n\n") {
+            BufferAction::Emit(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(&parts[0], Part::Text { text } if text == "\n\n"));
+            }
+            BufferAction::Buffering => panic!("whitespace-only delta should emit"),
+        }
+    }
+
+    #[test]
+    fn test_flush_whitespace_only_emits_text() {
+        // Requirement 2.2: whitespace-only buffered content at end-of-stream must
+        // be emitted by flush rather than discarded.
+        let mut buf = ToolCallBuffer::new();
+        // Place whitespace-only content into the buffer as if mid-tool-call
+        // buffering had accumulated it, then flush at end of stream.
+        buf.buffer.push_str("   \n\t");
+        buf.buffering = true;
+        let parts = buf.flush();
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], Part::Text { text } if text == "   \n\t"));
+    }
+
+    // ===== Boundary-whitespace preservation across the six markup formats =====
+
+    #[test]
+    fn test_boundary_whitespace_qwen_preserved() {
+        // Leading/trailing whitespace around the markup is preserved, while the
+        // inner tool name/args stay trimmed (inner is `.trim()`ed before parse).
+        let text = "lead \n<tool_call>  {\"name\": \"search\", \"arguments\": {\"q\": \"rust\"}}  </tool_call>\n trail";
+        let parts = parse_text_tool_calls(text).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], Part::Text { text } if text == "lead \n"));
+        match &parts[1] {
+            Part::FunctionCall { name, args, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(args["q"], "rust");
+            }
+            _ => panic!("expected FunctionCall"),
+        }
+        assert!(matches!(&parts[2], Part::Text { text } if text == "\n trail"));
+    }
+
+    #[test]
+    fn test_boundary_whitespace_llama_preserved() {
+        let text = "pre \n<|python_tag|>  {\"name\": \"get_weather\", \"parameters\": {\"city\": \"NYC\"}}";
+        let parts = parse_text_tool_calls(text).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], Part::Text { text } if text == "pre \n"));
+        match &parts[1] {
+            Part::FunctionCall { name, args, .. } => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(args["city"], "NYC");
+            }
+            _ => panic!("expected FunctionCall"),
+        }
+    }
+
+    #[test]
+    fn test_boundary_whitespace_mistral_nemo_preserved() {
+        let text = "pre \n[TOOL_CALLS]  [{\"name\": \"search\", \"arguments\": {\"q\": \"rust\"}}]";
+        let parts = parse_text_tool_calls(text).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], Part::Text { text } if text == "pre \n"));
+        match &parts[1] {
+            Part::FunctionCall { name, args, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(args["q"], "rust");
+            }
+            _ => panic!("expected FunctionCall"),
+        }
+    }
+
+    #[test]
+    fn test_boundary_whitespace_deepseek_preserved() {
+        let text = "pre \n```json\n{\"name\": \"search\", \"arguments\": {\"q\": \"rust\"}}\n```";
+        let parts = parse_text_tool_calls(text).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], Part::Text { text } if text == "pre \n"));
+        match &parts[1] {
+            Part::FunctionCall { name, args, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(args["q"], "rust");
+            }
+            _ => panic!("expected FunctionCall"),
+        }
+    }
+
+    #[test]
+    fn test_boundary_whitespace_gemma4_preserved() {
+        let text = "pre \n<|tool_call>call:get_weather{<|\"|>city<|\"|>:<|\"|>Tokyo<|\"|>}<tool_call|>\n post";
+        let parts = parse_text_tool_calls(text).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], Part::Text { text } if text == "pre \n"));
+        match &parts[1] {
+            Part::FunctionCall { name, args, .. } => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(args["city"], "Tokyo");
+            }
+            _ => panic!("expected FunctionCall"),
+        }
+        assert!(matches!(&parts[2], Part::Text { text } if text == "\n post"));
+    }
+
+    #[test]
+    fn test_boundary_whitespace_action_tag_preserved() {
+        let text = "pre \n<|action_start|>  {\"name\": \"search\", \"arguments\": {\"q\": \"rust\"}}  <|action_end|>\n post";
+        let parts = parse_text_tool_calls(text).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], Part::Text { text } if text == "pre \n"));
+        match &parts[1] {
+            Part::FunctionCall { name, args, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(args["q"], "rust");
+            }
+            _ => panic!("expected FunctionCall"),
+        }
+        assert!(matches!(&parts[2], Part::Text { text } if text == "\n post"));
     }
 }

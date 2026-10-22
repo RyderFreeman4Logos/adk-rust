@@ -199,10 +199,10 @@ fn interpolate_option_field(
     path: &str,
     errors: &mut Vec<InterpolationError>,
 ) {
-    if let Some(value) = field {
-        if value.contains("${") {
-            *value = resolve_placeholders(value, path, errors);
-        }
+    if let Some(value) = field
+        && value.contains("${")
+    {
+        *value = resolve_placeholders(value, path, errors);
     }
 }
 
@@ -225,10 +225,8 @@ fn interpolate_json_value(
     errors: &mut Vec<InterpolationError>,
 ) {
     match value {
-        serde_json::Value::String(s) => {
-            if s.contains("${") {
-                *s = resolve_placeholders(s, path, errors);
-            }
+        serde_json::Value::String(s) if s.contains("${") => {
+            *s = resolve_placeholders(s, path, errors);
         }
         serde_json::Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();

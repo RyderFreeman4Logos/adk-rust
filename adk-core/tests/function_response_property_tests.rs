@@ -14,8 +14,9 @@ fn arb_mime_type() -> impl Strategy<Value = String> {
 }
 
 fn arb_inline_data_part() -> impl Strategy<Value = InlineDataPart> {
-    (arb_mime_type(), prop::collection::vec(any::<u8>(), 0..1024))
-        .prop_map(|(mime_type, data)| InlineDataPart { mime_type, data })
+    (arb_mime_type(), prop::collection::vec(any::<u8>(), 0..1024)).prop_map(|(mime_type, data)| {
+        InlineDataPart { mime_type, data, uri: None, annotations: None }
+    })
 }
 
 fn arb_file_uri() -> impl Strategy<Value = String> {
@@ -27,8 +28,11 @@ fn arb_file_uri() -> impl Strategy<Value = String> {
 }
 
 fn arb_file_data_part() -> impl Strategy<Value = FileDataPart> {
-    (arb_mime_type(), arb_file_uri())
-        .prop_map(|(mime_type, file_uri)| FileDataPart { mime_type, file_uri })
+    (arb_mime_type(), arb_file_uri()).prop_map(|(mime_type, file_uri)| FileDataPart {
+        mime_type,
+        file_uri,
+        annotations: None,
+    })
 }
 
 fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {

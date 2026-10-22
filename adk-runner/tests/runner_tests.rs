@@ -1,7 +1,9 @@
 use adk_core::{Agent, Content, EventStream, InvocationContext, Part, Result, SessionId, UserId};
 use adk_plugin::{Plugin, PluginConfig, PluginManager};
 use adk_runner::Runner;
-use adk_session::{Event, Events, GetRequest, Session, SessionService, State};
+use adk_session::{
+    Event, Events, GetRequest, InMemorySessionService, Session, SessionService, State,
+};
 use adk_skill::{SelectionPolicy, SkillInjector, SkillInjectorConfig};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -182,6 +184,299 @@ async fn test_runner_run() {
     assert!(result.is_ok());
 }
 
+struct TransferAgent {
+    name: String,
+    target: Option<String>,
+}
+
+#[async_trait]
+impl Agent for TransferAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "emits a deterministic handoff"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let mut event = Event::new(ctx.invocation_id());
+        event.author = self.name.clone();
+        event.actions.transfer_to_agent = self.target.clone();
+        Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+    }
+}
+
+#[tokio::test]
+async fn started_run_exposes_the_invocation_identity_before_polling() {
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(Arc::new(TransferAgent { name: "test_agent".to_string(), target: None })
+            as Arc<dyn Agent>)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let started = runner
+        .start_with_config(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("Hello"),
+            None,
+        )
+        .await
+        .unwrap();
+    let invocation_id = started.invocation_id().to_string();
+    let events = started.into_events().collect::<Vec<_>>().await;
+
+    assert!(!invocation_id.is_empty());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].as_ref().unwrap().invocation_id, invocation_id);
+}
+
+struct StrictTransferRoot {
+    root: TransferAgent,
+    children: Vec<Arc<dyn Agent>>,
+    allowlists: std::collections::HashMap<String, Vec<String>>,
+    max_depth: u32,
+    denied_target: Option<String>,
+}
+
+#[async_trait]
+impl Agent for StrictTransferRoot {
+    fn name(&self) -> &str {
+        self.root.name()
+    }
+
+    fn description(&self) -> &str {
+        self.root.description()
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &self.children
+    }
+
+    fn configure_run(&self, _agent_name: &str, config: &mut adk_core::RunConfig) {
+        config.max_transfer_depth = Some(self.max_depth);
+    }
+
+    fn transfer_targets_for(&self, agent_name: &str) -> Option<Vec<String>> {
+        Some(self.allowlists.get(agent_name).cloned().unwrap_or_default())
+    }
+
+    fn strict_transfer_policy(&self) -> bool {
+        true
+    }
+
+    async fn govern_transfer(
+        &self,
+        request: &adk_core::AgentTransferRequest,
+    ) -> Result<adk_core::AgentTransferDecision> {
+        if self.denied_target.as_deref() == Some(request.to.as_str()) {
+            Ok(adk_core::AgentTransferDecision::Deny {
+                reason: "deployment policy rejected target".to_string(),
+            })
+        } else {
+            Ok(adk_core::AgentTransferDecision::Allow)
+        }
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        self.root.run(ctx).await
+    }
+}
+
+#[tokio::test]
+async fn strict_root_rejects_peer_widening() {
+    let billing: Arc<dyn Agent> =
+        Arc::new(TransferAgent { name: "billing".to_string(), target: None });
+    let technical: Arc<dyn Agent> =
+        Arc::new(TransferAgent { name: "technical".to_string(), target: None });
+    let root: Arc<dyn Agent> = Arc::new(StrictTransferRoot {
+        root: TransferAgent {
+            name: "supervisor".to_string(),
+            target: Some("technical".to_string()),
+        },
+        children: vec![billing, technical],
+        allowlists: std::collections::HashMap::from([(
+            "supervisor".to_string(),
+            vec!["billing".to_string()],
+        )]),
+        max_depth: 4,
+        denied_target: None,
+    });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(root)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+    let mut stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("route"),
+        )
+        .await
+        .unwrap();
+    let mut error = None;
+    while let Some(result) = stream.next().await {
+        if let Err(value) = result {
+            error = Some(value);
+            break;
+        }
+    }
+    let error = error.unwrap();
+    assert_eq!(error.code, "agent.transfer.target_forbidden");
+    assert!(error.to_string().contains("cannot hand off to 'technical'"));
+}
+
+#[tokio::test]
+async fn strict_root_reports_handoff_depth_overflow() {
+    let first: Arc<dyn Agent> =
+        Arc::new(TransferAgent { name: "first".to_string(), target: Some("second".to_string()) });
+    let second: Arc<dyn Agent> =
+        Arc::new(TransferAgent { name: "second".to_string(), target: None });
+    let root: Arc<dyn Agent> = Arc::new(StrictTransferRoot {
+        root: TransferAgent { name: "supervisor".to_string(), target: Some("first".to_string()) },
+        children: vec![first, second],
+        allowlists: std::collections::HashMap::from([
+            ("supervisor".to_string(), vec!["first".to_string()]),
+            ("first".to_string(), vec!["second".to_string()]),
+        ]),
+        max_depth: 1,
+        denied_target: None,
+    });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(root)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+    let mut stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("route"),
+        )
+        .await
+        .unwrap();
+    let mut error = None;
+    while let Some(result) = stream.next().await {
+        if let Err(value) = result {
+            error = Some(value);
+            break;
+        }
+    }
+    let error = error.unwrap();
+    assert_eq!(error.code, "agent.transfer.depth_exceeded");
+    assert!(error.to_string().contains("maximum handoff depth 1 exceeded"));
+}
+
+#[tokio::test]
+async fn runner_applies_async_transfer_governance_before_target_execution() {
+    let target: Arc<dyn Agent> =
+        Arc::new(TransferAgent { name: "billing".to_string(), target: None });
+    let root: Arc<dyn Agent> = Arc::new(StrictTransferRoot {
+        root: TransferAgent { name: "supervisor".to_string(), target: Some("billing".to_string()) },
+        children: vec![target],
+        allowlists: std::collections::HashMap::from([(
+            "supervisor".to_string(),
+            vec!["billing".to_string()],
+        )]),
+        max_depth: 4,
+        denied_target: Some("billing".to_string()),
+    });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(root)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+    let mut stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("route"),
+        )
+        .await
+        .unwrap();
+    let mut error = None;
+    while let Some(result) = stream.next().await {
+        if let Err(value) = result {
+            error = Some(value);
+            break;
+        }
+    }
+    let error = error.expect("governance must reject the transfer");
+    assert_eq!(error.code, "agent.transfer.denied");
+    assert!(error.to_string().contains("deployment policy rejected target"));
+}
+
+struct OrchestrationRootProbe {
+    observed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Agent for OrchestrationRootProbe {
+    fn name(&self) -> &str {
+        "billing"
+    }
+
+    fn description(&self) -> &str {
+        "checks root invocation propagation"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        self.observed.store(
+            ctx.orchestration_root_invocation_id() != ctx.invocation_id(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+#[tokio::test]
+async fn runner_preserves_orchestration_root_across_handoffs() {
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let target: Arc<dyn Agent> = Arc::new(OrchestrationRootProbe { observed: observed.clone() });
+    let root: Arc<dyn Agent> = Arc::new(StrictTransferRoot {
+        root: TransferAgent { name: "supervisor".to_string(), target: Some("billing".to_string()) },
+        children: vec![target],
+        allowlists: std::collections::HashMap::from([(
+            "supervisor".to_string(),
+            vec!["billing".to_string()],
+        )]),
+        max_depth: 4,
+        denied_target: None,
+    });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(root)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+    let stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("route"),
+        )
+        .await
+        .unwrap();
+    let results = stream.collect::<Vec<_>>().await;
+    assert!(results.into_iter().all(|result| result.is_ok()));
+    assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[test]
 fn test_find_agent_in_tree() {
     let sub_agent: Arc<dyn Agent> = Arc::new(MockAgent { name: "sub_agent".to_string() });
@@ -295,6 +590,75 @@ impl Agent for MockAgentWithSubs {
     async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
+}
+
+// Mock workflow agent (parallel/sequential/loop-like) that does not participate
+// in cross-turn transfer — mirrors the real workflow agents' override.
+struct MockWorkflowAgent {
+    name: String,
+    sub_agents: Vec<Arc<dyn Agent>>,
+}
+
+#[async_trait]
+impl Agent for MockWorkflowAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "Mock workflow agent"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &self.sub_agents
+    }
+
+    fn supports_agent_transfer(&self) -> bool {
+        false
+    }
+
+    async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+/// Regression test for #419: when a workflow agent's sub-agent responded on a
+/// previous turn, the runner must resume the workflow *root* (so every
+/// sub-agent runs again), not the single sub-agent that responded last.
+#[tokio::test]
+async fn test_find_agent_to_run_resumes_workflow_root_not_subagent() {
+    let technical: Arc<dyn Agent> = Arc::new(MockAgent { name: "technical_analyst".to_string() });
+    let business: Arc<dyn Agent> = Arc::new(MockAgent { name: "business_analyst".to_string() });
+    let ux: Arc<dyn Agent> = Arc::new(MockAgent { name: "ux_analyst".to_string() });
+
+    let root: Arc<dyn Agent> = Arc::new(MockWorkflowAgent {
+        name: "multi_analyst".to_string(),
+        sub_agents: vec![technical, business, ux],
+    });
+
+    // History: a user turn followed by one sub-agent (ux_analyst) responding.
+    let mut events = vec![];
+    let mut user_event = adk_session::Event::new("inv-1");
+    user_event.author = "user".to_string();
+    events.push(user_event);
+    let mut sub_event = adk_session::Event::new("inv-1");
+    sub_event.author = "ux_analyst".to_string();
+    events.push(sub_event);
+
+    let session = MockSession {
+        id: "session1".to_string(),
+        app_name: "test".to_string(),
+        user_id: "user1".to_string(),
+        events: MockEvents { events },
+        state: MockState,
+    };
+
+    let agent = Runner::find_agent_to_run(&root, &session);
+    assert_eq!(
+        agent.name(),
+        "multi_analyst",
+        "workflow root must be resumed, not the last-responding sub-agent"
+    );
 }
 
 struct EchoUserContentAgent;
@@ -622,4 +986,366 @@ fn test_compute_transfer_context_nested() {
     let (parent, peers) = Runner::compute_transfer_context(&root, "mid");
     assert_eq!(parent, Some("root".to_string()));
     assert!(peers.is_empty());
+}
+
+struct InterruptedHistoryAgent {
+    call_persisted: Arc<tokio::sync::Notify>,
+    captured_history: Arc<Mutex<Option<Vec<Content>>>>,
+}
+
+#[async_trait]
+impl Agent for InterruptedHistoryAgent {
+    fn name(&self) -> &str {
+        "interrupted-history"
+    }
+
+    fn description(&self) -> &str {
+        "Captures history after an interrupted tool call"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let is_first =
+            ctx.user_content().parts.iter().filter_map(Part::text).any(|text| text == "first");
+        if !is_first {
+            *self.captured_history.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some(ctx.session().conversation_history());
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+
+        let invocation_id = ctx.invocation_id().to_string();
+        let call_persisted = self.call_persisted.clone();
+        Ok(Box::pin(async_stream::stream! {
+            let mut call = Event::new(&invocation_id);
+            call.author = "interrupted-history".to_string();
+            call.llm_response.content = Some(Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "slow_tool".to_string(),
+                    args: serde_json::json!({}),
+                    id: Some("call-1".to_string()),
+                    thought_signature: None,
+                }],
+            });
+            yield Ok(call);
+
+            call_persisted.notify_one();
+            futures::future::pending::<()>().await;
+        }))
+    }
+}
+
+#[tokio::test]
+async fn interrupted_run_does_not_leave_an_orphaned_call_in_the_next_request() {
+    let session_service = Arc::new(InMemorySessionService::new());
+    session_service
+        .create(adk_session::CreateRequest {
+            app_name: "test_app".to_string(),
+            user_id: "user123".to_string(),
+            session_id: Some("interrupted-history".to_string()),
+            state: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let call_persisted = Arc::new(tokio::sync::Notify::new());
+    let captured_history = Arc::new(Mutex::new(None));
+    let agent = Arc::new(InterruptedHistoryAgent {
+        call_persisted: call_persisted.clone(),
+        captured_history: captured_history.clone(),
+    });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(agent as Arc<dyn Agent>)
+        .session_service(session_service as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let first = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("interrupted-history").unwrap(),
+            Content::new("user").with_text("first"),
+        )
+        .await
+        .unwrap();
+    let first_task = tokio::spawn(async move {
+        let mut first = first;
+        while let Some(result) = first.next().await {
+            result.unwrap();
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), call_persisted.notified())
+        .await
+        .expect("the first invocation must persist its tool call");
+
+    assert!(runner.interrupt("interrupted-history"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), first_task)
+        .await
+        .expect("the interrupted invocation must stop promptly")
+        .unwrap();
+
+    let mut second = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("interrupted-history").unwrap(),
+            Content::new("user").with_text("second"),
+        )
+        .await
+        .unwrap();
+    while let Some(result) = second.next().await {
+        result.unwrap();
+    }
+
+    let history = captured_history
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .expect("the second invocation must capture history");
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|content| content.role == "user"));
+    assert!(!history.iter().flat_map(|content| &content.parts).any(|part| {
+        matches!(
+            part,
+            Part::FunctionCall { id: Some(id), .. }
+                | Part::FunctionResponse { id: Some(id), .. }
+                if id == "call-1"
+        )
+    }));
+}
+
+// Agent that emits events in a loop until cancelled or `max_ticks` is reached.
+// Used to validate cooperative cancellation (issue #402): it honors
+// `ctx.is_cancelled()` between ticks, and the runner's cancellation race
+// interrupts the in-flight await.
+struct CancellableLoopAgent {
+    max_ticks: usize,
+}
+
+#[async_trait]
+impl Agent for CancellableLoopAgent {
+    fn name(&self) -> &str {
+        "cancellable-loop"
+    }
+
+    fn description(&self) -> &str {
+        "Emits events until cancelled or max_ticks reached"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let max_ticks = self.max_ticks;
+        let stream = futures::stream::unfold((0usize, ctx), move |(i, ctx)| async move {
+            // Stop before starting another tick if cancelled (Part 1/2 analog).
+            if i >= max_ticks || ctx.is_cancelled() {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            if ctx.is_cancelled() {
+                return None;
+            }
+            let mut event = Event::new(ctx.invocation_id());
+            event.author = "cancellable-loop".to_string();
+            event.llm_response.content = Some(Content::new("model").with_text(format!("tick-{i}")));
+            Some((Ok(event), (i + 1, ctx)))
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+#[tokio::test]
+async fn test_runner_interrupt_stops_agent_stream() {
+    // Issue #402: Runner::interrupt() must stop a long-running agent promptly
+    // rather than letting it run to natural completion.
+    let agent = Arc::new(CancellableLoopAgent { max_ticks: 1000 });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(agent as Arc<dyn Agent>)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let session_id = "cancel-session";
+    let mut stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new(session_id).unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+
+    // Ensure the agent is actually running (received at least one event).
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("first event should arrive within timeout");
+    assert!(first.is_some(), "expected at least one event before interrupt");
+
+    // Interrupt the running agent.
+    let interrupted = runner.interrupt(session_id);
+    assert!(interrupted, "interrupt() should find the active session");
+
+    // The stream must terminate promptly and well before max_ticks.
+    let mut extra = 0usize;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await {
+            Ok(Some(_)) => {
+                extra += 1;
+                assert!(extra < 50, "stream kept producing events after interrupt");
+            }
+            Ok(None) => break, // stream ended — cancellation was honored
+            Err(_) => panic!("stream did not terminate after interrupt (timed out)"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_runner_runs_to_completion_without_interrupt() {
+    // Control case: without interrupt, the same agent runs to completion.
+    let agent = Arc::new(CancellableLoopAgent { max_ticks: 3 });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(agent as Arc<dyn Agent>)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let mut stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("normal-session").unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+
+    let mut count = 0usize;
+    while let Some(result) = stream.next().await {
+        result.unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 3, "agent should emit exactly max_ticks events when not interrupted");
+}
+
+// ── Global cancellation token ──────────────────────────────────────────
+
+fn runner_with_global_token(
+    agent: Arc<dyn Agent>,
+    global: tokio_util::sync::CancellationToken,
+) -> Runner {
+    Runner::builder()
+        .app_name("test_app")
+        .agent(agent)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .cancellation_token(global)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn global_cancellation_token_leaves_no_task_behind_per_run() {
+    let global = tokio_util::sync::CancellationToken::new();
+    let runner = runner_with_global_token(
+        Arc::new(MockAgent { name: "test_agent".to_string() }),
+        global.clone(),
+    );
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let baseline = metrics.num_alive_tasks();
+
+    for run in 0..5 {
+        let mut stream = runner
+            .run(
+                UserId::new("user123").unwrap(),
+                SessionId::new(format!("session-{run}")).unwrap(),
+                Content::new("user").with_text("go"),
+            )
+            .await
+            .unwrap();
+        while let Some(result) = stream.next().await {
+            result.unwrap();
+        }
+    }
+    tokio::task::yield_now().await;
+
+    assert_eq!(metrics.num_alive_tasks(), baseline, "a completed run must not leave tasks behind");
+    assert_eq!(runner.active_runs(), Vec::new());
+    assert!(!global.is_cancelled());
+}
+
+#[tokio::test]
+async fn global_cancellation_token_stops_an_in_flight_run() {
+    let global = tokio_util::sync::CancellationToken::new();
+    let runner = runner_with_global_token(
+        Arc::new(CancellableLoopAgent { max_ticks: 1000 }),
+        global.clone(),
+    );
+    let mut stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("global-cancel").unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("first event should arrive within timeout");
+    assert!(first.is_some(), "expected at least one event before cancellation");
+
+    global.cancel();
+
+    let remaining = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut count = 0usize;
+        while stream.next().await.is_some() {
+            count += 1;
+        }
+        count
+    })
+    .await
+    .expect("stream should terminate after the global token is cancelled");
+    assert!(remaining < 50, "stream kept producing events after cancellation");
+}
+
+#[tokio::test]
+async fn interrupt_with_a_global_token_cancels_only_the_target_run() {
+    let global = tokio_util::sync::CancellationToken::new();
+    let runner =
+        runner_with_global_token(Arc::new(CancellableLoopAgent { max_ticks: 3 }), global.clone());
+    let mut interrupted = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("interrupted").unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), interrupted.next())
+        .await
+        .expect("first event should arrive within timeout");
+    assert!(first.is_some(), "expected at least one event before interrupt");
+
+    assert!(runner.interrupt("interrupted"));
+    while interrupted.next().await.is_some() {}
+    assert!(!global.is_cancelled(), "interrupting one run must not cancel the global token");
+
+    let mut next = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("next").unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+    let mut count = 0usize;
+    while let Some(result) = next.next().await {
+        result.unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 3, "a later run must not inherit the interrupted run's cancellation");
 }

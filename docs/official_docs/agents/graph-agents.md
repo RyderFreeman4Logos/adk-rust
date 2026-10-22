@@ -22,6 +22,45 @@ The `adk-graph` crate provides LangGraph-style workflow orchestration for buildi
 - **LLM Integration**: Native support for wrapping ADK agents as graph nodes
 - **Flexible Routing**: Static edges, conditional routing, and dynamic decision making
 
+## Choosing Between the Workflow Agents and the Graph
+
+ADK-Rust supports two ways to orchestrate. Neither replaces the other, and both
+are maintained.
+
+| You need | Use | Why |
+|----------|-----|-----|
+| A fixed order of steps | `SequentialAgent` | The topology is the list. Nothing to declare. |
+| Several agents on the same input | `ParallelAgent` | Fan-out with no join to configure. |
+| Repeat until a condition holds | `LoopAgent` | The exit condition is a callback, not an edge. |
+| A branch chosen at run time | Graph | Conditional edges, or a node that names its own successor. |
+| Cycles with a step budget | Graph | `recursion_limit` bounds the super-steps. |
+| A pause a person answers later | Graph | Interrupts checkpoint the run and resume it. |
+| Survival across a process restart | Graph | `SqliteCheckpointer` persists each super-step. |
+| Rewinding to an earlier step | Graph | Time travel forks a checkpoint. |
+
+Prefer the workflow agents when the shape of the work is known and linear: they
+are shorter to write and there is no state schema to maintain. Reach for the graph
+when control flow depends on results, or when a run has to outlive the process.
+
+### They compose
+
+The three workflow agents implement `Agent`, and `AgentNode` wraps any `Agent`, so
+a workflow agent is a graph node:
+
+```rust
+use adk_agent::SequentialAgent;
+use adk_graph::node::AgentNode;
+use std::sync::Arc;
+
+let pipeline = Arc::new(SequentialAgent::new("pipeline", vec![extract, validate]));
+let node = AgentNode::new(pipeline as Arc<dyn adk_core::Agent>);
+// `node` now goes into a StateGraph like any other node.
+```
+
+`GraphAgent` also implements `Agent`, so the reverse holds: a graph can be a
+sub-agent of a `SequentialAgent`. Use the graph for the part that needs branching
+or durability, and the workflow agents for the parts that do not.
+
 ## What You'll Build
 
 In this guide, you'll create a **Text Processing Pipeline** that runs translation and summarization in parallel:
@@ -115,10 +154,10 @@ Add dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-graph = { version = "2.0.0", features = ["sqlite"] }
-adk-agent = "2.0.0"
-adk-model = "2.0.0"
-adk-core = "2.0.0"
+adk-graph = { version = "2.3.0", features = ["sqlite"] }
+adk-agent = "2.3.0"
+adk-model = "2.3.0"
+adk-core = "2.3.0"
 tokio = { version = "1", features = ["full"] }
 dotenvy = "0.15"
 serde_json = "1.0"
@@ -150,7 +189,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     // Create specialized LLM agents
     let translator_agent = Arc::new(
@@ -390,7 +429,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     // Create classifier agent
     let classifier_agent = Arc::new(
@@ -591,7 +630,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
 
     // Create tools
     let weather_tool = Arc::new(FunctionTool::new(
@@ -732,6 +771,41 @@ Final Answer: "The weather in Paris is 72°F and sunny with 45% humidity.
 
 Wraps any ADK `Agent` (typically `LlmAgent`) as a graph node:
 
+#### What the agent sees
+
+An agent inside a graph runs under a context derived from the invocation that
+started the graph, so it behaves the same as it does outside one. When a `Runner`
+invokes a `GraphAgent`, the caller's identity and services are carried through
+automatically:
+
+| Carried through | Note |
+|-----------------|------|
+| `app_name`, `user_id`, `session_id` | The caller's, not a synthetic one |
+| Scopes and request metadata | So scope checks see the caller's grants |
+| Secret service, memory, artifacts, shared state | Available exactly as outside the graph |
+| Cancellation | `Runner::interrupt` reaches an agent running as a node |
+| `RunConfig` | Inherited from the caller |
+| `branch` | **Derived**, as `{caller_branch}.{agent_name}`, so a node's events are attributable |
+
+A graph invoked directly — `graph.invoke(state, ExecutionConfig::new("thread"))` —
+has no invocation to inherit. That is **standalone mode**: the node gets
+`user_id = "graph_user"`, `app_name = "graph_app"`, branch `main`, no secrets, and no
+memory. It is a deliberate mode for running a graph outside a `Runner`, not a
+fallback to reach for in production.
+
+To bridge manually — for instance when driving a graph from your own executor — pass
+the invocation explicitly:
+
+```rust
+let config = ExecutionConfig::new(ctx.session_id()).with_parent_context(ctx.clone());
+```
+
+> **Note:** the node still runs on its own in-memory graph session, so agent
+> conversation history inside a node is scoped to the node rather than appended to the
+> caller's session.
+
+
+
 ```rust
 let node = AgentNode::new(llm_agent)
     .with_input_mapper(|state| {
@@ -801,6 +875,39 @@ Dynamic routing based on state:
 )
 ```
 
+### Routing From Inside a Node
+
+A conditional edge fixes its targets when the graph is built. `NodeOutput::with_goto`
+does not: a node writes state and names its successors in the same step, and it may
+name any node in the graph, including one it has no edge to.
+
+```rust
+use adk_graph::node::NodeOutput;
+use serde_json::json;
+
+// The node decides where control goes, from what it just computed.
+async fn triage(ctx: &adk_graph::node::NodeContext) -> adk_graph::error::Result<NodeOutput> {
+    let amount = ctx.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let next = if amount > 10_000.0 { "escalate" } else { "auto_approve" };
+    Ok(NodeOutput::new().with_update("risk", json!(next)).with_goto([next]))
+}
+```
+
+| Behaviour | Rule |
+|-----------|------|
+| Declared edges | A node that sets a goto does not also follow its outgoing edges. The goto replaces them. |
+| Several targets | All named nodes run, admitted in sorted order. |
+| `END` | Naming `END` stops that branch. |
+| An unknown name | The run fails with `GraphError::UnknownRouteTarget`. |
+| No goto | The declared edges decide, which is the default. |
+
+The frontier a goto produces is checkpointed like any other, so a paused run
+resumes into the node the goto chose.
+
+> **Note:** use `add_conditional_edges` when the possible targets are known when
+> you build the graph — the edges then appear in a rendered diagram. Use a goto
+> when the choice belongs to the node.
+
 ### Router Helpers
 
 Use built-in routers for common patterns:
@@ -850,6 +957,18 @@ let agent = GraphAgent::builder("parallel_processor")
     .edge("combiner", END)
     .build()?;
 ```
+
+`combiner` runs **once**, after all three branches arrive. Nothing in the code
+above asks for that: a node with more than one incoming direct edge is deferred
+automatically at compile time. Branches of unequal length therefore join
+correctly without configuration.
+
+Two details follow from how the count is taken:
+
+| Case | Behaviour |
+|------|-----------|
+| Conditional predecessors | Not counted. A conditional branch may never fire, so waiting for it could stall the join. |
+| A quorum instead of all | Set `min_predecessors` on `DeferredNodeConfig` and mark the node with `mark_deferred`, to release after *n* of *m* arrive. |
 
 ## Cyclic Graphs (ReAct Pattern)
 
@@ -1020,6 +1139,20 @@ let agent = GraphAgent::builder("stateful")
 | `Sum` | Add numeric values |
 | `Custom` | Custom merge function |
 
+### Update order
+
+Nodes in one super-step run concurrently and finish in whatever order their work
+takes. Their state updates are applied in **node-name order**, not in the order
+the nodes finished.
+
+The order matters whenever a reducer is not commutative. `Append` builds an
+array, so the order is the result; a `Custom` reducer may be order-sensitive too.
+Sorting by node name makes a run reproducible: the same graph and the same input
+give the same state, whatever the timing of a slow dependency.
+
+Where several channels are written by one node, they are applied in channel-name
+order. Channels do not interact, so this matters only for reading a trace.
+
 ## Checkpointing
 
 Enable persistent state for fault tolerance and human-in-the-loop:
@@ -1050,9 +1183,60 @@ let graph = StateGraph::with_channels(&["task", "result"])
     .with_checkpointer(checkpointer);
 ```
 
+### What a Checkpoint Records
+
+A checkpoint stores the accumulated state, the step number, and the **frontier** —
+the nodes that still have to run. It is written after the frontier advances, so
+resuming an interrupted run does not re-execute a node whose step was checkpointed
+and never double-applies its updates. A run that finishes checkpoints an empty
+frontier, so resuming a completed thread with `invoke` returns the final state
+rather than restarting the graph.
+
+The frontier saved depends on how the step ended:
+
+| Situation | Frontier saved |
+|-----------|----------------|
+| Super-step completed | The next nodes to run |
+| Run finished | Empty |
+| `interrupt_before` gate | The nodes that were executing; the gated node has not run |
+| `interrupt_after` gate | The successors of the nodes that ran |
+| Dynamic or tool-confirmation pause | The successors and `goto` targets of every node that completed in the step, plus each node that paused |
+
+A checkpoint also records the arrivals a fan-in node is still waiting on, so a join
+whose first predecessor finished before a pause or crash runs once the last one
+arrives after the resume. `update_state` keeps those arrivals, the answered gate,
+and the retry budget.
+
+Streamed runs checkpoint on the same schedule as blocking runs, including when an
+interrupt ends the stream, so a human-in-the-loop pause is resumable in either
+execution mode.
+
+### Execution Guarantees
+
+Node execution is **at-least-once**. A super-step runs its nodes, applies their
+updates, and only then saves its checkpoint, so:
+
+| Event | Effect on resume |
+|-------|------------------|
+| Crash while a super-step is running | Every node of that step runs again, including nodes that had finished |
+| Checkpoint save fails | The run fails; the last saved step is where a resume starts |
+| Pause or completed step | No node of a checkpointed step runs again |
+
+Make a node with external side effects — a payment, an email, a write to another
+system — idempotent, for example by deriving an idempotency key from the thread id
+and step, so a repeated execution is harmless.
+
 ### Checkpoint History (Time Travel)
 
-Checkpoints also enable **durable resume** — if a graph execution crashes or the process restarts, execution resumes from the last persisted checkpoint rather than starting over. Use `SqliteCheckpointer` or `PostgresCheckpointer` for crash-safe persistence.
+> **Reads only.** `TimeTravelHandle::state_history(from, to)` returns the state that
+> was *stored* at each checkpointed step. It executes nothing — no node runs, no event
+> is regenerated, and no side effect repeats. To re-run from a point in history, use
+> `fork_at` to branch that checkpoint and invoke the graph on the forked thread. The
+> method was previously named `replay` and documented as re-executing the graph, which
+> it never did.
+
+
+Checkpoints also enable **durable resume** — if a graph execution crashes or the process restarts, execution resumes from the last persisted checkpoint rather than starting over. Use `SqliteCheckpointer` (the `sqlite` feature) for crash-safe persistence. `MemoryCheckpointer` holds checkpoints in the process, so they do not survive a restart. Those two are the backends this crate ships; implement the `Checkpointer` trait for anything else.
 
 ```rust
 // List all checkpoints for a thread
@@ -1207,6 +1391,252 @@ while let Some(event) = stream.next().await {
 | `Messages` | Stream message-type updates |
 | `Debug` | Stream all internal events |
 
+`Messages` mode reads tokens from `Node::execute_stream` as they are produced.
+Each node runs **once** per super-step in this mode: the node reports its state
+updates on the stream as a `StreamEvent::Updates` event, and the executor applies
+those rather than executing the node a second time to collect them. This matters
+most for `AgentNode`, where a second execution would mean a second billed model
+call per node.
+
+> **Important:** a custom `Node` that overrides `execute_stream` must yield a
+> `StreamEvent::Updates` event carrying its state updates. Without it the node
+> streams events but contributes no state in `Messages` mode. The default
+> `execute_stream`, which wraps `execute`, does this for you.
+
+Timeout policies apply to the streamed execution itself. For a stream,
+`idle_timeout` means no event was produced within the limit.
+
+## Subgraphs
+
+A compiled graph runs as a node of another through `SubgraphNode`. The inner graph
+keeps its own channels, edges and interrupt gates, and exchanges named channels
+with its parent.
+
+```rust
+use adk_graph::subgraph::SubgraphNode;
+use std::sync::Arc;
+
+let outer = StateGraph::with_channels(&["document", "size"])
+    .add_node(
+        SubgraphNode::new("measure_doc", Arc::new(inner))
+            .with_input("document", "text")
+            .with_output("length", "size"),
+    )
+    .add_edge(START, "measure_doc")
+    .add_edge("measure_doc", END)
+    .compile()?;
+```
+
+| Rule | Behaviour |
+|------|-----------|
+| Shared names | A channel both schemas declare under one name passes through both ways. |
+| `isolated()` | Nothing passes implicitly; every exchange must be named. Worth it when the two graphs are maintained apart, because adding a channel to one then cannot silently start feeding the other. |
+| A pause inside | Pauses the parent, carrying the subgraph's name and the inner message. |
+| Threads | The subgraph runs on `<parent thread>/<node name>`, so two subgraphs of one parent cannot collide. |
+| A wrong channel name | Fails when the **parent compiles**, naming the channel and the side. |
+
+That last row is the difference worth knowing: both schemas are available before
+anything runs, so a mapping naming a channel neither side declares cannot reach a
+run and surface as an absent value. A subgraph that exchanges nothing at all is
+rejected the same way, because it could not affect its parent.
+
+### Resuming a pause inside a subgraph
+
+Nothing extra is needed. Invoking the parent again on the same thread re-enters
+the subgraph, which finds its own checkpoint on `<parent thread>/<node name>` and
+continues from where it stopped. Work the subgraph finished before the pause is
+not repeated, and a pause several levels down resumes the same way — the message
+names each level it passed through.
+
+A subgraph that declares an interrupt gate but holds no checkpointer is rejected
+when the parent compiles: it would re-enter at its first node and pay for its
+finished work a second time.
+
+| Kind of pause | How the answer arrives |
+|---------------|------------------------|
+| `interrupt_before` / `interrupt_after` inside | Nothing to supply; the resume clears the gate that fired |
+| A node inside deciding for itself | The decision arrives as state, projected in through the channel mapping |
+
+Because both graphs hold real checkpointers, this survives a process restart: a
+fresh set of graph objects sharing only the databases resumes the same run.
+
+### Handing control back to the parent
+
+A node inside a subgraph can end its own graph and name a node of the graph that
+holds it:
+
+```rust
+Ok(NodeOutput::new()
+    .with_update("reason", json!("no confident answer"))
+    .with_goto_parent(["escalate"]))
+```
+
+The subgraph finishes and projects its output channels as usual, then the parent
+continues at `escalate` rather than following the subgraph node's declared edges.
+The parent validates the target, because it is the only side that knows its own
+nodes.
+
+## Reliability and Cost Controls
+
+Each of these is off by default, so a graph behaves as it did before you set one.
+
+### Per-node retry
+
+A transient failure — a rate limit, a dropped connection — otherwise ends the run.
+
+```rust
+use adk_graph::retry::{RetryOn, RetryPolicy};
+use std::time::Duration;
+
+let graph = graph.with_node_retry(
+    "call_model",
+    RetryPolicy::new(3)
+        .with_initial_delay(Duration::from_millis(500))
+        .with_max_delay(Duration::from_secs(8))
+        .with_backoff_factor(2.0)
+        .with_retry_on(RetryOn::Any),
+);
+```
+
+The delay grows by `backoff_factor`, is capped at `max_delay`, and then has jitter
+applied. A node with **no policy runs once**, so retry stays opt-in. A policy from
+`RetryPolicy::default()` allows ten attempts, whose nine sleeps total about 243
+seconds — lower `max_attempts` where a caller is waiting on the answer.
+
+An interrupt is never retried, whatever `retry_on` says: a pause is not a failure.
+The attempt count is checkpointed, so a resumed run continues the budget rather
+than restarting it.
+
+### Bounding concurrency
+
+A wide fan-out dispatches its whole frontier at once, which can exhaust a
+connection pool or trip a provider rate limit.
+
+```rust
+let graph = graph.with_max_concurrency(4);
+```
+
+Nodes beyond the cap wait for a slot. The admission order is the frontier sorted by
+name, so it does not depend on timing. Imperative child invocations are outside
+this budget, because a parent awaits its children while holding its own slot.
+
+### Per-node timeouts
+
+A `TimeoutPolicy` caps a single attempt and, with `idle_timeout`, how long a node
+may go without reporting progress. Exceeding either gives
+`GraphError::NodeTimedOut`, which a retry policy may then act on.
+
+### Invoking a node directly
+
+When the number of sub-tasks comes from state rather than from the graph's shape, a
+node can invoke another node itself:
+
+```rust
+use adk_graph::child::RunNodeOptions;
+
+let output = ctx
+    .run_node_with("reviewer", json!({ "aspect": aspect }), RunNodeOptions::with_run_id(aspect))
+    .await?;
+```
+
+The target needs no edge. Each completed child is recorded under
+`<parent>/<child>@<run_id>`, so a resumed run returns the recorded answer instead
+of executing the child again — which matters when the child costs a model call.
+
+### Node caching
+
+`cache_policy` on a node keys its result by node name and current state, with an
+optional TTL, so an unchanged input skips the work. Requires the `node-cache`
+feature; a Redis-backed store is available behind `redis-cache`.
+
+The key is computed from the state at the start of the super-step, and a hit's
+cached updates are applied with the step's other updates, so a hit is
+indistinguishable from the node running: siblings in the same step never see it.
+The in-memory store belongs to the compiled graph, so every run of that graph
+shares it.
+
+### Delta checkpoints
+
+The `delta` feature stores the difference between super-steps rather than the whole
+state, which matters when state is large and steps are many.
+
+### Time travel
+
+With the `time-travel` feature, `graph.time_travel(thread_id)?` returns a handle
+over a thread's checkpoint history: list the steps, read the state at one, or
+`fork_at` a checkpoint to branch a new thread from it. The call returns `Result`
+because every operation reads checkpoints, so a graph with no checkpointer reports
+`GraphError::CheckpointError` rather than panicking.
+
+### Graph-wide defaults
+
+Repeating the same retry across twenty nodes is easy to get wrong by omission.
+
+```rust
+use adk_graph::graph::NodeDefaults;
+
+let graph = graph
+    .with_node_defaults(NodeDefaults::new().with_retry(RetryPolicy::new(3)))
+    .with_node_retry("critical", RetryPolicy::new(10));
+```
+
+A per-node value always wins. `NodeDefaults` also carries a timeout and a failure
+handler.
+
+### Recovering from a node failure
+
+Once a node's retry budget is spent, a handler may record what happened and name a
+recovery node instead of ending the run:
+
+```rust
+let graph = graph.with_node_error_handler("charge", |node, error, _state| {
+    Ok(NodeOutput::new()
+        .with_update("status", json!(format!("{node} failed: {error}")))
+        .with_goto(["compensate"]))
+});
+```
+
+Returning `Err` ends the run as before. An interrupt never reaches a handler,
+because a pause is not a failure.
+
+### Bounding checkpoint growth
+
+A thread accumulates one checkpoint per super-step. A run that lives for days
+therefore grows without bound, which costs storage and slows `list`.
+
+```rust
+use adk_graph::checkpoint::RetentionPolicy;
+use std::time::Duration;
+
+let graph = graph
+    .with_checkpoint_retention(
+        RetentionPolicy::keep_last(50).with_max_age(Duration::from_secs(7 * 24 * 3600)),
+    );
+```
+
+Pruning happens after each save, so the cost stays proportional to the run and no
+external job is needed. **The newest checkpoint is never discarded**, whatever the
+policy says, because it is the one a resume loads — `keep_last(0)` is raised to
+one, and a thread whose every checkpoint is past the age limit keeps one.
+
+Off by default, so an existing thread keeps its whole history and time travel can
+still reach every step. Set a policy when a thread is long-lived and you do not
+need to rewind far.
+
+### Rejecting undeclared channels
+
+A channel the schema does not declare takes the overwrite reducer, because that is
+the fallback for an unknown name. A graph that declared a list channel and then
+wrote a near-miss name keeps only the last value and reports nothing.
+
+```rust
+let graph = graph.with_strict_channels();
+```
+
+A node writing an undeclared channel then fails the run with
+`GraphError::UndeclaredChannel`, naming the node and the channel. Off by default,
+and inert when a graph declares no channels at all.
+
 ## ADK Integration
 
 GraphAgent implements the ADK `Agent` trait, so it works with:
@@ -1237,6 +1667,21 @@ let graph_agent = GraphAgent::builder("workflow")
 // See adk-runner README for Runner configuration
 ```
 
+### Turns on a Checkpointed Thread
+
+Each `Agent::run` call is one turn on a thread whose id is the session id. With a
+checkpointer configured:
+
+| Thread's latest checkpoint | What the turn does |
+|----------------------------|--------------------|
+| None | Runs the graph from its entry nodes |
+| Paused (non-empty frontier) | Resumes the paused run, with the turn's input merged into its state |
+| Finished (empty frontier) | Runs the graph again from its entry nodes, starting from the previous turn's final state with the turn's input merged on top |
+
+The recursion limit applies to each turn separately. `GraphAgent::invoke` and
+`CompiledGraph::invoke` keep the direct-graph behaviour: re-invoking a finished
+thread returns its final state without running anything.
+
 ## Examples
 
 Validated graph examples in this repository:
@@ -1253,14 +1698,29 @@ The full graph gallery with real LLM integration lives in [adk-playground](https
 
 | Feature | LangGraph | adk-graph |
 |---------|-----------|-----------|
-| State Management | TypedDict + Reducers | StateSchema + Reducers |
-| Execution Model | Pregel super-steps | Pregel super-steps |
+| State management | TypedDict + reducers | `StateSchema` + reducers |
+| Execution model | Pregel super-steps | Pregel super-steps |
 | Checkpointing | Memory, SQLite, Postgres | Memory, SQLite |
-| Human-in-Loop | interrupt_before/after | interrupt_before/after + dynamic |
+| Human-in-the-loop | `interrupt_before`/`after` | `interrupt_before`/`after` + dynamic |
 | Streaming | 5 modes | 5 modes |
-| Cycles | Native support | Native support |
-| Type Safety | Python typing | Rust type system |
-| LLM Integration | LangChain | AgentNode + ADK agents |
+| Cycles | Native | Native |
+| Type safety | Python typing | Rust type system |
+| LLM integration | LangChain | `AgentNode` + ADK agents |
+| Routing from a node | `Command(goto=...)` | `NodeOutput::with_goto`, `AgentNode::with_goto_mapper` |
+| Fan-out sized by state | `Send("node", input)` | `ctx.run_node_with(name, input, options)` |
+| Per-node retry | `RetryPolicy` | `RetryPolicy` with capped backoff and jitter |
+| Concurrency cap | `max_concurrency` in config | `with_max_concurrency` on the graph |
+| Node caching | `cache_policy` | `cache_policy` (`node-cache` feature) |
+| Deferred join | `defer=True` | Automatic for multiple direct predecessors, plus an *n*-of-*m* quorum |
+| Subgraph as a node | `add_node("sub", compiled)` | `SubgraphNode`, with channel mapping checked when the parent compiles |
+| Subgraph to parent hop | `Command(graph=Command.PARENT)` | `NodeOutput::with_goto_parent` |
+| Graph-wide node defaults | `set_node_defaults` (≥1.2) | `with_node_defaults`, plus the pre-existing `default_timeout` |
+| Node failure handlers | `error_handler` (≥1.2) | `with_node_error_handler`, run once the retry budget is spent |
+
+Two differences are worth stating plainly. `run_node_with` returns the child's
+result inline and records it, so a resumed run does not pay for a completed child
+again, whereas `Send` hands work to the scheduler and collects it through a
+reducer. And a hop from a subgraph into its parent has no equivalent here yet.
 
 ---
 

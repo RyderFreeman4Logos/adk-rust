@@ -199,7 +199,10 @@ mod preservation {
 
         let resp = &responses[0];
         assert!(!resp.partial);
-        assert!(resp.turn_complete);
+        assert!(
+            !resp.turn_complete,
+            "a tool-call response must keep the turn open for tool execution"
+        );
 
         let content = resp.content.as_ref().expect("response should have content");
 
@@ -430,7 +433,7 @@ mod preservation {
     }
 
     #[tokio::test]
-    async fn http_error_500_internal() {
+    async fn http_error_500_unavailable() {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -450,7 +453,10 @@ mod preservation {
 
         let err =
             stream.next().await.expect("should yield an item").expect_err("should be an error");
-        assert_eq!(err.category, ErrorCategory::Internal, "500 should map to Internal");
+        // A 500 is transient for OpenAI-compatible providers, so it is retryable.
+        assert_eq!(err.category, ErrorCategory::Unavailable, "500 should map to Unavailable");
+        assert!(err.is_retryable());
+        assert_eq!(err.details.upstream_status_code, Some(500));
     }
 
     // ── Test 3e: Request parameters preserved ───────────────────────────

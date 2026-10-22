@@ -18,7 +18,7 @@ This document provides comprehensive guidelines for developers contributing to A
 
 ### Prerequisites
 
-- **Rust**: 1.94.0 or higher (edition 2024, check with `rustc --version`)
+- **Rust**: 1.95.0 or higher (edition 2024, check with `rustc --version`)
 - **Cargo**: Latest stable
 - **Git**: For version control
 - **sccache** (recommended): Compilation cache that cuts rebuild times by ~70%
@@ -432,7 +432,6 @@ pub fn add_callback(mut self, cb: Callback) -> Self {
     self
 }
 ```
-```
 
 ## Async Patterns
 
@@ -747,7 +746,7 @@ test: add integration tests for A2A protocol
 
 ## Project Scaffolding
 
-Use `cargo adk new` with the [Composable Template System](composable-templates.md) to scaffold new projects. The system provides 8 base templates, 9 addons, and 5 enterprise patterns:
+Use `cargo adk new` with the [Composable Template System](composable-templates.md) to scaffold new projects. The built-in registry provides 12 templates, 9 add-ons, and 5 enterprise patterns:
 
 ```bash
 # Basic agent (default)

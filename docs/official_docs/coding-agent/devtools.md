@@ -1,7 +1,7 @@
 # Dev Tools (`adk-devtools`)
 
 `adk-devtools` is the inner-loop toolset a coding agent needs — read, edit,
-search, and run — with every operation **scoped to a sandboxed workspace**. It's
+search, and run — with every operation **scoped to a workspace directory**. It's
 a standalone, publishable crate depending only on `adk-core`, so it composes with
 any `LlmAgent` (the [`CodingAgent`](harness.md) harness wires it for you).
 
@@ -51,10 +51,43 @@ let ws = Workspace::new("./my-repo")
 ```
 
 - **Path containment** — any path that resolves outside the root is rejected, so
-  the agent can't read or write `../../etc/...`.
+  the agent can't read or write `../../etc/...`. Containment is enforced against the
+  **resolved** path, not just the literal one: a symlink pointing outside the root is
+  rejected even though it sits lexically inside. That covers a symlinked final
+  component and a symlinked parent directory, so creation through a redirected
+  directory is refused too. A symlink whose target stays inside the workspace keeps
+  working, since repositories legitimately contain internal links.
+
+  A **dangling or looping symlink** anywhere on the path is refused wherever it
+  points, because a write would follow it and create its target — a cloned
+  repository containing `link -> ~/.zshenv` must not let `write_file("link", ..)`
+  create `~/.zshenv`. Write to the link's target path directly instead.
+
+  `glob` refuses patterns containing `..` or an absolute path, and drops every
+  match whose resolved path lies outside the root, so a symlinked directory
+  pointing elsewhere is not listed.
+
+  The check is not a lock. `write_file` and `edit_file` re-check the canonical
+  parent immediately before the open and, on Unix, open the final component with
+  `O_NOFOLLOW`, so a symlink planted in that position after the check fails the
+  open. A directory swapped for a symlink in the remaining window is still
+  followed; closing it needs descriptor-relative traversal. Treat the file tools
+  as containment against an agent that wanders, not as isolation against an
+  adversary that can write into the workspace concurrently.
 - **Read-only mode** — `Workspace::read_only(..)` hides the mutating tools
   entirely (the model only ever sees `read_file`/`glob`/`grep`).
-- **`bash` timeout + output caps** — long or chatty commands are bounded.
+- **`bash` environment is cleared** — the command receives only `PATH`, `HOME`, `LANG`,
+  `LC_ALL`, `TMPDIR`, `TERM`, `USER`, and `SHELL`, so provider API keys held by the agent
+  process are not readable with `env`. `Workspace::inherit_env(true)` restores the old
+  pass-everything behaviour, and `env_allowlist` replaces the set.
+- **`bash` timeout + output caps** — long or chatty commands are bounded. A timed-out
+  command is killed as a **process group**, so anything it started is killed too;
+  previously only the direct child was signalled and descendants survived. Dropping
+  the tool call's future (for example when the run is cancelled) kills the group the
+  same way. Each stream keeps at most `max_output_bytes` (default 1 MiB) as it is
+  read; output past the cap is drained and discarded, so the command still runs to
+  completion and reports its exit code, and the result sets `truncated: true`. The
+  cut falls on a UTF-8 character boundary.
 
 ## Using it directly
 
@@ -76,9 +109,17 @@ workspace yields a read-only agent automatically.
 
 ## Sandboxing model
 
-Phase 1 runs `bash` **host-local** (`sh -c`, working directory pinned to the
-root) with a timeout — it is path-contained and bounded, but not strongly
-OS-isolated. The policy vocabulary aligns with `adk-code`'s `SandboxPolicy`; for
+Phase 1 runs `bash` **host-local** (`sh -c`, working directory pinned to the root) with a
+timeout and a cleared environment. What that does and does not give you:
+
+| Enforced | Not enforced |
+|----------|--------------|
+| File tools cannot resolve outside the root, including through symlinks | `bash` can still use absolute paths — the working directory is not an OS boundary |
+| The command cannot read the agent's environment variables | The command can reach the network |
+| A timeout or a cancelled call kills the command and its descendants | Nothing limits the command's own memory or CPU |
+| Captured output is capped per stream as it is read | |
+
+So it is path-contained, environment-isolated, and bounded, but **not** OS-isolated. The policy vocabulary aligns with `adk-code`'s `SandboxPolicy`; for
 strong isolation, run `bash` behind a containerized executor (see the
 [design doc](https://github.com/zavora-ai/adk-rust/blob/main/docs/design/coding-agent.md#9-security--sandboxing)).
 Combine with [`adk-guardrail`](../security/guardrails.md) (command allowlists,

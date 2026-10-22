@@ -26,22 +26,27 @@ Tool system for Rust Agent Development Kit (ADK-Rust) agents (FunctionTool, MCP,
 - **LoadArtifactsTool** - Inject binary artifacts into context
 - **LoadMemoryTool** - Agent-callable tool for on-demand memory search (feature: `memory-tools`)
 - **PreloadMemoryTool** - Auto-loads relevant memories at turn start (feature: `memory-tools`)
+- **ExampleStoreClient / ExampleStoreProvider** - Vertex AI Example Store few-shot retrieval (feature: `example-store`)
+- **BigQueryToolset / SpannerToolset** - SQL execution, schema inspection, and table listing (features: `bigquery`, `spanner`); SQL execution is read-only by default
 
 ## Installation
 
 ```toml
 [dependencies]
-adk-tool = "2.0.0"
+adk-tool = "2.3.0"
+
+# For local MCP servers via stdio:
+adk-tool = { version = "2.3.0", features = ["mcp"] }
 
 # For remote MCP servers via HTTP:
-adk-tool = { version = "2.0.0", features = ["http-transport"] }
+adk-tool = { version = "2.3.0", features = ["mcp", "http-transport"] }
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.0.0", features = ["tools"] }
+adk-rust = { version = "2.3.0", features = ["tools"] }
 ```
 
 ## Quick Start
@@ -94,8 +99,8 @@ Mark tools as read-only or concurrency-safe for smarter dispatch:
 
 ```rust
 let lookup = FunctionTool::new("lookup", "Look up data", handler)
-    .with_read_only(true)        // safe for concurrent dispatch in Auto mode
-    .with_concurrency_safe(true);
+    .with_read_only(true)
+    .with_concurrency_safe(true); // both signals are required by Auto mode
 ```
 
 ### StatefulTool
@@ -132,29 +137,25 @@ Defaults: `user_id()` → `"anonymous"`, `session_id()` → `""`, unique UUIDs f
 
 ### MCP Server Manager (Multi-Server Lifecycle)
 
-Manage multiple MCP server processes with health monitoring, auto-restart, and tool aggregation:
+Manage a changing registry of local MCP server processes with connection monitoring, bounded restart, configuration persistence, and tool aggregation:
 
 ```rust
-use adk_tool::mcp::manager::{McpServerManager, McpServerConfig};
-use std::collections::HashMap;
+use adk_tool::mcp::manager::McpServerManager;
+use std::sync::Arc;
 use std::time::Duration;
 
 // Load from Kiro mcp.json format
-let manager = McpServerManager::from_json(r#"{
+let manager = Arc::new(McpServerManager::from_json(r#"{
     "mcpServers": {
-        "playwright": {
-            "command": "npx",
-            "args": ["--yes", "@playwright/mcp@latest"],
-            "autoApprove": ["browser_click"]
-        },
-        "filesystem": {
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        "workspace": {
+            "command": "/opt/company/bin/workspace-mcp",
+            "args": ["--stdio", "--root", "/srv/workspace"],
+            "disabled": false
         }
     }
 }"#)?
     .with_health_check_interval(Duration::from_secs(30))
-    .with_grace_period(Duration::from_secs(5));
+    .with_grace_period(Duration::from_secs(5)));
 
 // Start all non-disabled servers
 let results = manager.start_all().await;
@@ -163,32 +164,42 @@ let results = manager.start_all().await;
 // Name collisions are resolved with {server_id}__{tool_name} prefixes
 let agent = LlmAgentBuilder::new("agent")
     .model(model)
-    .toolset(Arc::new(manager))
+    .toolset(manager.clone())
     .build()?;
 
 // Dynamic management at runtime
 manager.add_server("github".into(), github_config).await?;
 manager.start_server("github").await?;
+manager.update_server("github", replacement_config).await?;
+manager.disable_server("github").await?;
+manager.enable_server("github").await?;
+manager.save_json_file("mcp.json").await?;
 manager.remove_server("github").await?;
 
 // Graceful shutdown
 manager.shutdown().await?;
 ```
 
+Use absolute, versioned executable paths in deployment configuration. The
+manager preserves `autoApprove` for configuration compatibility but does not
+turn that field into authorization or human approval policy.
+
 ### MCP Tools (Local Server via stdio)
 
 Connect to local MCP servers running as child processes:
 
 ```rust
-use adk_tool::McpToolset;
-use rmcp::{ServiceExt, transport::TokioChildProcess};
+use adk_tool::{
+    McpToolset,
+    mcp::rmcp::{ServiceExt, transport::TokioChildProcess},
+};
 use tokio::process::Command;
 
 // Connect to a local MCP server
-let cmd = Command::new("npx")
-    .arg("-y")
-    .arg("@modelcontextprotocol/server-filesystem")
-    .arg("/path/to/files");
+let cmd = Command::new("/opt/company/bin/workspace-mcp")
+    .arg("--stdio")
+    .arg("--root")
+    .arg("/srv/workspace");
 
 let client = ().serve(TokioChildProcess::new(cmd)?).await?;
 
@@ -205,6 +216,26 @@ let cancel_token = toolset.cancellation_token().await;
 cancel_token.cancel();
 ```
 
+### MCP Schema Size Limits
+
+Discovery skips a tool whose input or output schema exceeds `McpSchemaLimits`
+(256 KiB and 10 000 JSON values by default), logs a warning naming the toolset
+and the tool, and registers the remaining tools. Raise the limits for a trusted
+server:
+
+```rust
+use adk_tool::mcp::{McpSchemaLimits, McpToolset};
+
+let toolset = McpToolset::new(client).with_schema_limits(
+    McpSchemaLimits::default()
+        .with_max_bytes(1024 * 1024)
+        .with_max_nodes(40_000),
+);
+```
+
+`McpServerManager::with_schema_limits` applies the same limits to every managed
+server.
+
 ### MCP Tools (Remote Server via HTTP)
 
 Connect to remote MCP servers using HTTP transport (requires `http-transport` feature):
@@ -213,8 +244,8 @@ Connect to remote MCP servers using HTTP transport (requires `http-transport` fe
 use adk_tool::McpHttpClientBuilder;
 use std::time::Duration;
 
-// Connect to a public remote MCP server
-let toolset = McpHttpClientBuilder::new("https://remote.mcpservers.org/fetch/mcp")
+// Connect to a service owned by your organization or integration provider
+let toolset = McpHttpClientBuilder::new("https://mcp.example.com/mcp")
     .timeout(Duration::from_secs(30))
     .connect()
     .await?;
@@ -228,9 +259,9 @@ Connect to authenticated MCP servers:
 use adk_tool::{McpHttpClientBuilder, McpAuth, OAuth2Config};
 use std::time::Duration;
 
-// Bearer token (e.g., GitHub Copilot MCP)
-let toolset = McpHttpClientBuilder::new("https://api.githubcopilot.com/mcp/")
-    .with_auth(McpAuth::bearer(std::env::var("GITHUB_TOKEN")?))
+// Static bearer token supplied by your deployment identity system
+let toolset = McpHttpClientBuilder::new("https://mcp.example.com/mcp")
+    .with_auth(McpAuth::bearer(std::env::var("MCP_TOKEN")?))
     .timeout(Duration::from_secs(60))
     .connect()
     .await?;
@@ -257,7 +288,8 @@ let toolset = McpHttpClientBuilder::new("https://mcp.example.com/v1")
 
 ### MCP Task Support (Long-Running Operations)
 
-Enable async task lifecycle for long-running MCP operations (SEP-1686):
+Enable the negotiated MCP 2026-07-28 SEP-2663 Tasks extension for long-running
+tool operations:
 
 ```rust
 use adk_tool::{McpToolset, McpTaskConfig};
@@ -268,73 +300,78 @@ let toolset = McpToolset::new(client)
         McpTaskConfig::enabled()
             .poll_interval(Duration::from_secs(2))
             .timeout(Duration::from_secs(300))
-            .max_poll_attempts(100)
+            .max_attempts(100)
     );
 ```
 
-### MCP Auto-Reconnect (Connection Resilience)
+Task mode is used only when the client config enables it and the server
+advertises the extension. The server decides per call whether to return a task.
+ADK-Rust polls `tasks/get`, fulfils paused `input_required` requests through the
+configured elicitation handler and `tasks/update`, and requests `tasks/cancel`
+when the local timeout or poll bound is reached.
 
-For long-running agents, use `ConnectionRefresher` to automatically reconnect when connections fail:
+Managed servers select lifecycle and task policy in `mcp.json`:
 
-```rust
-use adk_tool::mcp::{ConnectionRefresher, ConnectionFactory, RefreshConfig};
-use rmcp::{RoleClient, ServiceExt, service::RunningService, transport::TokioChildProcess};
-use std::sync::Arc;
-use tokio::process::Command;
-
-// Define a factory that can create new connections
-struct MyConnectionFactory {
-    command: String,
-    args: Vec<String>,
-}
-
-#[async_trait::async_trait]
-impl<S> ConnectionFactory<S> for MyConnectionFactory
-where
-    S: rmcp::service::Service<RoleClient> + Send + Sync + 'static,
+```json
 {
-    async fn create_connection(&self) -> Result<RunningService<RoleClient, S>, String> {
-        let cmd = Command::new(&self.command)
-            .args(&self.args)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        
-        ().serve(TokioChildProcess::new(cmd).map_err(|e| e.to_string())?)
-            .await
-            .map_err(|e| e.to_string())
+  "mcpServers": {
+    "controlled-server": {
+      "command": "controlled-server",
+      "lifecycle": "discover",
+      "taskConfig": {
+        "enableTasks": true,
+        "pollIntervalMs": 500,
+        "timeoutMs": 300000,
+        "maxInputRounds": 10
+      }
+    },
+    "third-party-server": {
+      "command": "third-party-server",
+      "lifecycle": "auto"
     }
-}
-
-// Create initial connection
-let cmd = Command::new("npx")
-    .arg("-y")
-    .arg("@modelcontextprotocol/server-filesystem")
-    .arg("/path/to/files");
-let client = ().serve(TokioChildProcess::new(cmd)?).await?;
-
-// Wrap with auto-reconnect
-let factory = Arc::new(MyConnectionFactory {
-    command: "npx".to_string(),
-    args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into(), "/path".into()],
-});
-
-let refresher = ConnectionRefresher::new(client, factory)
-    .with_config(RefreshConfig::default()
-        .with_max_attempts(5)
-        .with_retry_delay_ms(2000));
-
-// Operations automatically retry on connection failure
-let tools = refresher.list_tools().await?;
-if tools.reconnected {
-    println!("Connection was refreshed during operation");
+  }
 }
 ```
+
+`discover` requires the stateless 2026 lifecycle. `auto` probes discovery and
+falls back only on `METHOD_NOT_FOUND`. The default remains `initialize` for
+backward compatibility. Stateless MRTR elicitation is driven automatically and
+bounded by `maxInputRounds`; opaque `requestState` is echoed without inspection.
+
+### MCP Auto-Reconnect (Connection Resilience)
+
+For one custom connection, `ConnectionRefresher` accepts a
+`ConnectionFactory` that can create the same concrete `rmcp::RunningService`
+again after a retryable failure. Configure bounded attempts and delay with
+`RefreshConfig`. For a changing set of local stdio processes, prefer
+`McpServerManager`, whose registry, monitoring, restart, and persistence model
+is easier to operate.
 
 The refresher handles these error conditions automatically:
 - Connection closed / EOF
 - Broken pipe / transport errors
 - Session not found (server restart)
 - Connection reset
+
+Discovery calls reconnect and retry automatically. Discovered tool wrappers
+also replay when the server publishes `readOnlyHint: true` or
+`idempotentHint: true`. Missing hints keep replay disabled because a lost
+response can leave a mutating tool's external result uncertain. The direct
+`call_tool_value` and `ConnectionRefresher::call_tool` paths do not have
+discovered per-tool metadata; opt them in only for read-only tools or operations
+protected by a stable provider idempotency guarantee:
+
+```rust
+let refresher = ConnectionRefresher::new(client, Arc::new(factory))
+    .with_tool_call_retries();
+
+let toolset = McpToolset::new(client)
+    .with_connection_factory(Arc::new(factory))
+    .with_tool_call_retries();
+```
+
+MCP annotations are server-published hints. Trust them only for servers inside
+the application's security boundary.
 
 ### Google Search
 
@@ -345,36 +382,66 @@ let search = GoogleSearchTool::new();
 // Add to agent - enables grounded web search
 ```
 
+### BigQuery and Spanner (`bigquery`, `spanner` features)
+
+`bigquery_execute_sql` is **read-only by default**: it accepts a single `SELECT` or
+`WITH … SELECT` statement, a BigQuery dry run must classify it as `SELECT` before it
+runs, and the tool reports `is_read_only() == true`. `spanner_execute_sql` runs in a
+read-only single-use transaction.
+
+```rust
+use adk_tool::bigquery::BigQueryToolset;
+
+let read_only = BigQueryToolset::with_project("my-gcp-project");
+// Allow DML, DDL, and scripts; the tool then reports itself as mutating.
+let read_write = BigQueryToolset::with_project("my-gcp-project").with_read_only(false);
+```
+
+Service-account keys resolved through `from_secret` are parsed in memory and never
+written to disk.
+
+## Code Execution Tools (`code` feature)
+
+Language-preset tool wrappers over the `adk-code` execution substrate: `CodeTool` (Rust), `JavaScriptCodeTool` (embedded JS via `code-embedded-js`), `PythonCodeTool` (container-backed CPython), and `MontyPythonCodeTool` (in-process Python via `code-embedded-python`).
+
+`MontyPythonCodeTool` runs model-written Python in the Monty interpreter — no container, no subprocess. It supports one-shot mode (fresh interpreter per call) and REPL mode (state persists across calls, scoped per ADK session), with host-granted filesystem/environment/clock access and registered host functions. Its LLM-facing description is composed from the executor's own capability report, so it always matches the built environment. For the full Python ecosystem (pip packages, C extensions, the complete standard library), use the container-backed `PythonCodeTool` instead.
+
+```rust
+use adk_code::PathAccess;
+use adk_tool::MontyPythonCodeTool;
+
+let tool = MontyPythonCodeTool::builder()
+    .allow_path("/data", "/srv/agent/data", PathAccess::ReadOnly)
+    .environ_var("PROJECT", "acme")
+    .system_clock()
+    .build_repl()?;
+```
+
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| (default) | Local MCP servers via stdio transport |
+| `mcp` | Local MCP clients via stdio, `McpToolset`, and `McpServerManager` |
 | `http-transport` | Remote MCP servers via streamable HTTP |
+| `mcp-sampling` | Deprecated upstream sampling compatibility |
+| `code` | Code execution tools over the `adk-code` substrate |
+| `code-embedded-js` | `JavaScriptCodeTool` live path (boa_engine) |
+| `code-embedded-python` | `MontyPythonCodeTool` live path (Monty interpreter) |
+| `example-store` | Vertex AI Example Store client (v1beta1 data plane) and `ExampleStoreProvider` few-shot retrieval |
+| `bigquery` | `BigQueryToolset`: SQL execution (read-only by default), schemas, datasets, tables |
+| `spanner` | `SpannerToolset`: read-only SQL execution, schemas, tables |
 
-## MCP Server Examples
+## MCP examples and guides
 
-### Available Public MCP Servers
+`examples/mcp_manager` runs a real Rust stdio server locally and verifies
+discovery, tool execution, dynamic registry changes, persistence, and shutdown
+without a package download or network dependency. `examples/mcp_elicitation`
+demonstrates a server asking its client application for additional information.
 
-- `https://remote.mcpservers.org/fetch/mcp` - Web content fetching
-- `https://remote.mcpservers.org/sequentialthinking/mcp` - Step-by-step reasoning
-
-### GitHub Copilot MCP (40+ tools)
-
-```rust
-// Requires GITHUB_TOKEN with Copilot access
-let toolset = McpHttpClientBuilder::new("https://api.githubcopilot.com/mcp/")
-    .with_auth(McpAuth::bearer(std::env::var("GITHUB_TOKEN")?))
-    .connect()
-    .await?;
-
-// Discovered tools include:
-// - search_repositories, search_code, search_issues
-// - create_pull_request, merge_pull_request
-// - get_file_contents, create_or_update_file
-// - issue_read, issue_write, add_issue_comment
-// - and 30+ more GitHub operations
-```
+The complete official guide covers client construction, server authoring,
+dynamic management, security, testing, resources, prompts, completion,
+reconnect-safe subscriptions with `ResourceNotificationHandler`, elicitation,
+and tasks in `docs/official_docs/mcp/`.
 
 ## Toolset Composition
 
@@ -419,17 +486,60 @@ let agent = LlmAgentBuilder::new("agent")
 
 All composition utilities implement `Toolset` and work with any `Toolset` implementation including `McpToolset` and `BrowserToolset`.
 
-## Migration from rmcp 0.9
+## rmcp compatibility
 
-**No changes required!** The rmcp 0.14 breaking changes were handled internally:
+ADK-Rust 2 uses `rmcp 3.1`, the official Rust SDK. `McpToolset::new(client)`
+remains the primary adapter. Advanced server authoring, transports, protocol
+extensions, and SDK types are available through `adk_tool::mcp::rmcp`, keeping
+them on the same version used internally.
 
-| What Changed | Impact |
-|--------------|--------|
-| `CallToolRequestParam` → `CallToolRequestParams` | Internal only |
-| Added `meta: None` field | Internal only |
-| HTTP transport API | Internal only |
+### Protocol revisions
 
-Your existing code using `McpToolset::new(client)` continues to work unchanged.
+The client advertises MCP `2025-11-25`, the same revision ADK-Rust 2 has always
+sent. A `2026-07-28` server still answers that handshake, so one client reaches
+both generations of server and no existing configuration changes behaviour.
+
+`2026-07-28` also adds a stateless `server/discover` handshake. It is opt-in,
+because a server that predates it is free to refuse an unknown method with
+something other than `METHOD_NOT_FOUND`, and the SDK treats only that one code
+as proof of a legacy peer. Select it per connection:
+
+| Mode | Sends first | Against an older server |
+|------|-------------|-------------------------|
+| `Initialize` (default) | `initialize` | Works |
+| `Auto` | `server/discover` | Falls back only on `METHOD_NOT_FOUND` |
+| `Discover` | `server/discover` | Fails; no fallback |
+
+```rust,ignore
+use adk_tool::mcp::{AdkClientHandler, ClientLifecycleMode, ClientServiceExt, McpToolset};
+use rmcp::model::ProtocolVersion;
+
+let client = AdkClientHandler::new(handler)
+    .serve_with_lifecycle(
+        transport,
+        ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: Some(ProtocolVersion::V_2025_11_25),
+        },
+    )
+    .await?;
+let toolset = McpToolset::new(client);
+```
+
+### Tasks
+
+SEP-2663 replaced the experimental task design. A tool no longer declares
+whether it supports task execution; the server decides per call, and the client
+reads the response to find out. `Tool::is_long_running` therefore reports per
+connection rather than per tool: it is true when tasks are enabled and the server
+negotiated them.
+
+Sampling, roots, and logging are deprecated upstream by SEP-2577. The
+`mcp-sampling` feature exists for compatible deployments and should not be the
+default design for a new system.
+
+When migrating code that imports `rmcp` types directly, align it to `rmcp 3.1`
+or import the SDK through `adk_tool::mcp::rmcp`.
 
 ## Related Crates
 

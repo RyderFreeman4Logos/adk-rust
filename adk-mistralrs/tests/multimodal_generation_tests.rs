@@ -67,7 +67,7 @@ fn arb_text_and_image_content() -> impl Strategy<Value = Content> {
         let png_data = generate_minimal_png();
         Content {
             role: "user".to_string(),
-            parts: vec![Part::Text { text }, Part::InlineData { mime_type, data: png_data }],
+            parts: vec![Part::Text { text }, Part::inline_data(mime_type, png_data)],
         }
     })
 }
@@ -80,10 +80,7 @@ fn arb_text_and_audio_content() -> impl Strategy<Value = Content> {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text },
-                Part::InlineData {
-                    mime_type,
-                    data: vec![0u8; 44], // Minimal WAV header size
-                },
+                Part::inline_data(mime_type, vec![0u8; 44]), // Minimal WAV header size
             ],
         }
     })
@@ -98,8 +95,8 @@ fn arb_multimodal_content() -> impl Strategy<Value = Content> {
                 role: "user".to_string(),
                 parts: vec![
                     Part::Text { text },
-                    Part::InlineData { mime_type: image_mime, data: png_data },
-                    Part::InlineData { mime_type: audio_mime, data: vec![0u8; 44] },
+                    Part::inline_data(image_mime, png_data),
+                    Part::inline_data(audio_mime, vec![0u8; 44]),
                 ],
             }
         },
@@ -265,11 +262,8 @@ fn test_mixed_valid_invalid_images() {
     let content = Content {
         role: "user".to_string(),
         parts: vec![
-            Part::InlineData { mime_type: "image/png".to_string(), data: png_data },
-            Part::InlineData {
-                mime_type: "image/jpeg".to_string(),
-                data: vec![0, 1, 2, 3], // Invalid JPEG data
-            },
+            Part::inline_data("image/png", png_data),
+            Part::inline_data("image/jpeg", vec![0, 1, 2, 3]), // Invalid JPEG data
         ],
     };
 
@@ -303,8 +297,8 @@ fn test_multimodal_with_multiple_images() {
         role: "user".to_string(),
         parts: vec![
             Part::Text { text: "Describe these images".to_string() },
-            Part::InlineData { mime_type: "image/png".to_string(), data: png_data1 },
-            Part::InlineData { mime_type: "image/png".to_string(), data: png_data2 },
+            Part::inline_data("image/png", png_data1),
+            Part::inline_data("image/png", png_data2),
         ],
     };
 
@@ -321,11 +315,8 @@ fn test_unsupported_mime_type_ignored() {
         role: "user".to_string(),
         parts: vec![
             Part::Text { text: "Test".to_string() },
-            Part::InlineData {
-                mime_type: "application/octet-stream".to_string(),
-                data: vec![0, 1, 2, 3],
-            },
-            Part::InlineData { mime_type: "video/mp4".to_string(), data: vec![0, 1, 2, 3] },
+            Part::inline_data("application/octet-stream", vec![0, 1, 2, 3]),
+            Part::inline_data("video/mp4", vec![0, 1, 2, 3]),
         ],
     };
 

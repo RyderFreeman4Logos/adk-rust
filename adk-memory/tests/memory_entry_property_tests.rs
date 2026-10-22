@@ -42,7 +42,12 @@ fn arb_inline_data_part() -> impl Strategy<Value = Part> {
         ],
         proptest::collection::vec(any::<u8>(), 0..64),
     )
-        .prop_map(|(mime_type, data)| Part::InlineData { mime_type, data })
+        .prop_map(|(mime_type, data)| Part::InlineData {
+            mime_type,
+            data,
+            uri: None,
+            annotations: None,
+        })
 }
 
 /// Generate a Part::FileData variant.
@@ -51,7 +56,11 @@ fn arb_file_data_part() -> impl Strategy<Value = Part> {
         prop_oneof![Just("image/jpeg".to_string()), Just("application/pdf".to_string()),],
         "https://example\\.com/[a-z]{3,10}\\.[a-z]{3}",
     )
-        .prop_map(|(mime_type, file_uri)| Part::FileData { mime_type, file_uri })
+        .prop_map(|(mime_type, file_uri)| Part::FileData {
+            mime_type,
+            file_uri,
+            annotations: None,
+        })
 }
 
 /// Generate an arbitrary Part that round-trips cleanly through serde.

@@ -25,6 +25,15 @@ pub struct ExecutionConfig {
     pub recursion_limit: usize,
     /// Additional configuration
     pub metadata: HashMap<String, Value>,
+    /// The invocation this graph run belongs to, when it has one.
+    ///
+    /// An [`AgentNode`] runs a real agent, and that agent expects the identity,
+    /// services, and cancellation of the run it belongs to. Without a parent the node
+    /// has to fabricate them, which makes an agent behave differently inside a graph
+    /// than outside it. Set this with
+    /// [`ExecutionConfig::with_parent_context`] to carry them through; leaving it
+    /// unset is standalone mode and is what a graph invoked outside a `Runner` gets.
+    pub parent_context: Option<Arc<dyn adk_core::InvocationContext>>,
 }
 
 impl ExecutionConfig {
@@ -35,7 +44,19 @@ impl ExecutionConfig {
             resume_from: None,
             recursion_limit: 50,
             metadata: HashMap::new(),
+            parent_context: None,
         }
+    }
+
+    /// Carry the invocation this graph run belongs to into its nodes.
+    ///
+    /// An [`AgentNode`] then presents the caller's identity, services, request
+    /// context, and cancellation to the agent it runs, instead of a synthetic
+    /// standalone context.
+    #[must_use]
+    pub fn with_parent_context(mut self, parent: Arc<dyn adk_core::InvocationContext>) -> Self {
+        self.parent_context = Some(parent);
+        self
     }
 
     /// Set the recursion limit
@@ -74,12 +95,101 @@ pub struct NodeContext {
     /// Optional progress handle for idle timeout tracking.
     /// When present, calling [`report_progress()`](Self::report_progress) resets the idle timeout counter.
     progress_handle: Option<ProgressHandle>,
+    /// Set by the executor when this node may invoke other nodes.
+    children: Option<std::sync::Arc<crate::child::ChildInvoker>>,
+    /// The schema of the graph running this node, for a node that projects state.
+    parent_schema: Option<std::sync::Arc<crate::state::StateSchema>>,
+    /// ADK configuration supplied through an additive `CompiledGraph` API.
+    run_config: Option<adk_core::RunConfig>,
 }
 
 impl NodeContext {
     /// Create a new node context
     pub fn new(state: State, config: ExecutionConfig, step: usize) -> Self {
-        Self { state, config, step, progress_handle: None }
+        Self {
+            state,
+            config,
+            step,
+            progress_handle: None,
+            children: None,
+            parent_schema: None,
+            run_config: None,
+        }
+    }
+
+    /// The machinery for invoking other nodes, if this context has it.
+    /// The schema of the graph running this node.
+    ///
+    /// Attached by the executor. A node that projects state between two schemas
+    /// needs it; most nodes do not.
+    pub fn parent_schema(&self) -> Option<std::sync::Arc<crate::state::StateSchema>> {
+        self.parent_schema.clone()
+    }
+
+    /// Attaches the running graph's schema.
+    pub fn set_parent_schema(&mut self, schema: std::sync::Arc<crate::state::StateSchema>) {
+        self.parent_schema = Some(schema);
+    }
+
+    /// Attach per-run ADK configuration for an agent node.
+    pub(crate) fn set_run_config(&mut self, run_config: adk_core::RunConfig) {
+        self.run_config = Some(run_config);
+    }
+
+    pub(crate) fn run_config(&self) -> Option<adk_core::RunConfig> {
+        self.run_config.clone()
+    }
+
+    pub(crate) fn child_invoker(&self) -> Option<std::sync::Arc<crate::child::ChildInvoker>> {
+        self.children.clone()
+    }
+
+    /// Attach the machinery for invoking other nodes.
+    pub(crate) fn set_child_invoker(
+        &mut self,
+        invoker: std::sync::Arc<crate::child::ChildInvoker>,
+    ) {
+        self.children = Some(invoker);
+    }
+
+    /// Invoke another node and await its output.
+    ///
+    /// The child sees this node's state with `input` merged over it, and returns
+    /// its updates as one object. Nothing is applied to the graph's state: the
+    /// caller decides what to do with the result.
+    ///
+    /// A child that already completed under the same identity is not run again
+    /// after a resume. See [`crate::child`] for how that identity is formed, and
+    /// why a resumable parent should pass its own run id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::NodeNotFound`](crate::error::GraphError::NodeNotFound)
+    /// when no node has that name, whatever the child returns, and
+    /// [`GraphError::Interrupted`](crate::error::GraphError::Interrupted) when the
+    /// child pauses.
+    pub async fn run_node(&self, child: &str, input: Value) -> Result<Value> {
+        self.run_node_with(child, input, crate::child::RunNodeOptions::default()).await
+    }
+
+    /// Invoke another node with an explicit run id.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_node`](Self::run_node), and additionally when this node was not
+    /// given the ability to invoke children.
+    pub async fn run_node_with(
+        &self,
+        child: &str,
+        input: Value,
+        options: crate::child::RunNodeOptions,
+    ) -> Result<Value> {
+        let invoker = self.children.as_ref().ok_or_else(|| {
+            crate::error::GraphError::InvalidGraph(
+                "this node cannot invoke other nodes: no child invoker was attached".to_string(),
+            )
+        })?;
+        invoker.run(child, input, options, self).await
     }
 
     /// Get a value from state
@@ -138,12 +248,82 @@ pub struct NodeOutput {
     pub interrupt: Option<Interrupt>,
     /// Custom stream events
     pub events: Vec<StreamEvent>,
+    /// Nodes to run next, replacing this node's declared outgoing edges.
+    pub goto: Option<Vec<String>>,
+    /// Nodes of the *parent* graph to run next, when this graph is a subgraph.
+    ///
+    /// A node deep in a nested graph can end its own graph and hand control to a
+    /// node of the graph that holds it.
+    pub goto_parent: Option<Vec<String>>,
 }
 
 impl NodeOutput {
     /// Create a new empty output
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Names the nodes to run next, replacing this node's declared edges.
+    ///
+    /// A conditional edge fixes its targets when the graph is built. This does
+    /// not: a node reads state and names any node in the graph, including one it
+    /// has no edge to. Naming [`END`](crate::edge::END) stops the branch.
+    ///
+    /// The declared edges from this node do not also fire. Setting no goto leaves
+    /// the declared edges in charge, which is the default.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::node::NodeOutput;
+    /// use serde_json::json;
+    ///
+    /// // Write state and choose the next node in one step.
+    /// let output = NodeOutput::new()
+    ///     .with_update("risk", json!("high"))
+    ///     .with_goto(["escalate"]);
+    /// assert_eq!(output.goto.as_deref(), Some(&["escalate".to_string()][..]));
+    /// ```
+    /// Names nodes of the *parent* graph to run next.
+    ///
+    /// Only meaningful inside a [`SubgraphNode`](crate::subgraph::SubgraphNode).
+    /// The subgraph finishes, its output channels are projected out as usual, and
+    /// the parent continues at the named nodes rather than following the
+    /// subgraph node's own edges. This is the counterpart to LangGraph's
+    /// `Command(goto=..., graph=Command.PARENT)`.
+    ///
+    /// A name the parent does not hold fails the run with
+    /// [`GraphError::UnknownRouteTarget`](crate::error::GraphError::UnknownRouteTarget),
+    /// checked by the parent, which is the only side that knows its own nodes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::node::NodeOutput;
+    /// use serde_json::json;
+    ///
+    /// // Inside a subgraph: give up, and let the parent's escalation path run.
+    /// let output = NodeOutput::new()
+    ///     .with_update("reason", json!("no confident answer"))
+    ///     .with_goto_parent(["escalate"]);
+    /// assert_eq!(output.goto_parent.as_deref(), Some(&["escalate".to_string()][..]));
+    /// ```
+    pub fn with_goto_parent<I, S>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.goto_parent = Some(targets.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_goto<I, S>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.goto = Some(targets.into_iter().map(Into::into).collect());
+        self
     }
 
     /// Add a state update
@@ -187,21 +367,75 @@ pub trait Node: Send + Sync {
     /// Node identifier
     fn name(&self) -> &str;
 
+    /// Human-readable purpose shown by generic workflow inspectors.
+    fn description(&self) -> &str {
+        "Graph workflow node"
+    }
+
+    /// Runtime capabilities inherited by portable graph topology metadata.
+    fn capabilities(&self) -> adk_core::AgentCapabilities {
+        adk_core::AgentCapabilities::default()
+    }
+
     /// Execute the node and return state updates
     async fn execute(&self, ctx: &NodeContext) -> Result<NodeOutput>;
 
-    /// Stream execution events (default: wraps execute)
+    /// Rejects a node that cannot execute, before the graph runs.
+    ///
+    /// Called for every node by [`StateGraph::compile`](crate::graph::StateGraph::compile), so a configuration whose
+    /// backend is unavailable fails while the graph is being built rather than
+    /// part-way through a run, when earlier nodes may already have had side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing what is unavailable. The default accepts the node.
+    /// Checks this node against the schema of the graph that holds it.
+    ///
+    /// Called by [`StateGraph::compile`](crate::graph::StateGraph::compile) for
+    /// every node, so a node that has requirements on its parent states them
+    /// before anything runs. Defaults to accepting any parent.
+    ///
+    /// [`SubgraphNode`](crate::subgraph::SubgraphNode) uses this to reject a
+    /// channel mapping that names a channel neither side declares.
+    fn validate_against(&self, _parent: &crate::state::StateSchema) -> Result<()> {
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Streams execution events for this node.
+    ///
+    /// An implementation must report the node's state updates by yielding a
+    /// [`StreamEvent::Updates`] event, because a streaming executor takes the
+    /// updates from this stream rather than executing the node a second time.
+    /// The default implementation wraps [`Node::execute`] and does so.
     fn execute_stream<'a>(
         &'a self,
         ctx: &'a NodeContext,
     ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send + 'a>> {
-        let _name = self.name().to_string();
+        let name = self.name().to_string();
         Box::pin(async_stream::stream! {
             match self.execute(ctx).await {
                 Ok(output) => {
                     for event in output.events {
                         yield Ok(event);
                     }
+                    // A goto and an interrupt have no other way through: this path
+                    // yields events, not a NodeOutput, so the executor reads both
+                    // back off the stream.
+                    if let Some(targets) = output.goto {
+                        yield Ok(StreamEvent::route_dispatched(&name, targets));
+                    }
+                    if let Some(interrupt) = output.interrupt {
+                        let (message, data) = match interrupt {
+                            crate::interrupt::Interrupt::Dynamic { message, data } => (message, data),
+                            other => (other.to_string(), None),
+                        };
+                        yield Ok(StreamEvent::node_interrupt(&name, &message, data));
+                    }
+                    yield Ok(StreamEvent::Updates { node: name, updates: output.updates });
                 }
                 Err(e) => yield Err(e),
             }
@@ -241,9 +475,20 @@ impl Node for FunctionNode {
     }
 
     async fn execute(&self, ctx: &NodeContext) -> Result<NodeOutput> {
+        // The closure takes an owned context, so everything the executor attached
+        // has to be carried across or the node silently loses it.
         let mut ctx_owned = NodeContext::new(ctx.state.clone(), ctx.config.clone(), ctx.step);
         if let Some(handle) = ctx.progress_handle() {
             ctx_owned.set_progress_handle(handle.clone());
+        }
+        if let Some(invoker) = ctx.child_invoker() {
+            ctx_owned.set_child_invoker(invoker);
+        }
+        if let Some(schema) = ctx.parent_schema() {
+            ctx_owned.set_parent_schema(schema);
+        }
+        if let Some(run_config) = ctx.run_config() {
+            ctx_owned.set_run_config(run_config);
         }
         (self.func)(ctx_owned).await
     }
@@ -279,6 +524,12 @@ pub type AgentInputMapper = Box<dyn Fn(&State) -> adk_core::Content + Send + Syn
 pub type AgentOutputMapper =
     Box<dyn Fn(&[adk_core::Event]) -> HashMap<String, Value> + Send + Sync>;
 
+/// Chooses an [`AgentNode`]'s successors from the updates it just produced.
+///
+/// Returning `None` leaves the node's declared edges in charge.
+pub type AgentGotoMapper =
+    Box<dyn Fn(&HashMap<String, Value>) -> Option<Vec<String>> + Send + Sync>;
+
 /// Wrapper to use an existing ADK Agent as a graph node
 pub struct AgentNode {
     name: String,
@@ -288,6 +539,8 @@ pub struct AgentNode {
     input_mapper: AgentInputMapper,
     /// Map agent events to state updates
     output_mapper: AgentOutputMapper,
+    /// Choose successors from the mapped updates, replacing declared edges.
+    goto_mapper: Option<AgentGotoMapper>,
 }
 
 impl AgentNode {
@@ -299,6 +552,7 @@ impl AgentNode {
             agent,
             input_mapper: Box::new(default_input_mapper),
             output_mapper: Box::new(default_output_mapper),
+            goto_mapper: None,
         }
     }
 
@@ -317,6 +571,38 @@ impl AgentNode {
         F: Fn(&[adk_core::Event]) -> HashMap<String, Value> + Send + Sync + 'static,
     {
         self.output_mapper = Box::new(mapper);
+        self
+    }
+
+    /// Chooses this node's successors from the updates the output mapper produced.
+    ///
+    /// An agent's answer often decides where control goes next. The output mapper
+    /// turns the agent's events into state; this turns that state into a route,
+    /// so the classification is parsed once.
+    ///
+    /// Returning `None` leaves the declared edges in charge. Returning targets
+    /// replaces them, exactly as [`NodeOutput::with_goto`] does for a plain node.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use adk_graph::node::AgentNode;
+    /// # use std::collections::HashMap;
+    /// # fn wire(node: AgentNode) -> AgentNode {
+    /// node.with_goto_mapper(|updates: &HashMap<String, serde_json::Value>| {
+    ///     match updates.get("category").and_then(|v| v.as_str()) {
+    ///         Some("refund") => Some(vec!["refund_desk".to_string()]),
+    ///         Some(_) => Some(vec!["general_desk".to_string()]),
+    ///         None => None,
+    ///     }
+    /// })
+    /// # }
+    /// ```
+    pub fn with_goto_mapper<F>(mut self, mapper: F) -> Self
+    where
+        F: Fn(&HashMap<String, Value>) -> Option<Vec<String>> + Send + Sync + 'static,
+    {
+        self.goto_mapper = Some(Box::new(mapper));
         self
     }
 }
@@ -348,7 +634,9 @@ fn default_output_mapper(events: &[adk_core::Event]) -> HashMap<String, Value> {
 
     // Collect text from events
     let mut messages = Vec::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     for event in events {
+        let event = text_deltas.push(event);
         if let Some(content) = event.content() {
             let text = content.parts.iter().filter_map(|p| p.text()).collect::<Vec<_>>().join("");
 
@@ -374,17 +662,27 @@ impl Node for AgentNode {
         &self.name
     }
 
+    fn description(&self) -> &str {
+        self.agent.description()
+    }
+
+    fn capabilities(&self) -> adk_core::AgentCapabilities {
+        self.agent.capabilities()
+    }
+
     async fn execute(&self, ctx: &NodeContext) -> Result<NodeOutput> {
-        use futures::StreamExt;
+        use futures::TryStreamExt;
 
         // Map state to input content
         let content = (self.input_mapper)(&ctx.state);
 
         // Create a graph invocation context with the agent
-        let invocation_ctx = Arc::new(GraphInvocationContext::new(
+        let invocation_ctx = Arc::new(GraphInvocationContext::with_parent(
             ctx.config.thread_id.clone(),
             content,
             self.agent.clone(),
+            ctx.config.parent_context.clone(),
+            ctx.run_config(),
         ));
 
         // Run the agent and collect events
@@ -395,13 +693,33 @@ impl Node for AgentNode {
             }
         })?;
 
-        let events: Vec<adk_core::Event> = stream.filter_map(|r| async { r.ok() }).collect().await;
+        let events: Vec<adk_core::Event> = stream.try_collect().await.map_err(|e| {
+            crate::error::GraphError::NodeExecutionFailed {
+                node: self.name.clone(),
+                message: e.to_string(),
+            }
+        })?;
+
+        if let Some(request) =
+            events.iter().find_map(|event| event.actions.tool_confirmation.clone())
+        {
+            return Ok(NodeOutput::new().with_interrupt(
+                crate::interrupt::GraphToolConfirmationPause::pending_interrupt(
+                    self.name.clone(),
+                    request,
+                ),
+            ));
+        }
 
         // Map events to state updates
         let updates = (self.output_mapper)(&events);
+        let goto = self.goto_mapper.as_ref().and_then(|mapper| mapper(&updates));
 
         // Convert agent events to stream events for tracing
         let mut output = NodeOutput::new().with_updates(updates);
+        if let Some(targets) = goto {
+            output = output.with_goto(targets);
+        }
         for event in &events {
             if let Ok(json) = serde_json::to_value(event) {
                 output = output.with_event(StreamEvent::custom(&self.name, "agent_event", json));
@@ -419,15 +737,20 @@ impl Node for AgentNode {
         let name = self.name.clone();
         let agent = self.agent.clone();
         let input_mapper = &self.input_mapper;
+        let output_mapper = &self.output_mapper;
+        let goto_mapper = &self.goto_mapper;
+        let parent_context = ctx.config.parent_context.clone();
         let thread_id = ctx.config.thread_id.clone();
         let content = (input_mapper)(&ctx.state);
 
         Box::pin(async_stream::stream! {
             tracing::debug!("AgentNode::execute_stream called for {}", name);
-            let invocation_ctx = Arc::new(GraphInvocationContext::new(
+            let invocation_ctx = Arc::new(GraphInvocationContext::with_parent(
                 thread_id,
                 content,
                 agent.clone(),
+                parent_context,
+                ctx.run_config(),
             ));
 
             let stream = match agent.run(invocation_ctx).await {
@@ -443,12 +766,24 @@ impl Node for AgentNode {
 
             tokio::pin!(stream);
             let mut all_events = Vec::new();
+            let mut text_deltas = adk_core::EventTextDeltas::default();
 
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(event) => {
+                        if let Some(request) = event.actions.tool_confirmation.clone() {
+                            yield Ok(StreamEvent::node_interrupt(
+                                &name,
+                                crate::interrupt::GraphToolConfirmationPause::KIND,
+                                Some(crate::interrupt::GraphToolConfirmationPause::pending_data(
+                                    name.clone(),
+                                    request,
+                                )),
+                            ));
+                            return;
+                        }
                         // Emit streaming event immediately
-                        if let Some(content) = event.content() {
+                        if let Some(content) = text_deltas.push(&event).content() {
                             let text: String = content.parts.iter().filter_map(|p| p.text()).collect();
                             if !text.is_empty() {
                                 yield Ok(StreamEvent::Message {
@@ -476,6 +811,16 @@ impl Node for AgentNode {
                     yield Ok(StreamEvent::custom(&name, "agent_event", json));
                 }
             }
+
+            // Report state updates from this run. Without this the streaming
+            // executor has no updates to apply and would have to run the agent
+            // a second time to obtain them.
+            let updates = (output_mapper)(&all_events);
+            // Same route the plain path uses: this yields events, not a NodeOutput.
+            if let Some(targets) = goto_mapper.as_ref().and_then(|mapper| mapper(&updates)) {
+                yield Ok(StreamEvent::route_dispatched(&name, targets));
+            }
+            yield Ok(StreamEvent::Updates { node: name.clone(), updates });
         })
     }
 }
@@ -488,25 +833,67 @@ struct GraphInvocationContext {
     session: Arc<GraphSession>,
     run_config: adk_core::RunConfig,
     ended: std::sync::atomic::AtomicBool,
+    /// The invocation this graph run belongs to, when it has one.
+    ///
+    /// Present: identity, services, request context, and cancellation come from the
+    /// caller, so an agent behaves the same inside a graph as outside it.
+    /// Absent: standalone mode, with the synthetic identity below.
+    parent: Option<Arc<dyn adk_core::InvocationContext>>,
+    /// Identity strings, owned because the trait returns them by reference.
+    user_id: String,
+    app_name: String,
+    branch: String,
 }
 
+/// Identity used when a graph runs with no parent invocation.
+const STANDALONE_USER_ID: &str = "graph_user";
+/// Application name used when a graph runs with no parent invocation.
+const STANDALONE_APP_NAME: &str = "graph_app";
+
 impl GraphInvocationContext {
-    fn new(
+    fn with_parent(
         session_id: String,
         user_content: adk_core::Content,
         agent: Arc<dyn adk_core::Agent>,
+        parent: Option<Arc<dyn adk_core::InvocationContext>>,
+        explicit_run_config: Option<adk_core::RunConfig>,
     ) -> Self {
         let invocation_id = uuid::Uuid::new_v4().to_string();
         let session = Arc::new(GraphSession::new(session_id));
         // Add user content to history
         session.append_content(user_content.clone());
+
+        // A node runs on its own branch below the caller's, so events it produces are
+        // attributable and do not read as the parent agent's own turn.
+        let (user_id, app_name, branch, inherited_run_config) = match parent.as_ref() {
+            Some(parent) => (
+                parent.user_id().to_string(),
+                parent.app_name().to_string(),
+                match parent.branch() {
+                    "" => agent.name().to_string(),
+                    existing => format!("{existing}.{}", agent.name()),
+                },
+                parent.run_config().clone(),
+            ),
+            None => (
+                STANDALONE_USER_ID.to_string(),
+                STANDALONE_APP_NAME.to_string(),
+                "main".to_string(),
+                adk_core::RunConfig::default(),
+            ),
+        };
+
         Self {
             invocation_id,
             user_content,
             agent,
             session,
-            run_config: adk_core::RunConfig::default(),
+            run_config: explicit_run_config.unwrap_or(inherited_run_config),
             ended: std::sync::atomic::AtomicBool::new(false),
+            parent,
+            user_id,
+            app_name,
+            branch,
         }
     }
 }
@@ -522,11 +909,11 @@ impl adk_core::ReadonlyContext for GraphInvocationContext {
     }
 
     fn user_id(&self) -> &str {
-        "graph_user"
+        &self.user_id
     }
 
     fn app_name(&self) -> &str {
-        "graph_app"
+        &self.app_name
     }
 
     fn session_id(&self) -> &str {
@@ -534,7 +921,7 @@ impl adk_core::ReadonlyContext for GraphInvocationContext {
     }
 
     fn branch(&self) -> &str {
-        "main"
+        &self.branch
     }
 
     fn user_content(&self) -> &adk_core::Content {
@@ -546,7 +933,11 @@ impl adk_core::ReadonlyContext for GraphInvocationContext {
 #[async_trait]
 impl adk_core::CallbackContext for GraphInvocationContext {
     fn artifacts(&self) -> Option<Arc<dyn adk_core::Artifacts>> {
-        None
+        self.parent.as_ref().and_then(|parent| parent.artifacts())
+    }
+
+    fn shared_state(&self) -> Option<Arc<adk_core::SharedState>> {
+        self.parent.as_ref().and_then(|parent| parent.shared_state())
     }
 }
 
@@ -558,7 +949,7 @@ impl adk_core::InvocationContext for GraphInvocationContext {
     }
 
     fn memory(&self) -> Option<Arc<dyn adk_core::Memory>> {
-        None
+        self.parent.as_ref().and_then(|parent| parent.memory())
     }
 
     fn session(&self) -> &dyn adk_core::Session {
@@ -571,10 +962,43 @@ impl adk_core::InvocationContext for GraphInvocationContext {
 
     fn end_invocation(&self) {
         self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(parent) = &self.parent {
+            parent.end_invocation();
+        }
     }
 
     fn ended(&self) -> bool {
         self.ended.load(std::sync::atomic::Ordering::SeqCst)
+            || self.parent.as_ref().is_some_and(|parent| parent.ended())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.parent.as_ref().is_some_and(|parent| parent.is_cancelled())
+    }
+
+    fn user_scopes(&self) -> Vec<String> {
+        self.parent.as_ref().map(|parent| parent.user_scopes()).unwrap_or_default()
+    }
+
+    fn request_metadata(&self) -> std::collections::HashMap<String, Value> {
+        self.parent.as_ref().map(|parent| parent.request_metadata()).unwrap_or_default()
+    }
+
+    async fn get_secret(&self, name: &str) -> adk_core::Result<Option<String>> {
+        match &self.parent {
+            Some(parent) => parent.get_secret(name).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn get_secret_for(
+        &self,
+        request: &adk_core::SecretRequest,
+    ) -> adk_core::Result<Option<String>> {
+        match &self.parent {
+            Some(parent) => parent.get_secret_for(request).await,
+            None => Ok(None),
+        }
     }
 }
 
@@ -680,6 +1104,28 @@ mod tests {
 
         assert!(output.updates.is_empty());
         assert!(output.interrupt.is_none());
+    }
+
+    #[test]
+    fn default_output_mapper_does_not_repeat_a_complete_snapshot() {
+        let mut partial = adk_core::Event::new("invocation");
+        partial.llm_response.partial = true;
+        partial.set_content(adk_core::Content::new("model").with_text("Hello"));
+        let mut terminal = partial.clone();
+        terminal.llm_response.partial = false;
+        terminal.llm_response.provider_metadata =
+            Some(serde_json::json!({"content_complete": true}));
+        terminal.set_content(adk_core::Content::new("model").with_text("Hello world"));
+
+        let updates = default_output_mapper(&[partial, terminal]);
+
+        assert_eq!(
+            updates.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "assistant", "content": "Hello"},
+                {"role": "assistant", "content": " world"},
+            ]))
+        );
     }
 
     #[test]

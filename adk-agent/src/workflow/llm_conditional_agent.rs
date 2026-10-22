@@ -258,6 +258,13 @@ impl Agent for LlmConditionalAgent {
         &self.all_agents
     }
 
+    fn supports_agent_transfer(&self) -> bool {
+        // Deterministic routing agent: on cross-turn resumption the runner must
+        // restart from this root so routing is re-evaluated, rather than
+        // resuming a single route that responded last.
+        false
+    }
+
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
         let run_ctx = super::skill_context::with_skill_injected_context(
             ctx,

@@ -8,7 +8,10 @@
 //! - [`CodeTool`] — Recommended Rust code execution tool using `RustExecutor` + `SandboxBackend`.
 //! - [`FrontendCodeTool`] — Placeholder frontend preset for collaborative workspace examples.
 //! - [`JavaScriptCodeTool`] — Secondary scripting preset for lightweight transforms.
-//! - [`PythonCodeTool`] — Container-backed Python execution preset.
+//! - [`PythonCodeTool`] — Container-backed CPython execution preset (full Python
+//!   ecosystem: pip packages, C extensions, complete standard library).
+//! - [`MontyPythonCodeTool`] — In-process Python execution via the Monty
+//!   interpreter (one-shot or per-session REPL; no container required).
 //!
 //! ## Scope Model
 //!
@@ -22,6 +25,7 @@
 //! | [`CodeTool`] | `code:execute`, `code:execute:rust` | Sandboxed Rust execution with strict defaults |
 //! | [`JavaScriptCodeTool`] | `code:execute` | In-process embedded JS, no elevated access |
 //! | [`PythonCodeTool`] | `code:execute`, `code:execute:container` | Container-backed, elevated mode |
+//! | [`MontyPythonCodeTool`] | `code:execute` | In-process Monty interpreter, host-granted OS access only |
 //! | [`FrontendCodeTool`] | `code:execute`, `code:execute:container` | Container-backed, elevated mode |
 //!
 //! ### Elevated Modes and Confirmation
@@ -46,7 +50,9 @@
 //! ## Quick Start
 //!
 //! ```rust,ignore
-//! use adk_tool::{CodeTool, FrontendCodeTool, JavaScriptCodeTool, PythonCodeTool};
+//! use adk_tool::{
+//!     CodeTool, FrontendCodeTool, JavaScriptCodeTool, MontyPythonCodeTool, PythonCodeTool,
+//! };
 //! use std::sync::Arc;
 //!
 //! // Rust code execution (recommended)
@@ -55,19 +61,26 @@
 //! // Frontend specialist (placeholder until container backend ships)
 //! let frontend_tool = Arc::new(FrontendCodeTool::react());
 //!
-//! // Lightweight JS transforms (placeholder until EmbeddedJsExecutor ships)
+//! // Lightweight JS transforms (requires the `code-embedded-js` feature)
 //! let js_tool = Arc::new(JavaScriptCodeTool::new());
 //!
-//! // Python execution (placeholder until ContainerCommandExecutor ships)
+//! // Container-backed CPython execution
 //! let py_tool = Arc::new(PythonCodeTool::new());
+//!
+//! // In-process Python execution (requires the `code-embedded-python` feature)
+//! let monty_tool = Arc::new(MontyPythonCodeTool::new());
 //! ```
 
 mod frontend_code_tool;
 mod javascript_code_tool;
+mod monty_python_code_tool;
 mod python_code_tool;
 
 pub use frontend_code_tool::FrontendCodeTool;
 pub use javascript_code_tool::JavaScriptCodeTool;
+pub use monty_python_code_tool::MontyPythonCodeTool;
+#[cfg(feature = "code-embedded-python")]
+pub use monty_python_code_tool::MontyPythonCodeToolBuilder;
 pub use python_code_tool::PythonCodeTool;
 
 /// Re-export [`adk_code::CodeTool`] as the recommended code execution tool.

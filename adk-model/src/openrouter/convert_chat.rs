@@ -5,12 +5,15 @@ use super::chat::{
     OpenRouterChatRequest, OpenRouterChatToolCall, OpenRouterChatToolFunction, OpenRouterPlugin,
     OpenRouterReasoningReplay,
 };
-use adk_core::{AdkError, Content, Part};
+use adk_core::{AdkError, Content, EmbeddedResource, Part};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::json;
 
 const FILE_PARSER_PLUGIN_ID: &str = "file-parser";
+
+/// MIME type used when an embedded resource blob does not declare one.
+const DEFAULT_BLOB_MIME_TYPE: &str = "application/octet-stream";
 
 /// Convert ADK contents into OpenRouter chat messages with multimodal parts preserved.
 pub fn adk_contents_to_chat_messages(
@@ -103,11 +106,11 @@ fn adk_content_to_chat_message(content: &Content) -> Result<OpenRouterChatMessag
             Part::Thinking { thinking, .. } => {
                 push_text_fragment(thinking, &mut text_fragments, &mut structured_parts)
             }
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 flush_text_fragments(&mut text_fragments, &mut structured_parts);
                 structured_parts.push(chat_part_from_inline_data(mime_type, data)?);
             }
-            Part::FileData { mime_type, file_uri } => {
+            Part::FileData { mime_type, file_uri, .. } => {
                 flush_text_fragments(&mut text_fragments, &mut structured_parts);
                 structured_parts.push(chat_part_from_file_uri(mime_type, file_uri));
             }
@@ -130,6 +133,22 @@ fn adk_content_to_chat_message(content: &Content) -> Result<OpenRouterChatMessag
                     &mut structured_parts,
                 );
             }
+            // Embedded resources are user-supplied content, so they are forwarded:
+            // text folds into the text stream, blobs route through the inline-data path.
+            Part::EmbeddedResource { resource } => match resource {
+                EmbeddedResource::Text(text_resource) => push_text_fragment(
+                    &text_resource.text,
+                    &mut text_fragments,
+                    &mut structured_parts,
+                ),
+                EmbeddedResource::Blob(blob_resource) => {
+                    flush_text_fragments(&mut text_fragments, &mut structured_parts);
+                    structured_parts.push(chat_part_from_inline_data(
+                        blob_resource.mime_type.as_deref().unwrap_or(DEFAULT_BLOB_MIME_TYPE),
+                        &blob_resource.data,
+                    )?);
+                }
+            },
             // Server-side tool parts are Gemini-specific; skip for OpenRouter chat
             Part::ServerToolCall { .. } | Part::ServerToolResponse { .. } => {}
         }
@@ -160,7 +179,7 @@ fn adk_content_to_chat_message(content: &Content) -> Result<OpenRouterChatMessag
 }
 
 fn tool_response_chat_message(content: &Content) -> OpenRouterChatMessage {
-    if let Some(Part::FunctionResponse { function_response, id }) = content.parts.first() {
+    if let Some(Part::FunctionResponse { function_response, id, .. }) = content.parts.first() {
         return OpenRouterChatMessage {
             role: "tool".to_string(),
             tool_call_id: id.clone().or_else(|| Some(format!("call_{}", function_response.name))),
@@ -298,12 +317,19 @@ fn chat_part_from_file_uri(mime_type: &str, file_uri: &str) -> OpenRouterChatCon
 fn content_uses_file_inputs(content: &Content) -> bool {
     content.parts.iter().any(|part| match part {
         Part::InlineData { mime_type, .. } | Part::FileData { mime_type, .. } => {
-            !mime_type.starts_with("image/")
-                && !mime_type.starts_with("audio/")
-                && !mime_type.starts_with("video/")
+            needs_file_parser(mime_type)
+        }
+        Part::EmbeddedResource { resource: EmbeddedResource::Blob(blob_resource) } => {
+            needs_file_parser(blob_resource.mime_type.as_deref().unwrap_or(DEFAULT_BLOB_MIME_TYPE))
         }
         _ => false,
     })
+}
+
+fn needs_file_parser(mime_type: &str) -> bool {
+    !mime_type.starts_with("image/")
+        && !mime_type.starts_with("audio/")
+        && !mime_type.starts_with("video/")
 }
 
 fn normalize_role(role: &str) -> &str {
@@ -356,7 +382,10 @@ mod tests {
         OpenRouterChatMessage, OpenRouterChatMessageContent, OpenRouterChatRequest,
         OpenRouterImageConfig, OpenRouterReasoningConfig, OpenRouterReasoningReplay,
     };
-    use adk_core::{Content, FunctionResponseData, Part};
+    use adk_core::{
+        BlobResourceContents, Content, EmbeddedResource, FunctionResponseData, Part,
+        TextResourceContents,
+    };
 
     #[test]
     fn inline_image_maps_to_image_url_data_uri() {
@@ -426,6 +455,60 @@ mod tests {
     }
 
     #[test]
+    fn embedded_text_resource_reaches_message_as_text() {
+        let messages = adk_contents_to_chat_messages(&[Content {
+            role: "user".to_string(),
+            parts: vec![
+                Part::Text { text: "review this file".to_string() },
+                Part::EmbeddedResource {
+                    resource: EmbeddedResource::Text(TextResourceContents::new(
+                        "file:///project/src/main.rs",
+                        Some("text/x-rust".to_string()),
+                        "fn main() {}",
+                    )),
+                },
+            ],
+        }])
+        .expect("messages should convert");
+
+        assert_eq!(
+            messages[0].content,
+            Some(OpenRouterChatMessageContent::Text(
+                "review this file\n\nfn main() {}".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn embedded_blob_resource_maps_to_inline_data_part() {
+        let messages = adk_contents_to_chat_messages(&[Content {
+            role: "user".to_string(),
+            parts: vec![Part::EmbeddedResource {
+                resource: EmbeddedResource::Blob(
+                    BlobResourceContents::new(
+                        "file:///logo.png",
+                        Some("image/png".to_string()),
+                        vec![0x89, 0x50, 0x4e, 0x47],
+                    )
+                    .expect("blob should build"),
+                ),
+            }],
+        }])
+        .expect("messages should convert");
+
+        let parts = match messages[0].content.as_ref() {
+            Some(OpenRouterChatMessageContent::Parts(parts)) => parts,
+            other => panic!("expected structured parts, got {other:?}"),
+        };
+
+        assert_eq!(parts[0].kind, "image_url");
+        assert_eq!(
+            parts[0].image_url.as_ref().and_then(|value| value.get("url")),
+            Some(&serde_json::json!("data:image/png;base64,iVBORw=="))
+        );
+    }
+
+    #[test]
     fn tool_response_maps_to_tool_role_with_tool_call_id() {
         let messages = adk_contents_to_chat_messages(&[Content {
             role: "tool".to_string(),
@@ -435,6 +518,7 @@ mod tests {
                     serde_json::json!({ "temperature": "22C" }),
                 ),
                 id: Some("call_weather".to_string()),
+                annotations: None,
             }],
         }])
         .expect("messages should convert");

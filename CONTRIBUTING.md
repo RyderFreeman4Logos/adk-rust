@@ -48,7 +48,7 @@ Branch naming conventions:
 CI enforces three gates: format, lint, and test. The easiest way to catch failures before they reach CI is to let [lefthook](https://github.com/evilmartians/lefthook) run them automatically as git hooks (see [Git Hooks with Lefthook](#git-hooks-with-lefthook)):
 
 - **pre-commit** runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`, plus `shellcheck --severity=warning` on any staged shell scripts
-- **pre-push** runs `cargo check --workspace` (a fast compilation check — CI runs the full test suite)
+- **pre-push** runs `cargo check --workspace` (a fast compilation check — CI runs the full test suite), plus `scripts/check-examples-compile.sh` when an example or a workspace crate it depends on changed
 
 Once installed, these run on every `git commit` and `git push` — no extra steps required.
 
@@ -72,6 +72,10 @@ cargo nextest run --workspace                            # Test (parallel, ~10x 
 - PRs require review and passing CI before merge
 - Address review feedback with additional commits (don't force-push during review)
 - Squash or merge commit at maintainer discretion
+
+### Linux fork gates
+
+This fork uses `just pre-commit-fast`, then `just quality-gates` on a clean feature branch, followed by independent review of `origin/main...HEAD` before pushing. `just pre-push` validates the exact outgoing commit against quality and review receipts under `$HOME/tmp/adk-rust-local-gates/`; hosted Actions remain disabled. Cargo commands enter through the local Just recipes: ordinary commands use `just cargo`, while generated-template checks use `template-cargo` and the SDK's existing canonical target. Both preserve the pinned compiler, idle I/O priority and verified temporary directory.
 
 ## Getting Started
 
@@ -97,10 +101,15 @@ cargo nextest run --workspace
 
 ### Prerequisites
 
-- Rust 1.94.0+ (edition 2024)
-- For browser examples: Chrome/Chromium
+- Rust 1.95.0+ (edition 2024), pinned by `rust-toolchain.toml`
+- `cargo-nextest` — backs the test gate: `cargo install cargo-nextest --locked`
+- For `adk-rag --features lancedb`: `protoc` (lance's build script requires it)
 - For `openai-webrtc` feature: cmake (audiopus builds Opus from source)
+- For browser examples: Chrome/Chromium
 - For mistral.rs: see [adk-mistralrs section](#adk-mistralrs)
+- On Windows: Visual Studio Build Tools (C/C++), NASM (`aws-lc-sys` needs it on
+  MSVC), plus full Git for Windows and Python — nine tests shell out to `bash`,
+  `sh`, or `python3`
 
 ### Dev Environment Setup
 
@@ -110,12 +119,26 @@ We provide three ways to set up your development environment:
 
 If you use [devenv](https://devenv.sh), just run `devenv shell`. This gives you identical toolchains on Linux, macOS, and CI — Rust, sccache, mold, cmake, Node.js, and everything else pinned to known-good versions.
 
-**Option B: Setup script (brew/apt)**
+**Option B: Setup script**
+
+On Linux and macOS (uses brew/apt/dnf):
 
 ```bash
 ./scripts/setup-dev.sh          # Install recommended tools
 ./scripts/setup-dev.sh --check  # Just check what's installed
 ```
+
+On Windows (devenv and the bash script both need a POSIX shell):
+
+```powershell
+./scripts/setup-dev.ps1         # Install recommended tools
+./scripts/setup-dev.ps1 -Check  # Just check what's installed
+```
+
+Both scripts are idempotent, and both check the feature-gated build tools —
+`protoc` for `adk-rag --features lancedb`, and NASM for `aws-lc-sys` on Windows
+MSVC. Missing either one fails the build locally while CI stays green, because
+CI installs them on every runner.
 
 **Option C: Manual**
 
@@ -153,7 +176,7 @@ cp .env.example .env
 The repo ships a `lefthook.yml` that wires the [Quality Gates](#quality-gates) into git hooks, so they run automatically:
 
 - **pre-commit** — format check (`cargo fmt --all -- --check`), lint (`cargo clippy --workspace --all-targets -- -D warnings`), and shell-script lint (`shellcheck --severity=warning` on staged `*.sh`, mirroring the shellcheck hook in `devenv.nix`)
-- **pre-push** — a fast compilation check (`cargo check --workspace`), not the full test suite. CI is the full-suite safety net, so the local push gate stays quick (see [Quality Gates](#quality-gates) for the CI tier design)
+- **pre-push** — a fast compilation check (`cargo check --workspace`), not the full test suite, plus `scripts/check-examples-compile.sh` over the four example shards when an example or a crate it depends on changed. CI is the full-suite safety net, so the local push gate stays quick (see [Quality Gates](#quality-gates) for the CI tier design)
 
 The shellcheck gate only runs when shell scripts are staged, and runs at `--severity=warning` so informational notes (e.g. SC1091 about sourced files that can't be followed) don't block commits. `publish.sh` is skipped because it's a zsh script, which shellcheck doesn't support. Install shellcheck with `brew install shellcheck` (macOS) or `apt install shellcheck` (Debian/Ubuntu); `scripts/setup-dev.sh` installs it for you.
 
@@ -179,7 +202,7 @@ Need to bypass a hook in an emergency? Use `LEFTHOOK=0 git commit ...` or `git c
 
 ## Project Structure
 
-ADK-Rust is a Cargo workspace with 32 publishable crates organized by responsibility.
+ADK-Rust is a Cargo workspace with 43 publishable crates organized by responsibility.
 
 ### Core Crates (publishable to crates.io)
 
@@ -191,8 +214,9 @@ adk-agent/         Agent implementations: LlmAgent, SequentialAgent, ParallelAge
 adk-model/         LLM provider facade: Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama,
                    OpenRouter, Bedrock, Azure AI, and OpenAI-compatible presets
 adk-gemini/        Dedicated Gemini client with GeminiBackend trait (Studio + Vertex AI)
+adk-gcp/           Shared Google Cloud authentication, REST, and LRO plumbing
 adk-anthropic/     Dedicated Anthropic client with thinking, caching, citations, vision
-adk-tool/          Tool utilities, built-in tools, MCP integration (rmcp 1.3)
+adk-tool/          Tool utilities, built-in tools, MCP integration (rmcp 3.1)
 adk-runner/        Agent execution runtime with event streaming
 adk-server/        REST API server and A2A (Agent-to-Agent) protocol
 adk-session/       Session management and state persistence, encrypted sessions
@@ -202,29 +226,89 @@ adk-graph/         Graph-based workflow orchestration with checkpoints, durable 
 adk-realtime/      Real-time bidirectional audio/voice agents (OpenAI, Gemini Live, LiveKit)
 adk-browser/       Browser automation tools via WebDriver
 adk-eval/          Agent evaluation framework (trajectory, semantic, rubric, LLM-judge)
-adk-telemetry/     OpenTelemetry 0.31 integration for agent observability
+adk-telemetry/     OpenTelemetry 0.32 integration for agent observability
 adk-guardrail/     Input/output guardrails for agent safety
 adk-auth/          Authentication: API keys, JWT, OAuth2, OIDC, SSO
 adk-plugin/        Plugin system for agent lifecycle hooks
+adk-retry-reflect/ Retry and reflection plugin for failed tool calls
 adk-skill/         Skill discovery and convention-based agent capabilities
 adk-cli/           Command-line launcher for agents
 adk-code/          Code generation and execution (experimental)
+adk-codeact-monty/ Sandboxed Python runtime for CodeAct agents (experimental)
+adk-devtools/      Sandboxed file, search, edit, and shell tools for coding agents
+adk-mistralrs/     Local LLM inference through mistral.rs (GPU features opt in)
 adk-sandbox/       Sandboxed execution environments (experimental)
 adk-audio/         Audio processing, STT/TTS providers (experimental)
 adk-rag/           Retrieval-augmented generation pipelines
 adk-action/        Action node execution for deterministic workflow operations
 adk-deploy/        Deployment utilities
 adk-payments/      Payment integration for agent services
+adk-computer-use/  Governed computer-use orchestration and evaluation receipts
+adk-managed/       Provider-neutral managed-agent runtime (experimental)
+adk-enterprise/    Enterprise managed-agent service client (experimental)
+adk-bench/         Runtime and cross-framework benchmarking
+awp-types/         Agentic Web Protocol types
+adk-awp/           Agentic Web Protocol server implementation
+adk-acp/           Agent Client Protocol client and server integration
 cargo-adk/         Cargo subcommand for project scaffolding
 adk-rust/          Umbrella crate re-exporting all of the above
 ```
 
+## Release Process
+
+Release from a clean checkout after all other intended changes have merged. The
+root workspace version is the source of truth for every publishable crate. During
+the cycle the README describes the version as `release candidate — unpublished`;
+the release-preparation pull request switches it to its final, released state, so
+the tagged commit is exactly what crates.io receives. Publishing is always the last
+step.
+
+1. If the workspace is not already at the target version, run
+   `python3 scripts/bump-version.py <version>`. Add an empty `## [Unreleased]`
+   section above the dated release, and make the changelog comparison links point
+   from the new version to `HEAD` and from the previous tag to the new tag.
+2. Assemble the changelog fragments into the release heading and commit the result
+   together with the removed fragment files:
+
+   ```bash
+   bash scripts/changelog-assemble.sh --into <version>
+   ```
+
+3. In the same pull request, set the README banner to `v<version> Released!` with
+   the crates.io link for the new version, and mark the roadmap version `(current)`.
+   Run the normal quality gates plus:
+
+   ```bash
+   bash scripts/check-release-consistency.sh
+   bash scripts/check-publish-order.sh
+   cargo xtask publish --dry-run
+   ```
+
+   The publish dry-run must run from a clean checkout without ignored build
+   artifacts inside crate directories. A warning about yanked `spin 0.9.x` is
+   currently expected through upstream `flume/sqlx` and `heapless/postcard`
+   dependency chains; it does not prevent packaging.
+4. Merge the preparation pull request and wait for both the PR tier and the
+   post-merge macOS/Windows tier to pass on the exact release commit.
+5. Create an annotated tag and validate the tagged checkout before pushing it.
+   Release mode fails while the README still describes a release candidate:
+
+   ```bash
+   git tag -a v<version> -m "Release <version>"
+   bash scripts/check-release-consistency.sh --release
+   git push origin v<version>
+   ```
+
+6. Create the GitHub release from the annotated tag, using the matching changelog
+   entry as the release notes.
+7. Publish with `cargo xtask publish`. If crates.io indexing interrupts the
+   workspace publish, resume safely with `cargo xtask publish --resume`; it uses
+   the computed dependency order and skips versions that already exist. Then
+   confirm all 43 crate versions and their docs.rs builds.
+
 ### Excluded from Workspace
 
 ```
-adk-mistralrs/     Local LLM inference via mistral.rs (GPU deps — build explicitly)
-                   Excluded so `--all-features` works without CUDA toolkit.
-                   Has its own CI workflow.
 adk-studio/        Visual agent builder — extracted to standalone repo.
                    Repo: https://github.com/zavora-ai/adk-studio
 adk-ui/            Dynamic UI generation — extracted to standalone repo.
@@ -292,8 +376,8 @@ expensive axes just move to a later tier.
 
 | Tier | Trigger | Checks | Blocks merge? |
 |------|---------|--------|---------------|
-| **PR** | pull request (`ci.yml` + `semver.yml`) | `fmt` (prerequisite gate), `clippy --workspace -D warnings`, `nextest --workspace` on Linux (at most once), `feature-coverage` (feature-gated modules like `adk-agent --features codeact`), `docs` (single `cargo doc --workspace --no-deps`), `templates`, compile-only `macos`/`windows` builds, `semver` (stable strict, beta warn-only) | Yes — this is the required-check set |
-| **Merge** | `push: main` (`ci-merge.yml`) | cross-platform `nextest --workspace` on macOS/Windows, out-of-workspace Monty build, doc-example compilation | No — runs post-merge |
+| **PR** | pull request (`ci.yml` + `semver.yml`) | `fmt` (prerequisite gate), `clippy --workspace -D warnings`, `nextest --workspace` on Linux (at most once), `feature-coverage` (feature-gated modules like `adk-agent --features codeact`), docs and doctests, standalone examples (4 shards), `templates`, a compile-only macOS build, a Windows workspace build with a targeted sandbox portability smoke, and `semver` (stable strict with the next release assumed minor, so additions pass and breakage fails; beta warn-only) | Yes — aggregated by `pr-gate`, plus `semver` |
+| **Merge** | `push: main` (`ci-merge.yml`) | cross-platform `nextest --workspace` on macOS/Windows, doc-example compilation | No — runs post-merge |
 | **Nightly** | `schedule` (`ci-nightly.yml`) | feature-combination matrix, `cargo-audit`/`cargo-deny` supply-chain, `#[ignore]` integration tests gated on secrets | No — runs on a schedule |
 
 Only the **PR tier** gates merges. The merge and nightly tiers run after a change
@@ -301,6 +385,29 @@ lands (or on a schedule) and are informational. The three local gates above map 
 the PR tier; locally, `pre-push` runs the lighter `cargo check --workspace` because
 CI is the full-suite safety net. The authoritative required-check set is enumerated
 in [Branch Protection — Required Status Checks](#branch-protection--required-status-checks).
+
+## Validating a Branch Locally
+
+`scripts/validate-pr.sh` runs the PR tier on the current branch, scoped to what it
+changes against a base (default `origin/main`): `fmt` on the workspace; clippy and
+nextest on the changed crates and every crate that depends on them; the
+feature-coverage pairs of the changed crates; each changed crate's widest declared
+feature set (`all-providers` or `full`), since a crate such as `adk-model` compiles
+almost nothing under its defaults; the semver gate for changed Stable crates when
+`cargo-semver-checks` is installed; shellcheck and YAML parsing for
+changed scripts and workflows; and the documentation gates. `--examples` adds a
+`cargo check --locked` of every standalone example that depends on a changed crate.
+
+```bash
+scripts/validate-pr.sh                 # against origin/main
+scripts/validate-pr.sh main --examples # against a local ref, with the examples
+```
+
+All worktrees of the repository share the main checkout's `target/` through `CARGO_TARGET_DIR`, so a second worktree does not cost a second full build on disk.
+
+The script prints one line per gate and exits non-zero when any gate fails. It is the
+maintainer's tool for rebasing a contributor branch and confirming it before pushing;
+CI remains the verification of record.
 
 ## Branch Protection — Required Status Checks
 
@@ -310,40 +417,40 @@ change lands (or on a schedule) and are informational — they MUST NOT be marke
 branch-protection-required, because requiring a check that doesn't run on a PR
 would block every PR waiting for a status that never arrives.
 
-Branch protection for `main` is configured through the GitHub API / repo settings
-(there is no committed config file). The authoritative required-check set is the
-list below. When updating branch protection, use exactly these status-check
-contexts.
+The `CI / pr-gate` job depends on every job group in `ci.yml` and runs with
+`if: always()`. It succeeds only when every dependency succeeds, including all
+matrix entries. Matrix jobs remain visible individually for diagnosis, but adding
+or removing a matrix entry no longer requires a matching branch-ruleset edit.
 
 ### Required on PRs (branch-protection-required)
 
-These are the Tier-1 jobs from `ci.yml` and `semver.yml`. The status-check context
-name is the job name (matrix jobs include the matrix value in parentheses):
+Require exactly these stable contexts in the `main` ruleset:
 
 | Check context | Workflow | Job |
 |---------------|----------|-----|
-| `fmt` | `ci.yml` | `fmt` |
-| `clippy` | `ci.yml` | `clippy` |
-| `test` | `ci.yml` | `test` |
-| `feature-coverage (adk-agent, codeact)` | `ci.yml` | `feature-coverage` (matrix) |
-| `docs` | `ci.yml` | `docs` |
-| `templates` | `ci.yml` | `templates` |
-| `macos` | `ci.yml` | `macos` (compile-only build) |
-| `windows` | `ci.yml` | `windows` (compile-only build) |
+| `pr-gate` | `ci.yml` | Aggregate of every PR-tier CI job below |
 | `semver` | `semver.yml` | `semver` (stable-tier strict; beta is warn-only within the same job) |
 
-Notes:
-- `feature-coverage` is a matrix job; its context includes the matrix value, so
-  add each entry that exists. Today the only entry is `adk-agent, codeact`. If you
-  append matrix entries, add their contexts here and to branch protection.
-- `semver` is a single job that runs the strict stable-crate check (which can fail
-  the job) and a warn-only beta/experimental check (which never fails). Requiring
-  the `semver` job therefore requires only the stable-tier semver gate, keeping the
-  beta check advisory (Requirement 5.3).
-- `codeact-feature` (from `codeact-monty.yml`) is **path-filtered** to CodeAct
-  paths and does **not** run on most PRs, so it MUST NOT be required — the
-  always-on `feature-coverage (adk-agent, codeact)` job is the merge-blocking
-  CodeAct signal instead.
+> **Note:** `pr-gate` and `semver` are the only contexts the ruleset requires. Shards
+> and matrix entries report individually for diagnosis, but none is required by name,
+> so the feature-coverage pairs and the example shards can change without a ruleset
+> edit.
+
+`pr-gate` covers `fmt`, `webui`, `clippy`, Linux workspace tests, the eight
+`feature-coverage` shards driven by `scripts/feature-coverage-pairs.txt`, docs and
+doctests, the four standalone-example shards, `templates`, the macOS build, and the
+Windows build plus sandbox portability smokes. `semver` stays separate because its
+workflow has an independent trigger and keeps stable crates strict while
+beta/experimental crates remain advisory.
+
+The `scope` job narrows a run to what the change can affect, and `pr-gate` accepts a
+skipped job only when the scope or the event skipped it:
+
+| Run | Jobs that run |
+|-----|---------------|
+| Pull request that touches code | every job |
+| Pull request that touches only `docs/`, Markdown, or `LICENSE*` | `fmt`, `webui`, `templates` (the documentation gates) |
+| Merge-queue build | every job except `docs`, the standalone-example shards and the macOS and Windows builds, which the pull request already passed and a merge cannot break on its own |
 
 ### NOT required (informational tiers)
 
@@ -351,46 +458,26 @@ These run post-merge or on a schedule and MUST NOT be branch-protection-required
 
 - **Merge tier** (`ci-merge.yml`, `on: push: branches:[main]`):
   `cross-platform-test (macos-latest)`, `cross-platform-test (windows-latest)`,
-  `out-of-workspace-monty`, `doc-examples`.
+  `doc-examples`.
 - **Nightly tier** (`ci-nightly.yml`, `on: schedule`): the `features (…)`
   feature-combination matrix jobs, `supply-chain`, `integration-tests`.
-- **Weekly out-of-workspace** (`codeact-monty.yml` cron): `monty-runtime`; and the
-  path-filtered `codeact-feature` PR job (see note above).
+- **Code scanning** (`codeql.yml`, `on: push: branches:[main]` and weekly): the
+  `Analyze (…)` CodeQL jobs. Alerts appear under Security → Code scanning; test
+  code and examples are excluded by `.github/codeql/config.yml`.
 
 ### Applying the required-check set
 
-A maintainer with admin rights can apply the set above with the GitHub CLI. This
-requires new PR-tier job names to be stable and green first (spec tasks 6 and 10),
-since branch protection waits on a context that must actually report:
+A maintainer with admin rights applies this through **Settings → Rules →
+Rulesets → `adk-rust-ruleset` → Require status checks to pass**. First merge the
+workflow change and confirm that `CI / pr-gate` has reported successfully on a
+pull request. Then remove the individual CI/matrix contexts and retain only:
 
-```bash
-gh api -X PUT repos/zavora-ai/adk-rust/branches/main/protection \
-  --input - <<'JSON'
-{
-  "required_status_checks": {
-    "strict": true,
-    "checks": [
-      { "context": "fmt" },
-      { "context": "clippy" },
-      { "context": "test" },
-      { "context": "feature-coverage (adk-agent, codeact)" },
-      { "context": "docs" },
-      { "context": "templates" },
-      { "context": "macos" },
-      { "context": "windows" },
-      { "context": "semver" }
-    ]
-  },
-  "enforce_admins": false,
-  "required_pull_request_reviews": { "required_approving_review_count": 1 },
-  "restrictions": null
-}
-JSON
-```
+- `pr-gate`
+- `semver`
 
-Adjust `required_pull_request_reviews`, `enforce_admins`, and `restrictions` to
-match the project's review policy; the merge-blocking contract for this spec is the
-`checks` list above.
+Keep **Require branches to be up to date before merging** enabled. Do not change
+the ruleset's review, deletion, or non-fast-forward policies as part of this
+status-check migration.
 
 ## Build Commands
 
@@ -474,7 +561,7 @@ cargo test --workspace --doc
 - Unit tests: `#[cfg(test)]` modules in source files
 - Integration tests: `tests/*.rs` in each crate
 - Property tests: `tests/*_property_tests.rs` using `proptest` (100+ iterations)
-- Doc examples: Cargo snippets, feature names, and package/example references in `README.md` and `docs/official_docs/` are validated against `cargo metadata` by `scripts/check-doc-examples.sh`. Compile coverage comes from the workspace example crates and cargo-adk templates.
+- Doc examples: Cargo snippets, feature names, and package/example references in `README.md` and `docs/official_docs/` are validated against `cargo metadata` by `scripts/check-doc-examples.sh`. The PR tier compiles the standalone example workspaces and cargo-adk templates.
 
 ### Writing Tests for New Code
 
@@ -494,7 +581,7 @@ If your change is purely internal refactoring with no behavior change, existing 
 
 ### Rust Conventions
 
-- Edition 2024, MSRV 1.94.0
+- Edition 2024, MSRV 1.95.0
 - `thiserror` for library error types
 - `async-trait` for async trait methods
 - `Arc<T>` for shared ownership across async boundaries
@@ -574,7 +661,7 @@ Every PR has a template with this checklist. Fill it out when you open your PR.
 
 ### Documentation (if applicable)
 
-- [ ] CHANGELOG.md updated for user-facing changes
+- [ ] Changelog fragment added under `changelog.d/` for user-facing changes
 - [ ] README updated if crate capabilities changed
 - [ ] Examples added or updated for new features
 

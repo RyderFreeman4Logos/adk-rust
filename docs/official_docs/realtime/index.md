@@ -60,7 +60,7 @@ Live — documented there.)
 
 ```toml
 # Voice + tools + the integration layer (recommended)
-adk-realtime = { version = "2.0.0", features = ["openai", "gemini", "integration"] }
+adk-realtime = { version = "2.3.0", features = ["openai", "gemini", "integration"] }
 ```
 
 | Feature | Adds |
@@ -88,7 +88,7 @@ use std::sync::Arc;
 # async fn run() -> anyhow::Result<()> {
 let model: BoxedModel = Arc::new(OpenAIRealtimeModel::new(
     std::env::var("OPENAI_API_KEY")?,
-    "gpt-realtime",
+    "gpt-realtime-2.1",
 ));
 
 let config = RealtimeConfig::default()

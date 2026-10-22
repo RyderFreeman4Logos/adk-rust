@@ -50,6 +50,18 @@ impl LoopAgent {
     }
 
     /// Set the maximum number of loop iterations.
+    ///
+    /// Each iteration runs every sub-agent once, in order; an escalation ends the loop early.
+    /// `0` runs no iterations: the before- and after-agent callbacks still run and the agent
+    /// completes immediately without invoking any sub-agent.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_agent::LoopAgent;
+    ///
+    /// let refine = LoopAgent::new("refine", vec![writer, critic]).with_max_iterations(3);
+    /// ```
     pub fn with_max_iterations(mut self, max: u32) -> Self {
         self.max_iterations = max;
         self
@@ -110,6 +122,8 @@ impl LoopAgent {
 struct HistoryTrackingSession {
     parent_ctx: Arc<dyn InvocationContext>,
     history: Arc<RwLock<Vec<Content>>>,
+    /// Event id of the streamed response that produced the last history entry.
+    streamed_id: RwLock<Option<String>>,
     state: StateTrackingState,
 }
 
@@ -156,6 +170,7 @@ impl HistoryTrackingSession {
     fn new(parent_ctx: Arc<dyn InvocationContext>) -> Self {
         Self {
             history: Arc::new(RwLock::new(parent_ctx.session().conversation_history())),
+            streamed_id: RwLock::new(None),
             state: StateTrackingState::new(&parent_ctx),
             parent_ctx,
         }
@@ -163,15 +178,19 @@ impl HistoryTrackingSession {
 
     fn apply_event(&self, event: &Event) {
         if let Some(content) = &event.llm_response.content {
-            // Consolidate streaming chunks: if the last history entry has the
-            // same role, merge text into it instead of creating a new entry.
+            // Consolidate streaming chunks: chunks of one response merge into the
+            // entry its first chunk started instead of creating new entries.
             // This prevents N streaming chunks from becoming N separate Content
             // entries that bloat context for subsequent agents.
             let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            let mut streamed_id = self.streamed_id.write().unwrap_or_else(|e| e.into_inner());
+            let continues_stream = streamed_id.as_deref() == Some(event.id.as_str());
 
             if event.llm_response.partial {
-                // Partial chunk — merge into last entry if same role
-                if let Some(last) = history.last_mut()
+                // Partial chunk — merge into the entry this response started, so a
+                // later complete snapshot replaces only this response.
+                if continues_stream
+                    && let Some(last) = history.last_mut()
                     && last.role == content.role
                 {
                     for part in &content.parts {
@@ -192,14 +211,27 @@ impl HistoryTrackingSession {
                 }
                 // No matching last entry — start a new one
                 history.push(content.clone());
+                *streamed_id = Some(event.id.clone());
             } else {
-                // Final event (partial=false) — append as-is.
-                // For non-streaming mode this carries the full content.
-                // For streaming mode the accumulated text is already in the
-                // last history entry from partial merges above, so the final
-                // chunk (which may carry the last fragment or be empty) is
-                // merged if same role, or appended if different.
-                if let Some(last) = history.last_mut() {
+                let content_complete = event
+                    .llm_response
+                    .provider_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("content_complete"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+                let replaced_stream = continues_stream && content_complete;
+                *streamed_id = None;
+                if replaced_stream && let Some(last) = history.last_mut() {
+                    // A complete snapshot already contains every streamed delta.
+                    *last = content.clone();
+                } else if let Some(last) = history.last_mut() {
+                    // Final event (partial=false) — append as-is.
+                    // For non-streaming mode this carries the full content.
+                    // Without a complete snapshot the accumulated text is already in
+                    // the last history entry from partial merges above, so the final
+                    // chunk (which may carry the last fragment or be empty) is
+                    // merged if same role, or appended if different.
                     if last.role == content.role && !content.parts.is_empty() {
                         // Merge any remaining text from the final chunk
                         for part in &content.parts {
@@ -257,6 +289,14 @@ impl Session for HistoryTrackingSession {
     }
 }
 
+/// Builds a [`HistoryTrackingContext`] for the wrapper conformance tests.
+#[cfg(test)]
+pub(crate) fn history_tracking_context_for_test(
+    parent: Arc<dyn InvocationContext>,
+) -> Arc<dyn InvocationContext> {
+    Arc::new(HistoryTrackingContext::new(parent))
+}
+
 struct HistoryTrackingContext {
     parent_ctx: Arc<dyn InvocationContext>,
     session: HistoryTrackingSession,
@@ -309,6 +349,10 @@ impl CallbackContext for HistoryTrackingContext {
     fn artifacts(&self) -> Option<Arc<dyn adk_core::Artifacts>> {
         self.parent_ctx.artifacts()
     }
+
+    fn shared_state(&self) -> Option<Arc<adk_core::SharedState>> {
+        self.parent_ctx.shared_state()
+    }
 }
 
 #[async_trait]
@@ -337,12 +381,49 @@ impl InvocationContext for HistoryTrackingContext {
         self.parent_ctx.ended()
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.parent_ctx.is_cancelled()
+    }
+
     fn user_scopes(&self) -> Vec<String> {
         self.parent_ctx.user_scopes()
     }
 
     fn request_metadata(&self) -> HashMap<String, serde_json::Value> {
         self.parent_ctx.request_metadata()
+    }
+
+    fn authoritative_transfer_targets(&self) -> bool {
+        self.parent_ctx.authoritative_transfer_targets()
+    }
+    fn delegation_depth(&self) -> u32 {
+        self.parent_ctx.delegation_depth()
+    }
+    fn max_delegation_depth(&self) -> Option<u32> {
+        self.parent_ctx.max_delegation_depth()
+    }
+
+    fn orchestration_root_invocation_id(&self) -> &str {
+        self.parent_ctx.orchestration_root_invocation_id()
+    }
+
+    fn orchestration_edge_id(&self) -> Option<&str> {
+        self.parent_ctx.orchestration_edge_id()
+    }
+
+    fn requires_tool_confirmation(&self, tool_name: &str) -> bool {
+        self.parent_ctx.requires_tool_confirmation(tool_name)
+    }
+
+    async fn get_secret(&self, name: &str) -> adk_core::Result<Option<String>> {
+        self.parent_ctx.get_secret(name).await
+    }
+
+    async fn get_secret_for(
+        &self,
+        request: &adk_core::SecretRequest,
+    ) -> adk_core::Result<Option<String>> {
+        self.parent_ctx.get_secret_for(request).await
     }
 }
 
@@ -358,6 +439,13 @@ impl Agent for LoopAgent {
 
     fn sub_agents(&self) -> &[Arc<dyn Agent>] {
         &self.sub_agents
+    }
+
+    fn supports_agent_transfer(&self) -> bool {
+        // Deterministic workflow agent: on cross-turn resumption the runner
+        // must restart from this root so every sub-agent runs again, rather
+        // than resuming a single sub-agent that responded last.
+        false
     }
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
@@ -406,9 +494,9 @@ impl Agent for LoopAgent {
                 }
             }
 
-            let mut remaining = max_iterations;
-
-            loop {
+            // A range cannot underflow, so `max_iterations == 0` runs the body zero times
+            // instead of wrapping to `u32::MAX`.
+            for _ in 0..max_iterations {
                 let mut should_exit = false;
 
                 for agent in &sub_agents {
@@ -436,11 +524,6 @@ impl Agent for LoopAgent {
                 }
 
                 if should_exit {
-                    break;
-                }
-
-                remaining -= 1;
-                if remaining == 0 {
                     break;
                 }
             }

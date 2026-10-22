@@ -22,9 +22,9 @@ cd examples/codeact_monty_agent
 cargo run
 ```
 
-> This example transitively depends on `monty` (a git dependency, not yet on
-> crates.io), which requires **rustc 1.95+**. The bundled `rust-toolchain.toml`
-> selects it automatically; the first build also fetches and compiles Monty.
+> This example transitively depends on `monty` (from crates.io), which requires
+> **rustc 1.95+**. The bundled `rust-toolchain.toml` selects it automatically;
+> the first build also fetches and compiles Monty.
 
 Expected output (the `priced_at` timestamp reflects the host clock at run time):
 

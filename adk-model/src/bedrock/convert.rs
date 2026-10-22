@@ -4,6 +4,7 @@
 //! and the Bedrock Converse API format used by `aws-sdk-bedrockruntime`.
 
 use super::config::{BedrockCacheConfig, BedrockCacheTtl};
+use crate::part_conversion::ConversionReport;
 use adk_core::{Content, FinishReason, GenerateContentConfig, LlmResponse, Part, UsageMetadata};
 use aws_sdk_bedrockruntime::types::{
     self as bedrock, CachePointBlock, CachePointType, CacheTtl, ContentBlock, ContentBlockDelta,
@@ -126,50 +127,219 @@ fn build_cache_point_block(cache_config: &BedrockCacheConfig) -> CachePointBlock
 }
 
 /// Convert ADK `Part` list to Bedrock `ContentBlock` list.
+/// Reports what became of every part in `contents` when converted for Bedrock.
+///
+/// Exposed so callers and conformance tests can see the fate of each supplied part without
+/// issuing a request. Use [`crate::part_conversion::ConversionReport::into_error`] to refuse a request that would
+/// reach the model incomplete.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::{Content, Part};
+/// use adk_model::bedrock::convert::report_for_contents;
+///
+/// let content = Content { role: "user".to_string(), parts: vec![Part::inline_data("audio/wav", vec![1])] };
+/// let report = report_for_contents(std::slice::from_ref(&content));
+///
+/// assert!(report.has_omissions(), "Bedrock Converse carries no audio block");
+/// ```
+pub fn report_for_contents(contents: &[Content]) -> ConversionReport {
+    let mut report = ConversionReport::new("bedrock");
+    for content in contents {
+        let _ = adk_parts_to_bedrock_inner(&content.parts, &mut report);
+    }
+    report
+}
+
+/// Converts parts to Bedrock content blocks, recording what each part's fate was.
+///
+/// Bedrock Converse accepts a narrower set than `Content` can express. Every part that is
+/// left out or rendered lossily is recorded — and warned about — rather than disappearing.
+fn adk_parts_to_bedrock_reported(parts: &[Part]) -> (Vec<ContentBlock>, ConversionReport) {
+    let mut report = ConversionReport::new("bedrock");
+    let blocks = adk_parts_to_bedrock_inner(parts, &mut report);
+    (blocks, report)
+}
+
 fn adk_parts_to_bedrock(parts: &[Part]) -> Vec<ContentBlock> {
+    adk_parts_to_bedrock_reported(parts).0
+}
+
+fn adk_parts_to_bedrock_inner(parts: &[Part], report: &mut ConversionReport) -> Vec<ContentBlock> {
     let contains_function_call = parts.iter().any(|part| matches!(part, Part::FunctionCall { .. }));
 
     parts
         .iter()
-        .filter_map(|part| match part {
-            Part::Text { text } => {
-                if text.is_empty() || contains_function_call {
-                    None
-                } else {
-                    Some(ContentBlock::Text(text.clone()))
+        .filter_map(|part| {
+            // Accounting wraps the conversion so a part cannot leave without a recorded
+            // fate. If a branch drops one without saying why — including any branch added
+            // later — the safety net below records it as an unexplained omission rather
+            // than letting it vanish.
+            let before = report.outcomes().len();
+            let block = convert_one_part(part, contains_function_call, report);
+
+            if report.outcomes().len() == before {
+                match block.is_some() {
+                    true => report.converted(part_kind(part)),
+                    false => report.omitted(
+                        part_kind(part),
+                        part_mime_type(part),
+                        "dropped by the Bedrock adapter without a recorded reason",
+                    ),
                 }
             }
-            Part::FunctionCall { name, args, id, .. } => {
-                let tool_use = ToolUseBlock::builder()
-                    .tool_use_id(id.clone().unwrap_or_else(|| format!("call_{name}")))
-                    .name(name.clone())
-                    .input(json_value_to_document(args))
-                    .build()
-                    .ok()?;
-                Some(ContentBlock::ToolUse(tool_use))
+
+            block
+        })
+        .collect()
+}
+
+/// The `Part` variant name, for reporting.
+fn part_kind(part: &Part) -> &'static str {
+    match part {
+        Part::Text { .. } => "Text",
+        Part::InlineData { .. } => "InlineData",
+        Part::FileData { .. } => "FileData",
+        Part::FunctionCall { .. } => "FunctionCall",
+        Part::FunctionResponse { .. } => "FunctionResponse",
+        Part::Thinking { .. } => "Thinking",
+        Part::ServerToolCall { .. } => "ServerToolCall",
+        Part::ServerToolResponse { .. } => "ServerToolResponse",
+        Part::EmbeddedResource { .. } => "EmbeddedResource",
+    }
+}
+
+/// The part's MIME type, where it has one.
+fn part_mime_type(part: &Part) -> Option<&str> {
+    match part {
+        Part::InlineData { mime_type, .. } | Part::FileData { mime_type, .. } => Some(mime_type),
+        Part::EmbeddedResource { resource } => match resource {
+            adk_core::EmbeddedResource::Blob(blob) => blob.mime_type.as_deref(),
+            adk_core::EmbeddedResource::Text(_) => None,
+        },
+        _ => None,
+    }
+}
+
+fn convert_one_part(
+    part: &Part,
+    contains_function_call: bool,
+    report: &mut ConversionReport,
+) -> Option<ContentBlock> {
+    match part {
+        Part::Text { text } => {
+            if text.is_empty() || contains_function_call {
+                None
+            } else {
+                Some(ContentBlock::Text(text.clone()))
             }
-            Part::FunctionResponse { function_response, id } => {
-                let tool_result = ToolResultBlock::builder()
-                    .tool_use_id(id.clone().unwrap_or_else(|| "unknown".to_string()))
-                    .content(ToolResultContentBlock::Text(
-                        crate::tool_result::serialize_tool_result(&function_response.response),
-                    ))
-                    .build()
-                    .ok()?;
-                Some(ContentBlock::ToolResult(tool_result))
+        }
+        Part::FunctionCall { name, args, id, .. } => {
+            let tool_use = ToolUseBlock::builder()
+                .tool_use_id(id.clone().unwrap_or_else(|| format!("call_{name}")))
+                .name(name.clone())
+                .input(json_value_to_document(args))
+                .build()
+                .ok()?;
+            Some(ContentBlock::ToolUse(tool_use))
+        }
+        Part::FunctionResponse { function_response, id, .. } => {
+            let tool_result = ToolResultBlock::builder()
+                .tool_use_id(id.clone().unwrap_or_else(|| "unknown".to_string()))
+                .content(ToolResultContentBlock::Text(crate::tool_result::serialize_tool_result(
+                    &function_response.response,
+                )))
+                .build()
+                .ok()?;
+            Some(ContentBlock::ToolResult(tool_result))
+        }
+        Part::Thinking { thinking, .. } => {
+            if thinking.is_empty() || contains_function_call {
+                None
+            } else {
+                // Bedrock Converse API doesn't accept thinking blocks in input,
+                // convert to text for conversation history
+                Some(ContentBlock::Text(thinking.clone()))
             }
-            Part::Thinking { thinking, .. } => {
-                if thinking.is_empty() || contains_function_call {
+        }
+        Part::InlineData { mime_type, data, .. } => {
+            if let Some(fmt) = mime_to_bedrock_image_format(mime_type) {
+                let source = ImageSource::Bytes(aws_smithy_types::Blob::new(data.as_slice()));
+                ImageBlock::builder()
+                    .format(fmt)
+                    .source(source)
+                    .build()
+                    .ok()
+                    .map(ContentBlock::Image)
+            } else if let Some(fmt) = mime_to_bedrock_document_format(mime_type) {
+                let source = DocumentSource::Bytes(aws_smithy_types::Blob::new(data.as_slice()));
+                DocumentBlock::builder()
+                    .format(fmt)
+                    .name("document")
+                    .source(source)
+                    .build()
+                    .ok()
+                    .map(ContentBlock::Document)
+            } else {
+                report.omitted(
+                    "InlineData",
+                    Some(mime_type),
+                    "no Bedrock Converse image or document format accepts this media type",
+                );
+                None
+            }
+        }
+        Part::FileData { mime_type, .. } => {
+            // Bedrock Converse API supports S3 URIs for images/documents, but not
+            // arbitrary HTTP URLs. For now, represent as text so the model sees the
+            // reference rather than silently dropping it.
+            if mime_type.starts_with("image/")
+                || mime_to_bedrock_document_format(mime_type).is_some()
+            {
+                report.downgraded(
+                    "FileData",
+                    Some(mime_type),
+                    "text",
+                    "Bedrock Converse takes S3 URIs, not arbitrary URLs, so the reference \
+                         is sent as text the model can read but not fetch",
+                );
+                Some(ContentBlock::Text(attachment::file_attachment_to_text(
+                    mime_type,
+                    part.file_uri().unwrap_or(""),
+                )))
+            } else {
+                report.omitted(
+                    "FileData",
+                    Some(mime_type),
+                    "not an image or a supported document type",
+                );
+                None
+            }
+        }
+        // Server-side tool parts are Gemini-specific; Bedrock has no equivalent.
+        Part::ServerToolCall { .. } | Part::ServerToolResponse { .. } => {
+            report.omitted(
+                "ServerToolCall/ServerToolResponse",
+                None,
+                "server-side tool parts are Gemini-specific and have no Bedrock equivalent",
+            );
+            None
+        }
+        // Embedded resources: text → text block; blob → inline image/document bytes.
+        Part::EmbeddedResource { resource } => match resource {
+            adk_core::EmbeddedResource::Text(text) => {
+                if text.text.is_empty() {
                     None
                 } else {
-                    // Bedrock Converse API doesn't accept thinking blocks in input,
-                    // convert to text for conversation history
-                    Some(ContentBlock::Text(thinking.clone()))
+                    Some(ContentBlock::Text(text.text.clone()))
                 }
             }
-            Part::InlineData { mime_type, data } => {
+            adk_core::EmbeddedResource::Blob(blob) => {
+                let mime_type = blob.mime_type.as_deref().unwrap_or("application/octet-stream");
                 if let Some(fmt) = mime_to_bedrock_image_format(mime_type) {
-                    let source = ImageSource::Bytes(aws_smithy_types::Blob::new(data.as_slice()));
+                    let source =
+                        ImageSource::Bytes(aws_smithy_types::Blob::new(blob.data.as_slice()));
                     ImageBlock::builder()
                         .format(fmt)
                         .source(source)
@@ -178,7 +348,7 @@ fn adk_parts_to_bedrock(parts: &[Part]) -> Vec<ContentBlock> {
                         .map(ContentBlock::Image)
                 } else if let Some(fmt) = mime_to_bedrock_document_format(mime_type) {
                     let source =
-                        DocumentSource::Bytes(aws_smithy_types::Blob::new(data.as_slice()));
+                        DocumentSource::Bytes(aws_smithy_types::Blob::new(blob.data.as_slice()));
                     DocumentBlock::builder()
                         .format(fmt)
                         .name("document")
@@ -187,29 +357,16 @@ fn adk_parts_to_bedrock(parts: &[Part]) -> Vec<ContentBlock> {
                         .ok()
                         .map(ContentBlock::Document)
                 } else {
-                    // Unsupported MIME type — skip silently
+                    report.omitted(
+                        "EmbeddedResource::Blob",
+                        Some(mime_type),
+                        "no Bedrock Converse image or document format accepts this media type",
+                    );
                     None
                 }
             }
-            Part::FileData { mime_type, .. } => {
-                // Bedrock Converse API supports S3 URIs for images/documents, but not
-                // arbitrary HTTP URLs. For now, represent as text so the model sees the
-                // reference rather than silently dropping it.
-                if mime_type.starts_with("image/")
-                    || mime_to_bedrock_document_format(mime_type).is_some()
-                {
-                    Some(ContentBlock::Text(attachment::file_attachment_to_text(
-                        mime_type,
-                        part.file_uri().unwrap_or(""),
-                    )))
-                } else {
-                    None
-                }
-            }
-            // Server-side tool parts are Gemini-specific; skip for Bedrock
-            Part::ServerToolCall { .. } | Part::ServerToolResponse { .. } => None,
-        })
-        .collect()
+        },
+    }
 }
 
 /// Map a MIME type to a Bedrock `ImageFormat`, if supported.
@@ -245,13 +402,16 @@ fn mime_to_bedrock_document_format(mime_type: &str) -> Option<DocumentFormat> {
 /// typically contains `description` and `parameters` fields.
 ///
 /// When `prompt_caching` is provided, a `CachePoint` block is appended after
-/// the tool definitions.
+/// the tool definitions. Tools are sorted by name so the cached prefix is
+/// identical across requests built from the same `HashMap`.
 fn adk_tools_to_bedrock(
     tools: &HashMap<String, Value>,
     prompt_caching: Option<&BedrockCacheConfig>,
 ) -> ToolConfiguration {
-    let mut bedrock_tools: Vec<Tool> = tools
-        .iter()
+    let mut sorted_tools = tools.iter().collect::<Vec<_>>();
+    sorted_tools.sort_unstable_by_key(|(name, _)| *name);
+    let mut bedrock_tools: Vec<Tool> = sorted_tools
+        .into_iter()
         .filter_map(|(name, decl)| {
             let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 
@@ -323,6 +483,10 @@ pub(crate) fn bedrock_response_to_adk(
     let finish_reason = Some(bedrock_stop_reason_to_adk(stop_reason));
 
     let usage_metadata = usage.map(|u| UsageMetadata {
+        provider_usage: Some(serde_json::json!({
+            "inputTokens":u.input_tokens, "outputTokens":u.output_tokens, "totalTokens":u.total_tokens,
+            "cacheReadInputTokens":u.cache_read_input_tokens, "cacheWriteInputTokens":u.cache_write_input_tokens,
+        })),
         prompt_token_count: u.input_tokens,
         candidates_token_count: u.output_tokens,
         total_token_count: u.total_tokens,
@@ -331,13 +495,14 @@ pub(crate) fn bedrock_response_to_adk(
         ..Default::default()
     });
 
+    let turn_complete = content.as_ref().is_none_or(|content| !content.has_function_calls());
     LlmResponse {
         content,
         usage_metadata,
         finish_reason,
         citation_metadata: None,
         partial: false,
-        turn_complete: true,
+        turn_complete,
         interrupted: false,
         error_code: None,
         error_message: None,
@@ -386,6 +551,8 @@ fn bedrock_content_blocks_to_parts(blocks: &[ContentBlock]) -> Vec<Part> {
                         Some(Part::InlineData {
                             mime_type: mime_type.to_string(),
                             data: blob.as_ref().to_vec(),
+                            uri: None,
+                            annotations: None,
                         })
                     } else {
                         None
@@ -612,6 +779,35 @@ mod tests {
     }
 
     #[test]
+    fn tool_configuration_order_is_stable_across_maps() {
+        let names: Vec<String> = (0..12).map(|i| format!("tool_{i:02}")).collect();
+        let declaration = |name: &str| {
+            serde_json::json!({
+                "description": format!("{name} description"),
+                "parameters": {"type": "object", "properties": {}}
+            })
+        };
+        let forward: HashMap<String, Value> =
+            names.iter().map(|name| (name.clone(), declaration(name))).collect();
+        let reverse: HashMap<String, Value> =
+            names.iter().rev().map(|name| (name.clone(), declaration(name))).collect();
+
+        let from_forward = adk_tools_to_bedrock(&forward, None);
+        let from_reverse = adk_tools_to_bedrock(&reverse, None);
+
+        assert_eq!(from_forward, from_reverse);
+        let converted_names: Vec<String> = from_forward
+            .tools()
+            .iter()
+            .map(|tool| match tool {
+                Tool::ToolSpec(spec) => spec.name().to_string(),
+                other => panic!("unexpected tool entry {other:?}"),
+            })
+            .collect();
+        assert_eq!(converted_names, names);
+    }
+
+    #[test]
     fn test_json_null_roundtrip() {
         let doc = json_value_to_document(&Value::Null);
         assert_eq!(document_to_json_value(&doc), Value::Null);
@@ -712,6 +908,7 @@ mod tests {
                     serde_json::json!({"temp": 72}),
                 ),
                 id: Some("call_123".to_string()),
+                annotations: None,
             }],
         }];
 
@@ -751,6 +948,7 @@ mod tests {
                         serde_json::json!({"tier": "growth"}),
                     ),
                     id: Some("call_review".to_string()),
+                    annotations: None,
                 }],
             },
             Content {
@@ -761,6 +959,7 @@ mod tests {
                         serde_json::json!({"components_analyzed": 2}),
                     ),
                     id: Some("call_threats".to_string()),
+                    annotations: None,
                 }],
             },
         ];
@@ -1128,10 +1327,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![
                 Part::Text { text: "What is in this image?".to_string() },
-                Part::InlineData {
-                    mime_type: "image/png".to_string(),
-                    data: vec![0x89, 0x50, 0x4E, 0x47],
-                },
+                Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
             ],
         }];
 
@@ -1145,10 +1341,7 @@ mod tests {
 
     #[test]
     fn test_inline_jpeg_converts_to_image_block() {
-        let parts = vec![Part::InlineData {
-            mime_type: "image/jpeg".to_string(),
-            data: vec![0xFF, 0xD8, 0xFF],
-        }];
+        let parts = vec![Part::inline_data("image/jpeg", vec![0xFF, 0xD8, 0xFF])];
         let blocks = adk_parts_to_bedrock(&parts);
         assert_eq!(blocks.len(), 1);
         let img = blocks[0].as_image().unwrap();
@@ -1157,10 +1350,7 @@ mod tests {
 
     #[test]
     fn test_inline_pdf_converts_to_document_block() {
-        let parts = vec![Part::InlineData {
-            mime_type: "application/pdf".to_string(),
-            data: b"%PDF-1.4".to_vec(),
-        }];
+        let parts = vec![Part::inline_data("application/pdf", b"%PDF-1.4".to_vec())];
         let blocks = adk_parts_to_bedrock(&parts);
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].is_document());
@@ -1168,10 +1358,7 @@ mod tests {
 
     #[test]
     fn test_inline_csv_converts_to_document_block() {
-        let parts = vec![Part::InlineData {
-            mime_type: "text/csv".to_string(),
-            data: b"a,b,c\n1,2,3".to_vec(),
-        }];
+        let parts = vec![Part::inline_data("text/csv", b"a,b,c\n1,2,3".to_vec())];
         let blocks = adk_parts_to_bedrock(&parts);
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].is_document());
@@ -1179,20 +1366,14 @@ mod tests {
 
     #[test]
     fn test_unsupported_mime_type_skipped() {
-        let parts = vec![Part::InlineData {
-            mime_type: "application/octet-stream".to_string(),
-            data: vec![0xCA, 0xFE],
-        }];
+        let parts = vec![Part::inline_data("application/octet-stream", vec![0xCA, 0xFE])];
         let blocks = adk_parts_to_bedrock(&parts);
         assert!(blocks.is_empty());
     }
 
     #[test]
     fn test_file_data_image_url_becomes_text_reference() {
-        let parts = vec![Part::FileData {
-            mime_type: "image/jpeg".to_string(),
-            file_uri: "https://example.com/photo.jpg".to_string(),
-        }];
+        let parts = vec![Part::file_data("image/jpeg", "https://example.com/photo.jpg")];
         let blocks = adk_parts_to_bedrock(&parts);
         assert_eq!(blocks.len(), 1);
         let text = blocks[0].as_text().unwrap();
@@ -1202,10 +1383,8 @@ mod tests {
 
     #[test]
     fn test_file_data_unsupported_mime_skipped() {
-        let parts = vec![Part::FileData {
-            mime_type: "application/octet-stream".to_string(),
-            file_uri: "https://example.com/data.bin".to_string(),
-        }];
+        let parts =
+            vec![Part::file_data("application/octet-stream", "https://example.com/data.bin")];
         let blocks = adk_parts_to_bedrock(&parts);
         assert!(blocks.is_empty());
     }
@@ -1222,7 +1401,7 @@ mod tests {
         let parts = bedrock_content_blocks_to_parts(&[ContentBlock::Image(image_block)]);
         assert_eq!(parts.len(), 1);
         match &parts[0] {
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 assert_eq!(mime_type, "image/png");
                 assert_eq!(data, &image_bytes);
             }

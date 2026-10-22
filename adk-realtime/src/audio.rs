@@ -1,5 +1,7 @@
 //! Audio format definitions and utilities.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// Audio encoding formats supported by realtime APIs.
@@ -153,34 +155,98 @@ impl AudioChunk {
         Ok(Self::new(data, format))
     }
 
-    /// Create an AudioChunk from i16 samples (converts to PCM16 little-endian bytes).
+    /// Create an `AudioChunk` from i16 samples (converts to PCM16 little-endian bytes).
     ///
     /// This is useful when working with audio APIs (like LiveKit) that provide
     /// samples as `i16` slices rather than raw byte buffers.
+    ///
+    /// On little-endian hosts the samples are reinterpreted and copied in one
+    /// vectorized `memcpy` instead of one `to_le_bytes` call per sample. On
+    /// big-endian hosts each sample is byte-swapped individually, so the emitted
+    /// bytes are little-endian PCM16 on every target.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_realtime::audio::{AudioChunk, AudioFormat};
+    ///
+    /// let chunk = AudioChunk::from_i16_samples(&[1, -1], AudioFormat::pcm16_24khz());
+    /// assert_eq!(chunk.data, vec![0x01, 0x00, 0xff, 0xff]);
+    /// ```
     pub fn from_i16_samples(samples: &[i16], format: AudioFormat) -> Self {
-        let mut data = Vec::with_capacity(samples.len() * 2);
-        for sample in samples {
-            data.extend_from_slice(&sample.to_le_bytes());
-        }
+        // Narrowing the element type to `u8` can never fail an alignment check, so
+        // this is a single bulk copy of the already little-endian sample bytes.
+        #[cfg(target_endian = "little")]
+        let data = bytemuck::cast_slice::<i16, u8>(samples).to_vec();
+
+        #[cfg(target_endian = "big")]
+        let data = {
+            let mut data = Vec::with_capacity(samples.len() * size_of::<i16>());
+            for sample in samples {
+                data.extend_from_slice(&sample.to_le_bytes());
+            }
+            data
+        };
+
         Self::new(data, format)
     }
 
-    /// Convert the audio data to a vector of i16 samples (assuming PCM16 little-endian).
+    /// Interpret the audio data as i16 samples (assuming PCM16 little-endian).
+    ///
+    /// When the buffer is suitably aligned on a little-endian host the samples are
+    /// borrowed directly from `self.data` and no copy is made ([`Cow::Borrowed`]).
+    /// Otherwise — a big-endian host, or a misaligned buffer — the samples are
+    /// decoded into a freshly allocated `Vec` ([`Cow::Owned`]).
+    ///
+    /// # Errors
     ///
     /// Returns an error string if the data length is not even (not valid PCM16).
-    pub fn to_i16_samples(&self) -> Result<Vec<i16>, String> {
-        if !self.data.len().is_multiple_of(2) {
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_realtime::audio::{AudioChunk, AudioFormat};
+    ///
+    /// let chunk = AudioChunk::pcm16_24khz(vec![0x01, 0x00, 0xff, 0xff]);
+    /// let samples = chunk.to_i16_samples().unwrap();
+    /// assert_eq!(samples.as_ref(), &[1, -1]);
+    ///
+    /// // An odd byte count cannot be valid PCM16.
+    /// assert!(AudioChunk::pcm16_24khz(vec![0x01]).to_i16_samples().is_err());
+    /// ```
+    pub fn to_i16_samples(&self) -> Result<Cow<'_, [i16]>, String> {
+        if !self.data.len().is_multiple_of(size_of::<i16>()) {
             return Err(format!(
                 "Invalid data length for PCM16: {} (must be even)",
                 self.data.len()
             ));
         }
-        let mut samples = Vec::with_capacity(self.data.len() / 2);
-        for chunk in self.data.chunks_exact(2) {
-            samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-        }
-        Ok(samples)
+        Ok(decode_pcm16_le(&self.data))
     }
+}
+
+/// Decode little-endian PCM16 bytes into i16 samples, borrowing when possible.
+///
+/// Mirrors the idiom used by the LiveKit audio handler: on a little-endian host an
+/// aligned buffer is reinterpreted in place, which is free. The `as_chunks`
+/// fallback covers both big-endian hosts (where the bytes need swapping) and
+/// misaligned buffers (where `i16` cannot be read directly).
+fn decode_pcm16_le(audio: &[u8]) -> Cow<'_, [i16]> {
+    debug_assert!(audio.len().is_multiple_of(size_of::<i16>()));
+
+    #[cfg(target_endian = "little")]
+    if let Ok(aligned_slice) = bytemuck::try_cast_slice::<u8, i16>(audio) {
+        return Cow::Borrowed(aligned_slice);
+    }
+
+    Cow::Owned(
+        audio
+            .as_chunks::<{ size_of::<i16>() }>()
+            .0
+            .iter()
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect(),
+    )
 }
 
 /// Buffers audio samples until a target duration is reached.
@@ -308,19 +374,62 @@ mod tests {
         let samples: Vec<i16> = vec![0, 1, -1, 32767, -32768, 1000, -1000];
         let chunk = AudioChunk::from_i16_samples(&samples, AudioFormat::pcm16_24khz());
         let recovered = chunk.to_i16_samples().unwrap();
-        assert_eq!(samples, recovered);
+        assert_eq!(samples.as_slice(), recovered.as_ref());
+    }
+
+    #[test]
+    fn test_from_i16_samples_emits_little_endian_bytes() {
+        let chunk = AudioChunk::from_i16_samples(&[1, -1, 256], AudioFormat::pcm16_24khz());
+        assert_eq!(chunk.data, vec![0x01, 0x00, 0xff, 0xff, 0x00, 0x01]);
     }
 
     #[test]
     fn test_i16_samples_empty() {
         let chunk = AudioChunk::from_i16_samples(&[], AudioFormat::pcm16_24khz());
         assert!(chunk.data.is_empty());
-        assert_eq!(chunk.to_i16_samples().unwrap(), Vec::<i16>::new());
+        assert!(chunk.to_i16_samples().unwrap().is_empty());
     }
 
     #[test]
     fn test_i16_samples_odd_bytes_error() {
         let chunk = AudioChunk::pcm16_24khz(vec![0, 1, 2]); // 3 bytes = invalid PCM16
-        assert!(chunk.to_i16_samples().is_err());
+        assert_eq!(
+            chunk.to_i16_samples().unwrap_err(),
+            "Invalid data length for PCM16: 3 (must be even)"
+        );
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn test_to_i16_samples_borrows_aligned_buffer() {
+        // `AudioChunk::data` is an owned `Vec<u8>`, so its allocation is always
+        // suitably aligned for `i16` and the borrowed fast path applies.
+        let chunk = AudioChunk::from_i16_samples(&[1, -1, 256], AudioFormat::pcm16_24khz());
+        let samples = chunk.to_i16_samples().unwrap();
+        assert!(matches!(samples, Cow::Borrowed(_)));
+        assert_eq!(samples.as_ref(), &[1, -1, 256]);
+    }
+
+    #[test]
+    fn test_decode_pcm16_le_misaligned_buffer_is_owned() {
+        // Build an aligned `[i16]`, view it as bytes, then take an odd-offset
+        // sub-slice so the buffer cannot be reinterpreted as `i16` in place.
+        let aligned_words = [
+            i16::from_ne_bytes([0x00, 0x01]),
+            i16::from_ne_bytes([0x02, 0x03]),
+            i16::from_ne_bytes([0x04, 0x00]),
+        ];
+        let aligned_bytes: &[u8] = bytemuck::cast_slice(&aligned_words);
+        let misaligned = &aligned_bytes[1..5];
+
+        let samples = decode_pcm16_le(misaligned);
+        assert!(matches!(samples, Cow::Owned(_)));
+        assert_eq!(samples.as_ref(), &[0x0201, 0x0403]);
+    }
+
+    #[test]
+    fn test_decode_pcm16_le_empty_input() {
+        let samples = decode_pcm16_le(&[]);
+        assert!(samples.is_empty());
     }
 }

@@ -1,193 +1,204 @@
-//! Permission bridge between ADK ToolConfirmation and ACP RequestPermission.
+//! Server-side permission bridge.
 //!
-//! When the ADK Runner encounters a tool requiring confirmation, the bridge:
-//! 1. Sends a RequestPermission to the ACP client
-//! 2. Waits for the client response (or timeout)
-//! 3. Returns the decision to the caller
+//! Maps an ADK [`ToolConfirmationRequest`] (surfaced on
+//! `event.actions.tool_confirmation` when an agent pauses pending human
+//! approval of a tool call) to an ACP `session/request_permission` request,
+//! awaits the client's outcome, and maps that outcome back to an ADK
+//! [`ToolConfirmationDecision`].
+//!
+//! # Correlation
+//!
+//! Each confirmation carries the LLM's `function_call_id`. The bridge threads
+//! that identifier onto the outbound `session/request_permission` request as the
+//! tool-call id, so the client sees the exact call it is approving and the
+//! outcome is correlated to that call (Requirement 7.5, Property P8).
+//!
+//! The resume API
+//! ([`RunConfig::tool_confirmation_decisions`](adk_core::RunConfig::tool_confirmation_decisions))
+//! is keyed by
+//! *function-call ID*, so the decision the bridge derives is recorded against the
+//! exact call the client approved and cannot be replayed onto another call of the
+//! same tool. A confirmation request that carries no call ID is rejected rather
+//! than approved under a weaker key.
+//!
+//! # SDK safety
+//!
+//! `session/request_permission` is a nested, agent-to-client request issued
+//! *while* the server is still handling the outer `session/prompt` request. The
+//! SDK's [`block_task`](agent_client_protocol::ConnectionTo) is only safe to
+//! await inside a task spawned with `ConnectionTo::spawn`. The prompt handler
+//! runs inside exactly such a spawned task (see `transport/stdio.rs`), so the
+//! nested request does not block the connection's dispatch loop and the outer
+//! prompt response still completes.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
-use tokio::sync::{Mutex, oneshot};
+use adk_core::{ToolConfirmationDecision, ToolConfirmationRequest};
+use agent_client_protocol::schema::v1::{
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+};
+use agent_client_protocol::{Client, ConnectionTo};
 
 use super::error::AcpServerError;
+use super::streamer::infer_tool_kind;
 
-/// Outcome of a permission request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PermissionOutcome {
-    /// The client approved the tool call.
-    Approved,
-    /// The client denied the tool call.
-    Denied,
-    /// No response arrived within the configured timeout.
-    Timeout,
-}
+/// Opaque option id for the one-time allow choice offered to the client.
+const ALLOW_OPTION_ID: &str = "acp-allow-once";
+/// Opaque option id for the one-time reject choice offered to the client.
+const REJECT_OPTION_ID: &str = "acp-reject-once";
 
-/// A pending permission request waiting for client response.
-struct PendingPermission {
-    #[allow(dead_code)]
-    tool_name: String,
-    response_tx: oneshot::Sender<bool>,
-}
-
-/// Bridges ADK ToolConfirmation with ACP RequestPermission.
-///
-/// Manages pending permission requests indexed by `function_call_id`.
-/// Each request creates a oneshot channel; the caller awaits the response
-/// or times out.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let bridge = PermissionBridge::new(Duration::from_secs(120));
-///
-/// // In the handler task:
-/// let outcome = bridge.request_permission("delete_file", "fc-1", &args).await;
-///
-/// // When client responds:
-/// bridge.resolve_permission("fc-1", true).await?;
-/// ```
-pub struct PermissionBridge {
-    timeout: Duration,
-    pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
-}
+/// Bridges ADK tool confirmations to ACP `session/request_permission`.
+pub(crate) struct PermissionBridge;
 
 impl PermissionBridge {
-    /// Create a new permission bridge with the given timeout.
-    pub fn new(timeout: Duration) -> Self {
-        Self { timeout, pending: Arc::new(Mutex::new(HashMap::new())) }
+    /// The permission options offered to the client for every request.
+    ///
+    /// A one-time allow and a one-time reject are sufficient to express the ADK
+    /// [`ToolConfirmationDecision`] set (`Approve` / `Deny`); persistent
+    /// allow/reject are not offered because ADK applies a decision per resume,
+    /// not persistently.
+    fn options() -> Vec<PermissionOption> {
+        vec![
+            PermissionOption::new(ALLOW_OPTION_ID, "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new(REJECT_OPTION_ID, "Reject", PermissionOptionKind::RejectOnce),
+        ]
     }
 
-    /// Request permission for a tool call.
+    /// Build the ACP `session/request_permission` request describing a tool call
+    /// awaiting confirmation.
     ///
-    /// Creates a oneshot channel, stores the pending request, and waits
-    /// for a response or timeout. Returns the outcome.
-    pub async fn request_permission(
-        &self,
-        tool_name: &str,
-        function_call_id: &str,
-        _args: &serde_json::Value,
-    ) -> PermissionOutcome {
-        let (tx, rx) = oneshot::channel();
+    /// The tool-call id is the confirmation's `function_call_id` when present so
+    /// the client can correlate the request to the exact call; otherwise a
+    /// deterministic `"{tool_name}-call"` fallback mirrors the streamer's tool
+    /// call id derivation.
+    fn build_request(
+        session_id: &SessionId,
+        request: &ToolConfirmationRequest,
+    ) -> RequestPermissionRequest {
+        let call_id = request
+            .function_call_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-call", request.tool_name));
+        let fields = ToolCallUpdateFields::new()
+            .kind(infer_tool_kind(&request.tool_name))
+            .status(ToolCallStatus::Pending)
+            .title(format!("Run tool '{}'", request.tool_name))
+            .raw_input(request.args.clone());
+        RequestPermissionRequest::new(
+            session_id.clone(),
+            ToolCallUpdate::new(call_id, fields),
+            Self::options(),
+        )
+    }
 
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(
-                function_call_id.to_string(),
-                PendingPermission { tool_name: tool_name.to_string(), response_tx: tx },
-            );
-        }
-
-        // Wait for response or timeout
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(approved)) => {
-                if approved {
-                    PermissionOutcome::Approved
+    /// Map an ACP permission outcome to an ADK decision.
+    ///
+    /// A selected allow option (one-time or persistent) approves; a selected
+    /// reject option denies; a cancelled request denies (Requirement 7.4). An
+    /// unrecognized selected option id is treated as a denial so an
+    /// unauthorized call never executes.
+    fn decision_for(outcome: &RequestPermissionOutcome) -> ToolConfirmationDecision {
+        match outcome {
+            RequestPermissionOutcome::Selected(selected) => {
+                let id = selected.option_id.to_string();
+                if id == ALLOW_OPTION_ID {
+                    ToolConfirmationDecision::Approve
                 } else {
-                    PermissionOutcome::Denied
+                    ToolConfirmationDecision::Deny
                 }
             }
-            Ok(Err(_)) => {
-                // Channel was dropped (sender gone) — treat as denial
-                self.cleanup(function_call_id).await;
-                PermissionOutcome::Denied
-            }
-            Err(_) => {
-                // Timeout expired
-                self.cleanup(function_call_id).await;
-                PermissionOutcome::Timeout
-            }
+            // Cancellation and any future outcome variant map to deny so the
+            // affected tool call is not executed.
+            _ => ToolConfirmationDecision::Deny,
         }
     }
 
-    /// Resolve a pending permission request.
-    ///
-    /// Called when the ACP client responds to a RequestPermission message.
+    /// Send a `session/request_permission` request to the client, await the
+    /// outcome, and return the mapped decision.
     ///
     /// # Errors
     ///
-    /// Returns `SessionNotFound` if the `function_call_id` is not in the pending map.
-    pub async fn resolve_permission(
-        &self,
-        function_call_id: &str,
-        approved: bool,
-    ) -> Result<(), AcpServerError> {
-        let mut pending = self.pending.lock().await;
-        let entry = pending.remove(function_call_id).ok_or_else(|| {
-            AcpServerError::SessionNotFound(format!(
-                "no pending permission for function_call_id: {function_call_id}"
-            ))
-        })?;
-
-        // Send the decision; ignore error if receiver was dropped
-        let _ = entry.response_tx.send(approved);
-        Ok(())
-    }
-
-    /// Remove a pending request from the map (cleanup after timeout/drop).
-    async fn cleanup(&self, function_call_id: &str) {
-        let mut pending = self.pending.lock().await;
-        pending.remove(function_call_id);
+    /// Returns [`AcpServerError::Transport`] if the nested request fails or the
+    /// client connection drops before responding.
+    pub(crate) async fn request(
+        connection: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        request: &ToolConfirmationRequest,
+    ) -> Result<ToolConfirmationDecision, AcpServerError> {
+        let acp_request = Self::build_request(session_id, request);
+        let response = connection
+            .send_request(acp_request)
+            .block_task()
+            .await
+            .map_err(|error| AcpServerError::Transport(error.to_string()))?;
+        Ok(Self::decision_for(&response.outcome))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use agent_client_protocol::schema::v1::{
+        PermissionOptionId, SelectedPermissionOutcome, ToolKind,
+    };
+
     use super::*;
 
-    #[tokio::test]
-    async fn test_approval_flow() {
-        let bridge = PermissionBridge::new(Duration::from_secs(5));
-        let bridge_clone = Arc::new(bridge);
-        let bridge_for_resolve = bridge_clone.clone();
-
-        let handle = tokio::spawn(async move {
-            bridge_clone.request_permission("delete_file", "fc-1", &serde_json::json!({})).await
-        });
-
-        // Small delay to ensure request is registered
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        bridge_for_resolve.resolve_permission("fc-1", true).await.unwrap();
-
-        let outcome = handle.await.unwrap();
-        assert_eq!(outcome, PermissionOutcome::Approved);
+    fn confirmation() -> ToolConfirmationRequest {
+        ToolConfirmationRequest {
+            tool_name: "delete_file".into(),
+            function_call_id: Some("call-42".into()),
+            args: serde_json::json!({"path": "/tmp/x"}),
+        }
     }
 
-    #[tokio::test]
-    async fn test_denial_flow() {
-        let bridge = PermissionBridge::new(Duration::from_secs(5));
-        let bridge_clone = Arc::new(bridge);
-        let bridge_for_resolve = bridge_clone.clone();
-
-        let handle = tokio::spawn(async move {
-            bridge_clone.request_permission("delete_file", "fc-2", &serde_json::json!({})).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        bridge_for_resolve.resolve_permission("fc-2", false).await.unwrap();
-
-        let outcome = handle.await.unwrap();
-        assert_eq!(outcome, PermissionOutcome::Denied);
+    #[test]
+    fn request_carries_function_call_id_kind_and_args() {
+        let session = SessionId::new("session-1");
+        let request = PermissionBridge::build_request(&session, &confirmation());
+        assert_eq!(request.tool_call.tool_call_id.to_string(), "call-42");
+        assert_eq!(request.tool_call.fields.kind, Some(ToolKind::Delete));
+        assert_eq!(request.tool_call.fields.status, Some(ToolCallStatus::Pending));
+        assert_eq!(request.tool_call.fields.raw_input, Some(serde_json::json!({"path": "/tmp/x"})));
+        assert_eq!(request.options.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_timeout_flow() {
-        let bridge = PermissionBridge::new(Duration::from_millis(50));
-
-        let outcome =
-            bridge.request_permission("delete_file", "fc-3", &serde_json::json!({})).await;
-
-        assert_eq!(outcome, PermissionOutcome::Timeout);
+    #[test]
+    fn request_falls_back_to_tool_name_call_id_when_absent() {
+        let session = SessionId::new("session-1");
+        let mut confirmation = confirmation();
+        confirmation.function_call_id = None;
+        let request = PermissionBridge::build_request(&session, &confirmation);
+        assert_eq!(request.tool_call.tool_call_id.to_string(), "delete_file-call");
     }
 
-    #[tokio::test]
-    async fn test_resolve_unknown_id() {
-        let bridge = PermissionBridge::new(Duration::from_secs(5));
+    #[test]
+    fn allow_selection_maps_to_approve() {
+        let outcome = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PermissionOptionId::new(ALLOW_OPTION_ID),
+        ));
+        assert_eq!(PermissionBridge::decision_for(&outcome), ToolConfirmationDecision::Approve);
+    }
 
-        let result = bridge.resolve_permission("unknown-id", true).await;
-        assert!(result.is_err());
+    #[test]
+    fn reject_selection_maps_to_deny() {
+        let outcome = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PermissionOptionId::new(REJECT_OPTION_ID),
+        ));
+        assert_eq!(PermissionBridge::decision_for(&outcome), ToolConfirmationDecision::Deny);
+    }
+
+    #[test]
+    fn cancellation_maps_to_deny() {
+        assert_eq!(
+            PermissionBridge::decision_for(&RequestPermissionOutcome::Cancelled),
+            ToolConfirmationDecision::Deny
+        );
+    }
+
+    #[test]
+    fn unknown_selection_maps_to_deny() {
+        let outcome = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PermissionOptionId::new("made-up-id"),
+        ));
+        assert_eq!(PermissionBridge::decision_for(&outcome), ToolConfirmationDecision::Deny);
     }
 }

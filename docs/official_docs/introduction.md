@@ -2,7 +2,7 @@
 
 Agent Development Kit (ADK) is a flexible and modular framework for developing and deploying AI agents. While optimized for Gemini and the Google ecosystem, ADK is model-agnostic, deployment-agnostic, and built for compatibility with other frameworks. ADK was designed to make agent development feel more like software development, making it easier for developers to create, deploy, and orchestrate agentic architectures that range from simple tasks to complex workflows.
 
-> **Note:** ADK-Rust requires Rust 1.94.0 or higher.
+> **Note:** ADK-Rust requires Rust 1.95.0 or higher.
 
 ## Installation
 
@@ -16,7 +16,7 @@ Or add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-rust = "2.0.0"
+adk-rust = "2.3.0"
 tokio = { version = "1.40", features = ["full"] }
 ```
 
@@ -29,7 +29,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
     
     let agent = LlmAgentBuilder::new("assistant")
         .description("A helpful AI assistant")
@@ -112,7 +112,10 @@ Tools give agents abilities beyond conversation, letting them interact with exte
 - **GoogleSearchTool**: Built-in web search capability
 - **BrowserToolset**: 46 WebDriver tools for web automation (navigation, forms, screenshots, etc.)
 - **ExitLoopTool**: Control loop termination in LoopAgent
-- **McpToolset**: Integration with Model Context Protocol servers
+- **McpToolset**: Connect one MCP server and expose reviewed tools, resources,
+  prompts, completion, subscriptions, elicitation, and negotiated tasks
+- **McpServerManager**: Add, update, monitor, restart, persist, and aggregate a
+  changing registry of local MCP servers while the application is running
 
 ### Sessions
 
@@ -155,11 +158,11 @@ Events form the conversation history and enable replay and debugging.
 
 The underlying LLM that powers LlmAgents. ADK-Rust is optimized for Gemini but supports multiple providers through the `Llm` trait:
 
-- **Gemini**: Google's Gemini models (`gemini-3-pro`, `gemini-3-flash`, `gemini-2.5-flash`, `gemini-2.5-pro`)
-- **OpenAI**: `gpt-5.1`, `gpt-5`, `gpt-5-mini`, Azure OpenAI
-- **Anthropic**: `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`
-- **DeepSeek**: `deepseek-r1`, `deepseek-v3.1`, `deepseek-chat` with thinking mode
-- **Groq**: Ultra-fast inference with `llama-4-scout`, `llama-3.1-70b-versatile`, `mixtral-8x7b-32768`
+- **Gemini**: `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`
+- **OpenAI**: `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna`, Azure OpenAI deployments
+- **Anthropic**: `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5`
+- **DeepSeek**: `deepseek-v4-flash`, `deepseek-v4-pro`
+- **Groq**: Ultra-fast inference with `openai/gpt-oss-120b` and `openai/gpt-oss-20b`
 - **Ollama**: Local inference with `qwen3.6:35b-a3b`, `qwen3.5`, `llama3.2:3b`, `deepseek-r1:14b`
 - **mistral.rs**: High-performance local inference with hardware acceleration
 
@@ -187,22 +190,22 @@ ADK-Rust uses Cargo features for modularity. Four presets control which crates a
 
 ```toml
 # Minimal (default) — Gemini, agents, runner, sessions
-adk-rust = "2.0.0"
+adk-rust = "2.3.0"
 
 # Standard — adds tools, memory, telemetry, server, auth, graph, eval, guardrail, plugins, artifacts, skills
-adk-rust = { version = "2.0.0", features = ["standard"] }
+adk-rust = { version = "2.3.0", features = ["standard"] }
 
 # Enterprise — standard + realtime, browser, RAG, payments, AWP
-adk-rust = { version = "2.0.0", features = ["enterprise"] }
+adk-rust = { version = "2.3.0", features = ["enterprise"] }
 
 # Full — enterprise + audio, code execution, sandbox
-adk-rust = { version = "2.0.0", features = ["full"] }
+adk-rust = { version = "2.3.0", features = ["full"] }
 
 # Equivalent explicit minimal selection
-adk-rust = { version = "2.0.0", default-features = false, features = ["minimal"] }
+adk-rust = { version = "2.3.0", default-features = false, features = ["minimal"] }
 
 # Custom: Pick what you need
-adk-rust = { version = "2.0.0", default-features = false, features = ["agents", "gemini", "tools"] }
+adk-rust = { version = "2.3.0", default-features = false, features = ["agents", "gemini", "tools"] }
 ```
 
 Available features:

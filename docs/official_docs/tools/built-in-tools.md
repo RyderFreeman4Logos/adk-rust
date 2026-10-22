@@ -33,7 +33,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // Create the GoogleSearchTool
     let search_tool = GoogleSearchTool;
@@ -62,6 +62,11 @@ Unlike regular function tools, `GoogleSearchTool` operates differently:
 1. **Server-side execution**: The search is performed by Gemini's grounding feature, not locally
 2. **Automatic invocation**: The model decides when to search based on the query
 3. **Integrated results**: Search results are incorporated directly into the model's response
+
+> **Note:** The answer text contains only what the model wrote. The search queries,
+> sources and supports are in the response's `provider_metadata` (`webSearchQueries`,
+> `groundingChunks`, `groundingSupports`); display them as your application's grounding
+> requirements specify.
 
 The tool implementation returns an error if called directly because the actual search happens within the Gemini API:
 
@@ -99,7 +104,32 @@ async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Valu
 
 ## AgentTool
 
-`AgentTool` wraps any agent as a callable tool, enabling agent composition where a parent agent can invoke a child agent as part of its tool-calling workflow. State changes and artifacts from the sub-agent are automatically forwarded to the parent context.
+`AgentTool` wraps any agent as a callable tool, enabling delegate-and-return
+composition: the caller invokes a child, receives its result, and then resumes.
+State and artifact deltas emitted by the child are merged into the parent tool
+event. The child session also applies each event immediately, so later steps in
+a delegated workflow see earlier state/history changes.
+
+Legacy defaults remain isolated and backward compatible. Portable teams opt in
+to parent history/state snapshots, memory forwarding, propagated failures,
+finite delegation depth, exact state/history projections, and internal execution
+of registered child handoffs. A consumed child handoff remains visible as an
+event but its transfer action is cleared before forwarding, so the parent Runner
+cannot execute it twice. Request
+metadata, cancellation, scopes, secrets, artifacts, and parallel shared state
+follow the configured forwarding policy. `AgentTool` itself does not run the
+Runner's global handoff loop; a compiled `TeamSpec` supplies the exact nested
+handoff registry for mixed topologies. Compiled teams also opt in to nested event forwarding so
+delegated activity remains visible on the parent event stream; standalone
+`AgentTool` keeps legacy event output unless `forward_events(true)` is selected.
+
+For controlled write-back, use `output_state_keys` independently from the input
+`state_keys` projection. `state_merge_policy(RejectConflicts)` compares the
+current parent value with the snapshot taken when delegation began and rejects
+conflicting writes atomically. `artifact_prefixes` applies the same allowlist
+principle to artifact names. Standalone defaults remain last-writer-wins with
+unrestricted output for backward compatibility; compiled teams opt into their
+exact edge policy.
 
 ### Basic Usage
 
@@ -160,7 +190,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // Create an agent with ExitLoopTool for iterative refinement
     let refiner = LlmAgentBuilder::new("content_refiner")
@@ -237,7 +267,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // Create agent with artifact loading capability
     let agent = LlmAgentBuilder::new("document_analyzer")
@@ -332,7 +362,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     // Create agent with multiple built-in tools
     let agent = LlmAgentBuilder::new("research_agent")

@@ -113,8 +113,7 @@
 //! production adapter wraps [Monty](https://github.com/pydantic/monty), a
 //! Rust-native Python interpreter whose snapshot-at-call-boundary model makes
 //! suspend/resume a true continuation rather than a replay. It lives in the
-//! `adk-codeact-monty` crate (kept outside the workspace because Monty is a git
-//! dependency, not yet on crates.io).
+//! `adk-codeact-monty` crate.
 
 pub mod agent;
 pub mod checkpoint;

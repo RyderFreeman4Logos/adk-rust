@@ -157,10 +157,7 @@ fn test_audio_format_ogg() {
 
 #[test]
 fn test_audio_part_to_mistralrs_with_unsupported_mime() {
-    let part = Part::InlineData {
-        mime_type: "application/octet-stream".to_string(),
-        data: vec![0, 1, 2, 3],
-    };
+    let part = Part::inline_data("application/octet-stream", vec![0, 1, 2, 3]);
 
     let result = audio_part_to_mistralrs(&part);
     assert!(result.is_none(), "Unsupported MIME type should return None");

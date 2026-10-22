@@ -718,10 +718,10 @@ pub mod v1_remote {
 
         // Try JSON-RPC wrapped response
         if let Ok(rpc_value) = serde_json::from_str::<serde_json::Value>(data) {
-            if let Some(result) = rpc_value.get("result") {
-                if let Ok(stream_resp) = serde_json::from_value::<StreamResponse>(result.clone()) {
-                    return convert_stream_response(&stream_resp, invocation_id, agent_name);
-                }
+            if let Some(result) = rpc_value.get("result")
+                && let Ok(stream_resp) = serde_json::from_value::<StreamResponse>(result.clone())
+            {
+                return convert_stream_response(&stream_resp, invocation_id, agent_name);
             }
             // Check for JSON-RPC error
             if let Some(error) = rpc_value.get("error") {
@@ -917,6 +917,8 @@ pub mod v1_remote {
                 name: "my-agent".to_string(),
                 description: "My remote agent".to_string(),
                 agent_card: card,
+                // The wire default: let the card decide rather than forcing a mode.
+                streaming: None,
             });
             assert_eq!(agent.name(), "my-agent");
             assert_eq!(agent.description(), "My remote agent");
@@ -929,6 +931,8 @@ pub mod v1_remote {
                 name: "test".to_string(),
                 description: "test".to_string(),
                 agent_card: card,
+                // The wire default: let the card decide rather than forcing a mode.
+                streaming: None,
             });
             assert!(agent.sub_agents().is_empty());
         }

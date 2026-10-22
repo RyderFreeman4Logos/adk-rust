@@ -33,7 +33,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
     
     let agent = LlmAgentBuilder::new("my_agent")
         .description("A helpful assistant")
@@ -125,6 +125,44 @@ POST /api/run_sse
   }
 }
 ```
+
+> **Note:** A streamed response arrives as partial events (`"partial": true`) followed by a
+> terminal event with the same `id`. When that terminal event carries
+> `"provider_metadata": {"content_complete": true}`, its `content` is the complete response,
+> including text the partial events already delivered. Replace the content rendered for that
+> `id` instead of appending it. See
+> [Complete response snapshots](../events/events.md#complete-response-snapshots).
+
+### Run Agent (Non-Streaming)
+
+Execute an agent to completion and receive all events in a single JSON response:
+
+```
+POST /api/run
+```
+
+**Request Body:** same shape as `POST /api/run_sse` (the `streaming` field is ignored):
+```json
+{
+  "appName": "my_agent",
+  "userId": "user123",
+  "sessionId": "session456",
+  "newMessage": {
+    "role": "user",
+    "parts": [
+      {
+        "text": "What is the capital of France?"
+      }
+    ]
+  }
+}
+```
+
+**Response:**
+- Content-Type: `application/json`
+- A JSON array containing every event produced by the run, in order, using the same event format as `/api/run_sse`
+
+This endpoint mirrors Google ADK's `api_server` non-streaming `/run` route.
 
 ### Session Management
 
@@ -272,13 +310,22 @@ The server includes a built-in web UI accessible at:
 http://localhost:8080/ui/
 ```
 
+![Prompting an agent, following an animated team handoff, and inspecting telemetry in the embedded runtime UI](../images/adk-runtime-five-minute.gif)
+
+The [five-minute quickstart](../quickstart.md) scaffolds an OpenAI-backed server
+and opens this interface with four commands. The recording uses a team to make
+the active topology edge visible; leaf agents, tools, graphs, workflows,
+realtime agents, and remote agents use the same interface.
+
 ### Features
 
-- **Interactive Chat**: Send messages and receive streaming responses
+- **Interactive Runs**: Send messages and attachments and inspect safely rendered Markdown, streaming text, tool calls, failures, and handoffs
 - **Session Management**: Create, view, and switch between sessions
-- **Multi-Agent Support**: Visualize agent transfers and hierarchies
+- **Portable Team Topology**: Distinguish exact delegation-and-return edges from control handoffs, with Studio Next-style animation for the active member and incoming edge
+- **Runtime Inspector**: Inspect ordered events, dedicated telemetry spans, shared/session state, configured runtime services, A2A discovery, and UI/MCP Apps protocol support
+- **Realtime Playback**: Recognize realtime agents, merge transcript deltas, and play completed PCM output as WAV audio
 - **Artifact Viewer**: View and download session artifacts
-- **Real-time Updates**: SSE-based streaming for instant responses
+- **Responsive Themes**: Keyboard-accessible system, light, and dark layouts with no external assets
 
 ### UI Routes
 
@@ -286,6 +333,20 @@ http://localhost:8080/ui/
 - `/ui/` - Main chat interface
 - `/ui/assets/*` - Static assets (CSS, JS, images)
 - `/ui/assets/config/runtime-config.json` - Runtime configuration
+- `/api/ui/agents/{name}` - Agent capabilities, hierarchy, and portable topology metadata
+
+The interface is maintained in `adk-server/webui` and its production build is
+embedded in the server crate, so generated projects and deployments use the
+same runtime UI without a separate frontend service.
+
+The runnable [runtime UI showcase](../../../examples/runtime_ui_showcase/README.md)
+includes separate OpenAI-backed walkthroughs and screenshots for a tool-calling
+agent, a deterministic graph workflow, and a portable handoff team. The
+[advanced agent gallery](../../../examples/advanced_agents/README.md) adds an
+ambient schedule, OpenAI Realtime voice playback, A2A discovery, MCP
+`2026-07-28` discovery with SEP-2663 tasks, and configured telemetry, artifact,
+and memory services in one server. The **ADK Runtime** brand links to
+[adk-rust.com](https://adk-rust.com) in a new tab.
 
 ## Client Examples
 

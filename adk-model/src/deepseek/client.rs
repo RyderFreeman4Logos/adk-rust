@@ -1,10 +1,13 @@
 //! DeepSeek client implementation.
 //!
-//! Supports DeepSeek V4 models (`deepseek-v4-pro`, `deepseek-v4-flash`) and
-//! legacy models (`deepseek-chat`, `deepseek-reasoner`).
+//! Supports the current DeepSeek models (`deepseek-flash`, `deepseek-v4-pro`).
+//! `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `deepseek-chat` and
+//! `deepseek-reasoner` aliases were retired on 2026-07-24.
 
 use super::config::{DeepSeekConfig, ThinkingMode};
-use super::convert::{self, ChatCompletionRequest, ChatCompletionResponse, ThinkingConfig};
+use super::convert::{
+    self, ChatCompletionRequest, ChatCompletionResponse, ResponseFormat, ThinkingConfig,
+};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use adk_core::{
     AdkError, ErrorCategory, ErrorComponent, FinishReason, GenericSchemaAdapter, Llm, LlmRequest,
@@ -14,7 +17,6 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
-use serde_json::Value;
 
 /// DeepSeek client for V4 and legacy models.
 ///
@@ -49,7 +51,9 @@ pub struct DeepSeekClient {
 impl DeepSeekClient {
     /// Create a new DeepSeek client.
     pub fn new(config: DeepSeekConfig) -> Result<Self, AdkError> {
+        crate::catalog::warn_if_obsolete("deepseek", &config.model);
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| AdkError::model(format!("failed to create HTTP client: {e}")))?;
 
@@ -61,17 +65,17 @@ impl DeepSeekClient {
         Self::new(DeepSeekConfig::v4_pro(api_key))
     }
 
-    /// Create a client for `deepseek-v4-flash` (fast, cost-efficient).
+    /// Create a client for `deepseek-flash` (fast, cost-efficient, vision-capable).
     pub fn v4_flash(api_key: impl Into<String>) -> Result<Self, AdkError> {
         Self::new(DeepSeekConfig::v4_flash(api_key))
     }
 
-    /// Create a client for `deepseek-chat` model (legacy).
+    /// Create a client for DeepSeek's balanced chat model.
     pub fn chat(api_key: impl Into<String>) -> Result<Self, AdkError> {
         Self::new(DeepSeekConfig::chat(api_key))
     }
 
-    /// Create a client for `deepseek-reasoner` model with thinking enabled (legacy).
+    /// Create a client for DeepSeek's reasoning model with thinking enabled.
     pub fn reasoner(api_key: impl Into<String>) -> Result<Self, AdkError> {
         Self::new(DeepSeekConfig::reasoner(api_key))
     }
@@ -101,7 +105,29 @@ impl DeepSeekClient {
 
     /// Build a chat completion request from an LLM request.
     fn build_request(&self, request: &LlmRequest, stream: bool) -> ChatCompletionRequest {
-        let messages: Vec<_> = request.contents.iter().map(convert::content_to_message).collect();
+        let mut messages: Vec<_> =
+            request.contents.iter().map(convert::content_to_message).collect();
+
+        // DeepSeek's structured-output contract is JSON Output: `response_format`
+        // accepts only `{"type": "json_object"}` — there is no `json_schema` mode —
+        // and the API requires the word "json" to appear in the system or user
+        // prompt, otherwise it can return empty content.
+        // https://api-docs.deepseek.com/guides/json_mode
+        let response_format = match request.config.as_ref().and_then(|c| c.response_schema.as_ref())
+        {
+            Some(schema) => {
+                if !mentions_json(&messages) {
+                    messages.insert(
+                        0,
+                        convert::system_message(format!(
+                            "Respond with a single json object matching this schema: {schema}"
+                        )),
+                    );
+                }
+                Some(ResponseFormat { format_type: "json_object".to_string() })
+            }
+            None => None,
+        };
 
         let tools = if request.tools.is_empty() {
             None
@@ -143,12 +169,20 @@ impl DeepSeekClient {
             max_tokens,
             stream: Some(stream),
             tools,
-            response_format: None,
+            response_format,
             thinking,
             reasoning_effort,
             stop: None,
         }
     }
+}
+
+/// Whether the conversation already satisfies DeepSeek's requirement that the word
+/// "json" appear in the prompt when JSON Output is enabled.
+fn mentions_json(messages: &[convert::Message]) -> bool {
+    messages.iter().any(|message| {
+        message.content.as_deref().is_some_and(|text| text.to_lowercase().contains("json"))
+    })
 }
 
 #[async_trait]
@@ -211,23 +245,19 @@ impl Llm for DeepSeekClient {
                     if !response.status().is_success() {
                         let status = response.status();
                         let status_code = status.as_u16();
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(crate::retry::parse_retry_after);
                         let error_text = response.text().await.unwrap_or_default();
-                        let category = match status_code {
-                            401 => ErrorCategory::Unauthorized,
-                            403 => ErrorCategory::Forbidden,
-                            404 => ErrorCategory::NotFound,
-                            408 => ErrorCategory::Timeout,
-                            429 => ErrorCategory::RateLimited,
-                            503 | 529 => ErrorCategory::Unavailable,
-                            _ if status_code >= 500 => ErrorCategory::Internal,
-                            _ => ErrorCategory::InvalidInput,
-                        };
-                        return Err(AdkError::new(
+                        let error = AdkError::new(
                             ErrorComponent::Model,
-                            category,
+                            crate::retry::category_for_status_code(status_code),
                             "model.deepseek.api_error",
                             format!("DeepSeek API error (HTTP {status}): {error_text}"),
-                        ).with_upstream_status(status_code).with_provider("deepseek"));
+                        ).with_upstream_status(status_code).with_provider("deepseek");
+                        return Err(crate::retry::with_retry_after(error, retry_after));
                     }
 
                     Ok(response)
@@ -237,21 +267,19 @@ impl Llm for DeepSeekClient {
 
             if stream {
                 let mut byte_stream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut buffer = Vec::new();
+                let mut finished = false;
                 let mut tool_call_accumulators: std::collections::HashMap<u32, (String, String, String)> =
                     std::collections::HashMap::new();
                 let mut reasoning_buffer = String::new();
-                let mut text_buffer = String::new();
 
                 while let Some(chunk_result) = byte_stream.next().await {
                     let chunk = chunk_result
                         .map_err(|e| AdkError::model(format!("stream read error: {e}")))?;
 
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
 
-                    while let Some(line_end) = buffer.find('\n') {
-                        let line = buffer[..line_end].trim().to_string();
-                        buffer = buffer[line_end + 1..].to_string();
+                    while let Some(line) = crate::sse::take_line(&mut buffer)? {
 
                         if line.is_empty() || line == "data: [DONE]" {
                             continue;
@@ -311,6 +339,7 @@ impl Llm for DeepSeekClient {
 
                                         // Check for finish
                                         if choice.finish_reason.is_some() {
+                                            finished = true;
                                             let finish_reason = choice.finish_reason.as_ref().map(|fr| {
                                                 match fr.as_str() {
                                                     "stop" => FinishReason::Stop,
@@ -325,40 +354,37 @@ impl Llm for DeepSeekClient {
                                                 let mut sorted_calls: Vec<_> =
                                                     tool_call_accumulators.drain().collect();
                                                 sorted_calls.sort_by_key(|(idx, _)| *idx);
-                                                let tool_calls: Vec<_> = sorted_calls
+                                                let tool_calls = sorted_calls
                                                     .into_iter()
                                                     .map(|(_, (id, name, args_str))| {
-                                                        let args: Value =
-                                                            serde_json::from_str(&args_str)
-                                                                .unwrap_or(serde_json::json!({}));
-                                                        (id, name, args)
+                                                        let args = crate::tool_args::parse_streamed_tool_arguments(
+                                                            "deepseek",
+                                                            "model.deepseek.invalid_tool_arguments",
+                                                            &name,
+                                                            &args_str,
+                                                        )?;
+                                                        Ok((id, name, args))
                                                     })
-                                                    .collect();
-                                                let tool_reasoning = if thinking_enabled {
-                                                    Some(std::mem::take(&mut reasoning_buffer))
-                                                } else {
-                                                    None
-                                                };
-                                                yield convert::create_tool_call_response(
+                                                    .collect::<Result<Vec<_>, AdkError>>()?;
+                                                let tool_reasoning = convert::pending_reasoning(
+                                                    &mut reasoning_buffer,
+                                                    thinking_enabled,
+                                                );
+                                                let mut response = convert::create_tool_call_response(
                                                     tool_calls,
                                                     finish_reason,
                                                     tool_reasoning,
                                                 );
+                                                response.usage_metadata = chunk_response.usage.as_ref().map(convert::usage);
+                                                yield response;
                                                 continue;
                                             }
 
-                                            let mut parts = Vec::new();
-                                            if !reasoning_buffer.is_empty() {
-                                                parts.push(Part::Thinking {
-                                                    thinking: std::mem::take(&mut reasoning_buffer),
-                                                    signature: None,
-                                                });
-                                            }
-                                            if !text_buffer.is_empty() {
-                                                parts.push(Part::Text {
-                                                    text: std::mem::take(&mut text_buffer),
-                                                });
-                                            }
+                                            let parts = convert::final_chunk_parts(
+                                                choice.delta.as_ref(),
+                                                &mut reasoning_buffer,
+                                                thinking_enabled,
+                                            );
 
                                             let content = if parts.is_empty() {
                                                 None
@@ -375,17 +401,7 @@ impl Llm for DeepSeekClient {
 
                                             yield LlmResponse {
                                                 content,
-                                                usage_metadata: chunk_response.usage.map(|u| {
-                                                    adk_core::UsageMetadata {
-                                                        prompt_token_count: u.prompt_tokens as i32,
-                                                        candidates_token_count: u.completion_tokens as i32,
-                                                        total_token_count: u.total_tokens as i32,
-                                                        thinking_token_count: u.reasoning_tokens.map(|t| t as i32),
-                                                        cache_read_input_token_count: u.prompt_cache_hit_tokens.map(|t| t as i32),
-                                                        cache_creation_input_token_count: u.prompt_cache_miss_tokens.map(|t| t as i32),
-                                                        ..Default::default()
-                                                    }
-                                                }),
+                                                usage_metadata: chunk_response.usage.as_ref().map(convert::usage),
                                                 finish_reason,
                                                 partial: false,
                                                 turn_complete,
@@ -396,7 +412,6 @@ impl Llm for DeepSeekClient {
                                             if let Some(delta) = &choice.delta
                                                 && let Some(text) = &delta.content
                                                     && !text.is_empty() {
-                                                        text_buffer.push_str(text);
                                                         yield LlmResponse {
                                                             content: Some(adk_core::Content {
                                                                 role: "model".to_string(),
@@ -412,12 +427,15 @@ impl Llm for DeepSeekClient {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!("failed to parse DeepSeek chunk: {e} - {data}");
+                                Err(_) => {
+                                    Err(AdkError::model("invalid DeepSeek event data"))?;
                                 }
                             }
                         }
                     }
+                }
+                if !finished || buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    Err(AdkError::model("incomplete DeepSeek event stream"))?;
                 }
             } else {
                 // Non-streaming mode
@@ -434,5 +452,103 @@ impl Llm for DeepSeekClient {
         };
 
         Ok(crate::usage_tracking::with_usage_tracking(Box::pin(response_stream), usage_span))
+    }
+}
+
+#[cfg(test)]
+mod response_format_tests {
+    //! `build_request` read temperature, top-p, token limits, tools, thinking, and
+    //! reasoning effort but always sent `response_format: None`, even with a
+    //! `response_schema` present, while the module advertised structured JSON output.
+    //! The schema reached the model only as the agent's textual instruction, so native
+    //! enforcement was never requested and structured turns could cost retries.
+
+    use super::*;
+    use adk_core::{Content, GenerateContentConfig, LlmRequest};
+    use serde_json::json;
+
+    fn client() -> DeepSeekClient {
+        DeepSeekClient::chat("test-key").expect("client builds")
+    }
+
+    fn schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"]
+        })
+    }
+
+    fn request_with(config: Option<GenerateContentConfig>, prompt: &str) -> LlmRequest {
+        let mut request =
+            LlmRequest::new("deepseek-flash", vec![Content::new("user").with_text(prompt)]);
+        request.config = config;
+        request
+    }
+
+    #[test]
+    fn a_response_schema_requests_json_output() {
+        let request = request_with(
+            Some(GenerateContentConfig { response_schema: Some(schema()), ..Default::default() }),
+            "give me the answer as json",
+        );
+
+        let built = client().build_request(&request, false);
+        let wire = serde_json::to_value(&built).expect("request serializes");
+
+        // DeepSeek accepts only `json_object`; there is no `json_schema` mode.
+        assert_eq!(
+            wire["response_format"],
+            json!({ "type": "json_object" }),
+            "a response schema must request DeepSeek's JSON Output mode"
+        );
+    }
+
+    #[test]
+    fn no_schema_leaves_the_response_format_unset() {
+        let request = request_with(None, "hello");
+        let built = client().build_request(&request, false);
+        let wire = serde_json::to_value(&built).expect("request serializes");
+
+        assert!(
+            wire.get("response_format").is_none(),
+            "an ordinary turn must not request JSON Output"
+        );
+    }
+
+    #[test]
+    fn the_documented_json_keyword_requirement_is_satisfied() {
+        // DeepSeek requires the word "json" in the system or user prompt whenever
+        // JSON Output is enabled, or the API may return empty content.
+        let request = request_with(
+            Some(GenerateContentConfig { response_schema: Some(schema()), ..Default::default() }),
+            "summarise the document",
+        );
+
+        let built = client().build_request(&request, false);
+
+        assert!(
+            built.messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|text| text.to_lowercase().contains("json"))),
+            "enabling JSON Output without the keyword risks empty responses"
+        );
+    }
+
+    #[test]
+    fn an_existing_json_mention_is_not_duplicated() {
+        let request = request_with(
+            Some(GenerateContentConfig { response_schema: Some(schema()), ..Default::default() }),
+            "reply in json please",
+        );
+
+        let built = client().build_request(&request, false);
+
+        assert_eq!(
+            built.messages.len(),
+            1,
+            "the prompt already mentions json, so nothing needs to be added"
+        );
     }
 }

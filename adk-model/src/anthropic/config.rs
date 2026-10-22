@@ -62,11 +62,15 @@ pub enum Effort {
 /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-4-6")
 ///     .with_prompt_caching(false); // opt out
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AnthropicConfig {
-    /// Anthropic API key.
+    /// Anthropic API key. Never serialized; deserializing a config without it
+    /// yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
-    /// Model name (e.g., `"claude-opus-4-7"`, `"claude-sonnet-4-6"`).
+    /// Model name (e.g., `"claude-opus-5"`, `"claude-sonnet-5"`).
     pub model: String,
     /// Maximum tokens to generate.
     #[serde(default = "default_max_tokens")]
@@ -74,6 +78,14 @@ pub struct AnthropicConfig {
     /// Optional custom base URL (for proxies, Ollama, Vercel Gateway, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+
+    /// Accept a plain `http://` [`base_url`](AnthropicConfig::base_url) on a
+    /// non-loopback host.
+    ///
+    /// Defaults to `false`. Set with
+    /// [`allow_insecure_http`](AnthropicConfig::allow_insecure_http).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure_http: bool,
 
     /// Enable prompt caching with `cache_control` blocks.
     ///
@@ -92,8 +104,8 @@ pub struct AnthropicConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
 
-    /// Enable fast mode (Opus 4.6+ only, beta).
-    /// Delivers up to 2.5× higher output tokens/sec at 6× pricing.
+    /// Enable fast mode for Claude Opus 5 or Claude Opus 4.8 (research preview).
+    /// Delivers up to 2.5× higher output tokens/sec at premium pricing.
     #[serde(default)]
     pub fast_mode: bool,
 
@@ -129,6 +141,29 @@ pub struct AnthropicConfig {
     pub tool_search: Option<ToolSearchConfig>,
 }
 
+impl std::fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("base_url", &self.base_url)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("prompt_caching", &self.prompt_caching)
+            .field("thinking", &self.thinking)
+            .field("effort", &self.effort)
+            .field("fast_mode", &self.fast_mode)
+            .field("citations", &self.citations)
+            .field("inference_geo", &self.inference_geo)
+            .field("context_management", &self.context_management)
+            .field("service_tier", &self.service_tier)
+            .field("beta_features", &self.beta_features)
+            .field("api_version", &self.api_version)
+            .field("tool_search", &self.tool_search)
+            .finish()
+    }
+}
+
 fn default_max_tokens() -> u32 {
     4096
 }
@@ -141,9 +176,10 @@ impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            model: "claude-sonnet-4-6".to_string(),
+            model: crate::catalog::ANTHROPIC_DEFAULT.to_string(),
             max_tokens: default_max_tokens(),
             base_url: None,
+            allow_insecure_http: false,
             prompt_caching: true,
             thinking: None,
             effort: None,
@@ -172,8 +208,42 @@ impl AnthropicConfig {
     }
 
     /// Set a custom base URL.
+    ///
+    /// The URL is validated when [`AnthropicClient::new`](super::AnthropicClient::new)
+    /// builds the client: it must use `https://`, or `http://` with a loopback host,
+    /// unless [`allow_insecure_http`](Self::allow_insecure_http) is set.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Allow a plain `http://` base URL on a non-loopback host.
+    ///
+    /// Use this for a trusted internal gateway that is reachable only over plain
+    /// HTTP. Every request attaches the API key, which then crosses the network
+    /// unencrypted. The base URL is validated when
+    /// [`AnthropicClient::new`](super::AnthropicClient::new) builds the client, so
+    /// this method and [`with_base_url`](Self::with_base_url) can be called in
+    /// either order. Accepting a non-loopback `http://` URL logs a warning with
+    /// the host.
+    ///
+    /// The opt-in applies to the configured base URL. Without one, the client
+    /// reads `ANTHROPIC_BASE_URL`, and a plain-HTTP URL from that variable is
+    /// acknowledged by `ANTHROPIC_ALLOW_INSECURE_HTTP=1` instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+    ///
+    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-5")
+    ///     .allow_insecure_http()
+    ///     .with_base_url("http://10.60.1.20:8080/api/v1/llm/anthropic");
+    /// let client = AnthropicClient::new(config)?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    pub fn allow_insecure_http(mut self) -> Self {
+        self.allow_insecure_http = true;
         self
     }
 
@@ -201,7 +271,7 @@ impl AnthropicConfig {
         self
     }
 
-    /// Enable fast mode (Opus 4.6+ only, beta).
+    /// Enable fast mode for Claude Opus 5 or Claude Opus 4.8.
     pub fn with_fast_mode(mut self, enabled: bool) -> Self {
         self.fast_mode = enabled;
         self

@@ -21,12 +21,29 @@ filesystem access, an empty environment), but you can grant a script specific
 read-only or read-write paths and an explicit environment map (see
 [OS access](#os-access) below).
 
-## Why a separate crate (outside the workspace)?
+## Installation
 
-Monty is not on crates.io yet, so it is pulled in as a **git dependency** pinned
-to the `v0.0.18` release commit. A published workspace can't carry a git
-dependency, so this crate is its own workspace (note the empty `[workspace]`
-table in `Cargo.toml`) and is excluded from the root `adk-rust` workspace.
+```toml
+[dependencies]
+adk-agent = { version = "2.3.0", features = ["codeact"] }
+adk-codeact-monty = "2.3.0"
+```
+
+> **Note:** this crate is **Experimental** (see [STABILITY.md](../STABILITY.md)) —
+> the API may change in a minor release; pin an exact version for production use.
+
+## Dependencies
+
+The Monty interpreter is consumed through `adk-code`'s `embedded-python`
+integration kernel, which pins the three Monty crates —
+[`monty`](https://crates.io/crates/monty) (the interpreter and run/repl
+surface), [`monty-types`](https://crates.io/crates/monty-types) (the types
+that cross the host boundary — `MontyObject`, `OsFunctionCall`,
+`ResourceLimits`, ...), and [`monty-fs`](https://crates.io/crates/monty-fs)
+(the boundary-enforcing filesystem `MountTable`) — in exactly one place, and
+shares the JSON↔Monty conversion and OS-call servicing with the
+`MontyOneShotExecutor`/`MontyReplExecutor` executors, so the two integrations
+cannot drift.
 
 ## Usage
 
@@ -90,8 +107,7 @@ dispatched.
 ## Example
 
 A runnable example lives in
-[`examples/codeact_monty_agent`](../examples/codeact_monty_agent) (run it from
-that directory so its `rust-toolchain.toml` selects rustc 1.95+):
+[`examples/codeact_monty_agent`](../examples/codeact_monty_agent):
 
 ```bash
 cd examples/codeact_monty_agent && cargo run

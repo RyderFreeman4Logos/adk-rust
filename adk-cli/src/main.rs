@@ -1,6 +1,8 @@
 mod cli;
 mod deploy;
 mod graph;
+#[cfg(feature = "vertex-agent-registry")]
+mod registry;
 mod setup;
 mod skills;
 mod ultra;
@@ -93,28 +95,42 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Skills { command }) => skills::run(command),
+        Some(Commands::Skills { command }) => skills::run(command).await,
         Some(Commands::Deploy { command }) => deploy::run(command).await,
+        #[cfg(feature = "vertex-agent-registry")]
+        Some(Commands::Registry { command }) => registry::run(command).await,
         Some(Commands::Graph { command }) => graph::run(command).await,
     }
 }
 
-/// Resolve provider/model/key non-interactively (default: a Gemini 3 model;
-/// key from `--api-key` or the environment). Returns the model and its id.
-fn resolve_model(
+/// Resolve the provider and its display model id from the CLI flags.
+///
+/// This is deliberately kept free of any credential handling: the returned
+/// `model_id` is derived only from `--provider` / `--model` (or the provider's
+/// default) and is therefore safe to echo to the console. Key material is
+/// resolved separately by [`build_model`], so no code path can conflate the
+/// two.
+fn resolve_model_id(
     cli_provider: Option<ModelProvider>,
     cli_model: Option<String>,
+) -> (ModelProvider, String) {
+    let provider = cli_provider.unwrap_or(ModelProvider::Gemini);
+    let model_id = cli_model.unwrap_or_else(|| provider.default_model().to_string());
+    (provider, model_id)
+}
+
+/// Build the model for an already-resolved provider and model id.
+///
+/// The API key comes from `--api-key` or the provider's conventional
+/// environment variable. Nothing derived from the key is returned.
+fn build_model(
+    provider: ModelProvider,
+    model_id: &str,
     cli_api_key: Option<String>,
     thinking_budget: Option<u32>,
-) -> Result<(Arc<dyn Llm>, String)> {
-    let provider = cli_provider.unwrap_or(ModelProvider::Gemini);
-    let model_id = cli_model.unwrap_or_else(|| match provider {
-        ModelProvider::Gemini => "gemini-3.1-flash-lite".to_string(),
-        _ => provider.default_model().to_string(),
-    });
+) -> Result<Arc<dyn Llm>> {
     let api_key = cli_api_key.or_else(|| env_api_key(provider));
-    let model = create_model(provider, &model_id, api_key.as_deref(), thinking_budget)?;
-    Ok((model, model_id))
+    create_model(provider, model_id, api_key.as_deref(), thinking_budget)
 }
 
 /// Drive one agent turn on an existing runner/session, streaming the trace.
@@ -127,8 +143,10 @@ async fn stream_turn(runner: &Runner, session_id: &str, prompt: &str) -> Result<
         )
         .await?;
     let mut pending = String::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     while let Some(event) = stream.next().await {
         let event = event?;
+        let event = text_deltas.push(&event);
         if let Some(content) = &event.llm_response.content {
             for part in &content.parts {
                 match part {
@@ -151,8 +169,23 @@ async fn stream_turn(runner: &Runner, session_id: &str, prompt: &str) -> Result<
 }
 
 /// Run a shell command in `dir`; returns (exit_code, combined stdout+stderr).
+/// Run the goal-mode success check.
+///
+/// Uses the same environment policy as the agent's `bash` tool, so a check cannot see
+/// credentials the agent itself is not allowed to see.
 fn run_check(dir: &str, command: &str) -> (Option<i32>, String) {
-    match std::process::Command::new("sh").arg("-c").arg(command).current_dir(dir).output() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(command).current_dir(dir);
+
+    let workspace = adk_devtools::Workspace::new(dir);
+    if !workspace.inherits_env() {
+        cmd.env_clear();
+        for (key, value) in workspace.bash_env() {
+            cmd.env(key, value);
+        }
+    }
+
+    match cmd.output() {
         Ok(o) => {
             let mut out = String::from_utf8_lossy(&o.stdout).to_string();
             out.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -203,7 +236,8 @@ async fn run_goal(args: GoalArgs) -> Result<()> {
         resume,
     } = args;
 
-    let (model, model_id) = resolve_model(provider, model, api_key, thinking_budget)?;
+    let (provider, model_id) = resolve_model_id(provider, model);
+    let model = build_model(provider, &model_id, api_key, thinking_budget)?;
     let coding = CodingAgent::builder().model(model).workspace(Workspace::new(&dir)).build()?;
 
     let state_path = state.unwrap_or_else(|| format!("{dir}/.adk/goal.json"));
@@ -328,7 +362,8 @@ async fn run_code(
     read_only: bool,
     task: String,
 ) -> Result<()> {
-    let (model, model_id) = resolve_model(cli_provider, cli_model, cli_api_key, thinking_budget)?;
+    let (provider, model_id) = resolve_model_id(cli_provider, cli_model);
+    let model = build_model(provider, &model_id, cli_api_key, thinking_budget)?;
     let workspace = if read_only { Workspace::read_only(&dir) } else { Workspace::new(&dir) };
     let coding = CodingAgent::builder().model(model).workspace(workspace).build()?;
 
@@ -492,6 +527,16 @@ fn create_model(
     }
 }
 
+// Only reachable from the `#[cfg(not(feature = ...))]` arms above; with every provider
+// compiled in there is no caller, and clippy's dead-code lint fails the build.
+#[cfg(not(all(
+    feature = "gemini",
+    feature = "openai",
+    feature = "anthropic",
+    feature = "deepseek",
+    feature = "groq",
+    feature = "ollama"
+)))]
 fn provider_feature_disabled(provider: ModelProvider, feature: &str) -> Result<Arc<dyn Llm>> {
     Err(anyhow::anyhow!(
         "{} support is not compiled into this adk-cli build. Reinstall with `--features {}` or `--features all-providers`.",

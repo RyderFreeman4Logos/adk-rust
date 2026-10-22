@@ -5,8 +5,9 @@ Welcome to the official documentation for ADK-Rust (Agent Development Kit for Ru
 ## Getting Started
 
 - [Introduction](introduction.md) - Overview of ADK-Rust, its architecture, and key concepts
-- [Quickstart](quickstart.md) - Build your first agent in under 10 minutes
+- [Quickstart](quickstart.md) - Scaffold, run, and test your first agent in the embedded UI in under 5 minutes
 - [A2UI Quickstart](quickstart-a2ui.md) - Emit A2UI JSONL and render it in React
+- [Migrating 1.0 → 2.0](migration/1.0-to-2.0.md) - Complete breaking-change list with before/after code
 
 ## Core
 
@@ -17,6 +18,7 @@ Welcome to the official documentation for ADK-Rust (Agent Development Kit for Ru
 ## Models
 
 - [Model Providers](models/providers.md) - LLM integrations: Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama
+- [OpenCode Go and Zen](models/opencode.md) - Per-model routing across four wire APIs with conversation headers
 - [Ollama](models/ollama.md) - Local inference with Ollama
 - [mistral.rs Integration](models/mistralrs.md) - Native mistral.rs for high-performance local inference
 
@@ -58,14 +60,29 @@ A dedicated, newcomer-friendly guide to building voice + multimodal agents — a
 
 - [Function Tools](tools/function-tools.md) - Create custom tools with async Rust functions
 - [Built-in Tools](tools/built-in-tools.md) - Pre-built tools like GoogleSearchTool
-- [MCP Tools](tools/mcp-tools.md) - Model Context Protocol integration
+- [MCP overview and architecture](mcp/index.md) - Where MCP fits and which ADK-Rust surface to use
+- [MCP client](mcp/client.md) - Tools, resources, prompts, completion, subscriptions, elicitation, tasks, and HTTP
+- [Dynamic MCP server manager](mcp/manager.md) - Runtime local-server registry, persistence, monitoring, and restart
+- [MCP server authoring](mcp/server.md) - Publish tools and other capabilities with the aligned official Rust SDK
+- [MCP security](mcp/security.md) - Authentication, visibility, authorization, approval, and secret handling
+- [MCP testing](mcp/testing.md) - Deterministic gates and deployment verification
 - [Browser Tools](tools/browser-tools.md) - 46 WebDriver tools for web automation
 - [UI Tools](tools/ui-tools.md) - Dynamic UI generation with forms, cards, charts
 - [RAG](tools/rag.md) - Retrieval-Augmented Generation for knowledge base search
-- [ACP Tools](tools/acp-tools.md) - Agent Client Protocol (Claude Code, Codex, Kiro CLI)
+- [ACP Tools](tools/acp-tools.md) - Use an ACP coding agent as a typed ADK-Rust tool
 - [Retry & Reflect](tools/retry-reflect.md) - Tool failure recovery with reflection prompts
 - [Action Nodes](tools/action-nodes.md) - 14 deterministic node types for workflow graphs
 - [Benchmarking](tools/benchmarking.md) - Performance measurement with `cargo adk bench`
+
+## Agent Client Protocol
+
+Use an external coding agent from ADK-Rust, or expose an ADK-Rust agent to an
+editor through stable ACP v1.
+
+- [Architecture and concepts](acp/index.md) - Client/host and coding-agent roles, sessions, capabilities, and protocol flow
+- [ACP client and host](acp/client.md) - Delegation, persistent sessions, streaming, cancellation, permissions, files, terminals, and MCP
+- [ACP agent server](acp/server.md) - Expose the Runner, tools, sessions, and live events through stdio
+- [Testing and support matrix](acp/testing.md) - Verified interoperability and deliberately unadvertised features
 
 ## Sessions & State
 
@@ -101,6 +118,7 @@ Long-term memory that outlives a session — the persistent counterpart to sessi
 - [Server](deployment/server.md) - REST API and web UI integration
 - [A2A Protocol](deployment/a2a.md) - Agent-to-Agent communication
 - [Agentic Web Protocol](deployment/awp.md) - AWP protocol for agent-native web services
+- [Agent Engine](deployment/agent-engine.md) - Deploying on the Gemini Enterprise Agent Platform
 
 ## Evaluation
 
@@ -117,6 +135,10 @@ Long-term memory that outlives a session — the persistent counterpart to sessi
 - [Guardrails](security/guardrails.md) - PII redaction, content filtering, schema validation
 - [Memory](security/memory.md) - Long-term semantic memory for agents
 - [Payments and Commerce](security/payments.md) - Agentic commerce journeys, protocol support, and validation paths
+
+## Compliance
+
+- [Vertex-Only Deployments](compliance/vertex-only-deployments.md) - Guarantee no Gemini Studio (`generativelanguage.googleapis.com`) traffic for HIPAA and data-residency workloads
 
 ## Studio
 

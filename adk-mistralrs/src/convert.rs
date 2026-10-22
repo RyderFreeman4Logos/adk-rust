@@ -68,7 +68,7 @@ pub fn content_to_message(content: &Content) -> IndexMap<String, Value> {
 
     // Handle function responses
     for part in &content.parts {
-        if let Part::FunctionResponse { id, function_response } = part {
+        if let Part::FunctionResponse { id, function_response, .. } = part {
             message
                 .insert("tool_call_id".to_string(), Value::String(id.clone().unwrap_or_default()));
             message.insert("name".to_string(), Value::String(function_response.name.clone()));
@@ -291,14 +291,14 @@ impl ImageFormat {
 /// A DynamicImage if the part contains valid image data, None otherwise.
 pub fn image_part_to_mistralrs(part: &Part) -> Option<DynamicImage> {
     match part {
-        Part::InlineData { mime_type, data } => {
+        Part::InlineData { mime_type, data, .. } => {
             if ImageFormat::is_supported_mime_type(mime_type) {
                 image::load_from_memory(data).ok()
             } else {
                 None
             }
         }
-        Part::FileData { mime_type, file_uri } => {
+        Part::FileData { mime_type, file_uri, .. } => {
             if ImageFormat::is_supported_mime_type(mime_type) {
                 image_from_uri(file_uri).ok()
             } else {
@@ -498,14 +498,14 @@ impl AudioFormat {
 /// An AudioInput if the part contains valid audio data, None otherwise.
 pub fn audio_part_to_mistralrs(part: &Part) -> Option<AudioInput> {
     match part {
-        Part::InlineData { mime_type, data } => {
+        Part::InlineData { mime_type, data, .. } => {
             if AudioFormat::is_supported_mime_type(mime_type) {
                 AudioInput::from_bytes(data).ok()
             } else {
                 None
             }
         }
-        Part::FileData { mime_type, file_uri } => {
+        Part::FileData { mime_type, file_uri, .. } => {
             if AudioFormat::is_supported_mime_type(mime_type) {
                 audio_from_uri(file_uri).ok()
             } else {

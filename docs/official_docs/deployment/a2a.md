@@ -1,6 +1,6 @@
 # Agent-to-Agent (A2A) Protocol
 
-ADK-Rust implements the [A2A Protocol v1.0.0](https://google.github.io/A2A/) for cross-network agent communication. The implementation lives in `adk-server` behind the `a2a-v1` feature flag and covers all 11 JSON-RPC operations, REST bindings, agent card discovery, and version negotiation. Wire types are provided by [`a2a-protocol-types`](https://crates.io/crates/a2a-protocol-types) — the Foundation-verified Rust A2A SDK by [@tomtom215](https://github.com/tomtom215) ([a2a-rust](https://github.com/tomtom215/a2a-rust)).
+ADK-Rust implements the [A2A Protocol v1.0.0](https://google.github.io/A2A/) for cross-network agent communication. The implementation lives in `adk-server` behind the `a2a-v1` feature flag and covers all 11 JSON-RPC operations, REST bindings, agent card discovery, and version negotiation. See [Operation coverage](#operation-coverage) for the one operation whose semantics are narrower than the specification allows. Wire types are provided by [`a2a-protocol-types`](https://crates.io/crates/a2a-protocol-types) — the Foundation-verified Rust A2A SDK by [@tomtom215](https://github.com/tomtom215) ([a2a-rust](https://github.com/tomtom215/a2a-rust)).
 
 ## Overview
 
@@ -91,7 +91,7 @@ use axum::routing::post;
 use tokio::sync::RwLock;
 
 // 1. Create your agent
-let model = adk_model::GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+let model = adk_model::GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 let agent = LlmAgentBuilder::new("my-agent")
     .description("A helpful agent")
     .model(Arc::new(model))
@@ -147,7 +147,7 @@ axum::serve(listener, app).await?;
 
 This exposes:
 - `GET /.well-known/agent-card.json` — Agent card with ETag caching
-- `POST /jsonrpc` — JSON-RPC endpoint (all 11 v1 operations)
+- `POST /jsonrpc` — JSON-RPC endpoint (all 11 v1 operations; see [Operation coverage](#operation-coverage))
 - REST routes for all operations
 - `A2A-Version` header negotiation on all routes
 
@@ -219,7 +219,24 @@ The handler automatically finds the existing task by `contextId`, transitions it
 
 ### Idempotency
 
-Duplicate `SendMessage` requests with the same `messageId` return the previously created task without re-processing. This applies to both `SendMessage` and `SendStreamingMessage`.
+Duplicate `SendMessage` requests with the same `messageId` from the same caller return the previously created task without re-processing. This applies to both `SendMessage` and `SendStreamingMessage`.
+
+### Caller Identity
+
+Every operation runs for the authenticated caller of the request. `jsonrpc_handler` and `rest_router` read the caller with the `AuthenticatedCaller` extractor, which accepts an `Option<RequestContext>` or a bare `RequestContext` request extension. Mount them behind the middleware that authenticates callers and inserts that extension.
+
+| | Authenticated caller | No authentication |
+|---|---|---|
+| Session user | the caller's `user_id` | `a2a-{contextId}` |
+| Task owner | the caller's `user_id` | none |
+| Tasks visible to `GetTask`, `CancelTask`, `ListTasks`, `SubscribeToTask`, push-config operations | tasks the caller created | ownerless tasks |
+| `INPUT_REQUIRED` resume by `contextId` | the caller's own task only | ownerless tasks only |
+
+A task owned by someone else answers `TaskNotFound`, the same as a task that does not exist. The owner is kept in task metadata under `adk.owner` (`OWNER_METADATA_KEY`) and is never sent on the wire. Programmatic callers use `RequestHandler::for_caller(Some(request_context))`; the `RequestHandler` operation methods act for an unauthenticated caller.
+
+> **Important:** without authentication, the session user is derived from the client-supplied `contextId`, so any client that knows a `contextId` shares that session. Configure authentication for any deployment with more than one client.
+
+The pre-v1 `/a2a` and `/a2a/stream` routes mounted by `create_app_with_a2a` and `ServerBuilder::with_a2a` apply the same rules, with `A2A_USER_{contextId}` as the unauthenticated session user. They take the caller from the server's `RequestContextExtractor`. Finished task records there are bounded by `A2aTaskRetention` (newest 1,000 for at most one hour by default; configure with `ServerBuilder::with_a2a_task_retention`), and a `message/send` that reuses the `taskId` of a running task, or of another caller's task, is rejected with JSON-RPC error `-32602`.
 
 ## Push Notification Authentication
 
@@ -228,7 +245,24 @@ When a client registers a webhook via `CreateTaskPushNotificationConfig`, the se
 - `Authorization: Bearer <credentials>` — when `authentication` field has bearer credentials
 - `a2a-notification-token: <token>` — when `token` field is present
 
-Both headers can be set simultaneously. SSRF protection validates webhook URLs against private IP ranges and localhost.
+Both headers can be set simultaneously.
+
+### Webhook URL Validation
+
+`validate_webhook_url` rejects a webhook whose host is `localhost`, a `*.localhost` name, or a literal address in a non-public range:
+
+| Range | Purpose |
+|-------|---------|
+| `0.0.0.0/8`, `::` | unspecified |
+| `127.0.0.0/8`, `::1` | loopback |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | private |
+| `100.64.0.0/10` | carrier-grade NAT |
+| `169.254.0.0/16`, `fe80::/10` | link-local, including cloud metadata endpoints |
+| `fc00::/7`, `fec0::/10` | IPv6 unique-local and site-local |
+| `224.0.0.0/4`, `255.255.255.255`, `ff00::/8` | multicast and broadcast |
+| IPv4-mapped, IPv4-compatible, and NAT64 IPv6 | any IPv4 range above |
+
+`HttpPushNotificationSender::new()` does not follow redirects and bounds each delivery attempt at 10 seconds (5 seconds to connect). A client passed to `HttpPushNotificationSender::with_client` should do the same, since validation covers the registered URL only. Host names are not resolved during validation; route deliveries through an egress proxy when webhook hosts are untrusted.
 
 ## Input Validation
 
@@ -340,3 +374,46 @@ The client validates: agent card discovery, SendMessage (both agents with real L
 ---
 
 **Previous**: [← Server](server.md) | **Next**: [Evaluation →](../evaluation/evaluation.md)
+
+## Operation coverage
+
+All 11 v1 JSON-RPC operations are dispatched and implemented.
+
+| Operation | Status |
+|-----------|--------|
+| `SendMessage` | Drives the agent, records its output as an artifact |
+| `SendStreamingMessage` | Drives the agent, streams artifact chunks as they are produced |
+| `GetTask`, `ListTasks` | Full |
+| `CancelTask` | Full |
+| `SubscribeToTask` (`tasks/resubscribe`) | **Snapshot only** — see below |
+| `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig` | Full |
+| `GetExtendedAgentCard` | Full |
+
+### `SubscribeToTask` is a snapshot
+
+The operation returns the task and its current status, then closes the stream. It does **not**
+deliver subsequent updates, so a client must not wait on it for progress.
+
+A live re-attach requires a per-task event queue that outlives the originating request. The
+reference implementations get this from their A2A SDKs — adk-python and adk-go both delegate
+`tasks/resubscribe` entirely to the SDK's queue manager, and neither implements it in ADK code.
+This server is hand-rolled on `a2a-protocol-types`, which provides wire types rather than a
+server runtime, so the queue does not exist yet.
+
+Use `SendStreamingMessage` when live updates are required.
+
+### Streaming event contract
+
+`SendStreamingMessage` translates agent events as they arrive:
+
+| Agent event | A2A event |
+|-------------|-----------|
+| first, before output | `Task`, then `TaskStatusUpdateEvent` — `Working` |
+| content, `partial = true` | `TaskArtifactUpdateEvent` — `append`, not last chunk |
+| content, `partial = false` | `TaskArtifactUpdateEvent` — final chunk |
+| stream ends | `TaskStatusUpdateEvent` — `Completed` |
+| stream errors | `TaskStatusUpdateEvent` — `Failed` |
+
+All chunks of one response share an artifact ID so a client can reassemble them. The joined text
+is persisted, so a later `GetTask` returns what was streamed. This matches the contract
+adk-python and adk-go implement over their SDKs.

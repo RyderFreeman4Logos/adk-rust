@@ -12,7 +12,7 @@ use adk_core::{
     CallbackContext, Content, EventActions, MemoryEntry, ReadonlyContext, Result, Tool, ToolContext,
 };
 use adk_sandbox::ProcessBackend;
-use adk_tool::{FrontendCodeTool, JavaScriptCodeTool, PythonCodeTool};
+use adk_tool::{FrontendCodeTool, JavaScriptCodeTool, MontyPythonCodeTool, PythonCodeTool};
 use async_trait::async_trait;
 use proptest::prelude::*;
 use serde_json::json;
@@ -109,6 +109,7 @@ enum ToolSelection {
     Rust,
     JavaScript,
     Python,
+    MontyPython,
     FrontendReact,
 }
 
@@ -117,6 +118,7 @@ fn arb_tool_selection() -> impl Strategy<Value = ToolSelection> {
         Just(ToolSelection::Rust),
         Just(ToolSelection::JavaScript),
         Just(ToolSelection::Python),
+        Just(ToolSelection::MontyPython),
         Just(ToolSelection::FrontendReact),
     ]
 }
@@ -127,6 +129,7 @@ fn make_tool(sel: ToolSelection) -> Box<dyn Tool> {
         ToolSelection::Rust => Box::new(make_code_tool()),
         ToolSelection::JavaScript => Box::new(JavaScriptCodeTool::new()),
         ToolSelection::Python => Box::new(PythonCodeTool::new()),
+        ToolSelection::MontyPython => Box::new(MontyPythonCodeTool::new()),
         ToolSelection::FrontendReact => Box::new(FrontendCodeTool::react()),
     }
 }
@@ -185,6 +188,7 @@ proptest! {
         sel in prop_oneof![
             Just(ToolSelection::Rust),
             Just(ToolSelection::JavaScript),
+            Just(ToolSelection::MontyPython),
         ]
     ) {
         let tool = make_tool(sel);
@@ -221,6 +225,12 @@ fn test_python_code_tool_name() {
 }
 
 #[test]
+fn test_monty_python_code_tool_name() {
+    let tool = MontyPythonCodeTool::new();
+    assert_eq!(tool.name(), "monty_python_code");
+}
+
+#[test]
 fn test_frontend_code_tool_react_name() {
     let tool = FrontendCodeTool::react();
     assert_eq!(tool.name(), "frontend_code");
@@ -232,6 +242,7 @@ fn test_all_tools_have_nonempty_descriptions() {
         Box::new(make_code_tool()),
         Box::new(JavaScriptCodeTool::new()),
         Box::new(PythonCodeTool::new()),
+        Box::new(MontyPythonCodeTool::new()),
         Box::new(FrontendCodeTool::react()),
     ];
     for tool in &tools {
@@ -245,6 +256,7 @@ fn test_all_tools_have_code_required_in_schema() {
         Box::new(make_code_tool()),
         Box::new(JavaScriptCodeTool::new()),
         Box::new(PythonCodeTool::new()),
+        Box::new(MontyPythonCodeTool::new()),
         Box::new(FrontendCodeTool::react()),
     ];
     for tool in &tools {
@@ -264,10 +276,14 @@ fn test_all_tools_have_code_required_in_schema() {
 // ===========================================================================
 
 #[tokio::test]
-async fn test_javascript_placeholder_returns_rejected() {
+async fn test_javascript_returns_a_stable_execution_status() {
     let tool = JavaScriptCodeTool::new();
     let result = tool.execute(mock_ctx(), json!({"code": "1+1"})).await.unwrap();
-    assert_eq!(result["status"], "rejected");
+    let status = result["status"].as_str().unwrap_or("").to_ascii_lowercase();
+    assert!(
+        matches!(status.as_str(), "success" | "failed" | "timeout" | "rejected"),
+        "expected an execution status, got: {status}"
+    );
 }
 
 #[tokio::test]
@@ -276,9 +292,22 @@ async fn test_python_placeholder_returns_rejected() {
     let result = tool.execute(mock_ctx(), json!({"code": "print(1)"})).await.unwrap();
     // PythonCodeTool now uses ContainerCommandExecutor — it will attempt real
     // execution. The status depends on whether docker is available.
-    let status = result["status"].as_str().unwrap_or("");
+    let status = result["status"].as_str().unwrap_or("").to_ascii_lowercase();
     assert!(
-        status == "Success" || status == "Failed" || status == "Timeout",
+        matches!(status.as_str(), "success" | "failed" | "timeout"),
+        "expected an execution status, got: {status}"
+    );
+}
+
+#[tokio::test]
+async fn test_monty_python_returns_a_stable_execution_status() {
+    let tool = MontyPythonCodeTool::new();
+    let result = tool.execute(mock_ctx(), json!({"code": "print(1)"})).await.unwrap();
+    // With `code-embedded-python` the Monty interpreter runs the snippet;
+    // without it the tool returns a structured "rejected" result.
+    let status = result["status"].as_str().unwrap_or("").to_ascii_lowercase();
+    assert!(
+        matches!(status.as_str(), "success" | "failed" | "timeout" | "rejected"),
         "expected an execution status, got: {status}"
     );
 }
@@ -289,9 +318,9 @@ async fn test_frontend_placeholder_returns_rejected() {
     let result = tool.execute(mock_ctx(), json!({"code": "console.log(1)"})).await.unwrap();
     // FrontendCodeTool now uses ContainerCommandExecutor — it will attempt real
     // execution. The status depends on whether docker/node image is available.
-    let status = result["status"].as_str().unwrap_or("");
+    let status = result["status"].as_str().unwrap_or("").to_ascii_lowercase();
     assert!(
-        status == "Success" || status == "Failed" || status == "Timeout",
+        matches!(status.as_str(), "success" | "failed" | "timeout"),
         "expected an execution status, got: {status}"
     );
 }

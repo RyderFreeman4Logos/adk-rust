@@ -19,7 +19,7 @@ Deployment manifest, bundling, and control-plane client for ADK-Rust agents.
 
 ```toml
 [dependencies]
-adk-deploy = "2.0.0"
+adk-deploy = "2.3.0"
 ```
 
 ## Manifest Format
@@ -277,6 +277,35 @@ The client config is stored at `~/.config/adk-deploy/config.json`:
 ```
 
 Load with `DeployClientConfig::load()` (defaults to `http://127.0.0.1:8090` if no config exists).
+
+## Agent Engine deployment (feature `gcp`)
+
+The `gcp` feature adds `gcp::GcpDeployClient`, a minimal ADC-authenticated
+client for deploying BYOC containers as Gemini Enterprise Agent Platform
+ReasoningEngines — exactly four operations: create, poll, get, delete.
+
+```rust
+use adk_deploy::gcp::{CreateReasoningEngineRequest, GcpDeployClient, GcpDeployConfig};
+
+async fn deploy() -> adk_deploy::DeployResult<()> {
+    let client =
+        GcpDeployClient::new_with_adc(GcpDeployConfig::new("my-project", "us-central1"))?;
+    let request = CreateReasoningEngineRequest::byoc(
+        "my-agent",
+        "us-central1-docker.pkg.dev/my-project/agents/my-agent:latest",
+    );
+    let operation = client.create_reasoning_engine(&request).await?;
+    let engine = client.wait_for_operation(operation).await?;
+    let _ = engine;
+    Ok(())
+}
+```
+
+Building and pushing the image is Cloud Build's job:
+
+```bash
+gcloud builds submit --tag us-central1-docker.pkg.dev/my-project/agents/my-agent:latest
+```
 
 ## Related Crates
 

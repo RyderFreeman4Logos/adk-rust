@@ -45,6 +45,33 @@ pub enum ContextMutationOutcome {
 ///     Ok(())
 /// }
 /// ```
+/// Why a provider closed the stream, when it said.
+///
+/// A closed transport and a provider that deliberately hung up both reach a
+/// polling caller as `next_event() -> None`, so without this they produce the
+/// same terminal record. Distinguishing them matters: "the provider aborted an
+/// idle session" and "the network dropped" call for different responses, and
+/// an application that records the first as a generic stream failure sends an
+/// operator looking for a defect that is not there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectReason {
+    /// The WebSocket close code, if the peer sent a close frame.
+    pub code: Option<u16>,
+    /// The peer's stated reason. Provider text, so treat it as data.
+    pub reason: String,
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) if !self.reason.is_empty() => write!(f, "{code}:{}", self.reason),
+            Some(code) => write!(f, "{code}"),
+            None if !self.reason.is_empty() => write!(f, "{}", self.reason),
+            None => write!(f, "unknown"),
+        }
+    }
+}
+
 #[async_trait]
 pub trait RealtimeSession: Send + Sync {
     /// Get the session ID.
@@ -52,6 +79,16 @@ pub trait RealtimeSession: Send + Sync {
 
     /// Check if the session is currently connected.
     fn is_connected(&self) -> bool;
+
+    /// Why the stream ended, if the provider said and the session recorded it.
+    ///
+    /// Defaulted to `None` so existing sessions keep compiling; a provider that
+    /// sees a close frame should override it. Only meaningful after the event
+    /// stream has ended — before that it reports whatever the last close was,
+    /// which for a live session is nothing.
+    fn disconnect_reason(&self) -> Option<DisconnectReason> {
+        None
+    }
 
     /// Send raw audio data to the server.
     ///
@@ -191,3 +228,40 @@ impl<T: RealtimeSession> RealtimeSessionExt for T {}
 
 /// A boxed session type for dynamic dispatch.
 pub type BoxedSession = Box<dyn RealtimeSession>;
+
+#[cfg(test)]
+mod disconnect_reason_tests {
+    use super::DisconnectReason;
+
+    /// The string is what ends up in an application's terminal record, so the
+    /// shape is a contract, not a debug convenience.
+    #[test]
+    fn a_code_and_reason_render_together() {
+        let reason =
+            DisconnectReason { code: Some(1008), reason: "The operation was aborted.".to_string() };
+
+        assert_eq!(reason.to_string(), "1008:The operation was aborted.");
+    }
+
+    /// Providers do not always send both halves, and a close with only a code
+    /// still carries the distinction the caller needs.
+    #[test]
+    fn either_half_alone_still_says_something() {
+        assert_eq!(
+            DisconnectReason { code: Some(1011), reason: String::new() }.to_string(),
+            "1011"
+        );
+        assert_eq!(
+            DisconnectReason { code: None, reason: "going away".to_string() }.to_string(),
+            "going away"
+        );
+    }
+
+    /// A transport that simply died sends no close frame at all. Rendering that
+    /// as an empty string would produce terminal records ending in a bare
+    /// separator, which reads as truncation rather than absence.
+    #[test]
+    fn an_absent_close_frame_is_named_rather_than_blank() {
+        assert_eq!(DisconnectReason { code: None, reason: String::new() }.to_string(), "unknown");
+    }
+}

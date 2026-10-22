@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
 
 use super::error::A2aError;
-use super::task_store::TaskStoreEntry;
+use super::task_store::{OWNER_METADATA_KEY, TaskStoreEntry};
 
 // ── Part conversion ──────────────────────────────────────────────────────────
 
@@ -33,11 +33,14 @@ pub fn wire_part_to_adk(part: &a2a_protocol_types::Part) -> Result<adk_core::Par
             Ok(adk_core::Part::InlineData {
                 mime_type: part.media_type.clone().unwrap_or_default(),
                 data,
+                uri: None,
+                annotations: None,
             })
         }
         a2a_protocol_types::PartContent::Url(uri) => Ok(adk_core::Part::FileData {
             mime_type: part.media_type.clone().unwrap_or_default(),
             file_uri: uri.clone(),
+            annotations: None,
         }),
         a2a_protocol_types::PartContent::Data(data) => wire_data_to_adk(data),
         _ => {
@@ -72,6 +75,7 @@ fn wire_data_to_adk(data: &Value) -> Result<adk_core::Part, A2aError> {
         Ok(adk_core::Part::FunctionResponse {
             function_response: adk_core::FunctionResponseData::new(name, response),
             id,
+            annotations: None,
         })
     } else if let Some(stc) = data.get("server_tool_call") {
         Ok(adk_core::Part::ServerToolCall { server_tool_call: stc.clone() })
@@ -98,11 +102,11 @@ fn wire_data_to_adk(data: &Value) -> Result<adk_core::Part, A2aError> {
 pub fn adk_part_to_wire(part: &adk_core::Part) -> Result<a2a_protocol_types::Part, A2aError> {
     match part {
         adk_core::Part::Text { text } => Ok(a2a_protocol_types::Part::text(text.clone())),
-        adk_core::Part::InlineData { mime_type, data } => {
+        adk_core::Part::InlineData { mime_type, data, .. } => {
             let encoded = general_purpose::STANDARD.encode(data);
             Ok(a2a_protocol_types::Part::raw(encoded).with_media_type(mime_type.clone()))
         }
-        adk_core::Part::FileData { mime_type, file_uri } => {
+        adk_core::Part::FileData { mime_type, file_uri, .. } => {
             Ok(a2a_protocol_types::Part::url(file_uri.clone()).with_media_type(mime_type.clone()))
         }
         adk_core::Part::FunctionCall { name, args, id, .. } => {
@@ -115,7 +119,7 @@ pub fn adk_part_to_wire(part: &adk_core::Part) -> Result<a2a_protocol_types::Par
             let data = json!({ "function_call": Value::Object(call_data) });
             Ok(a2a_protocol_types::Part::data(data))
         }
-        adk_core::Part::FunctionResponse { function_response, id } => {
+        adk_core::Part::FunctionResponse { function_response, id, .. } => {
             let mut resp_data = Map::new();
             resp_data.insert("name".to_string(), Value::String(function_response.name.clone()));
             resp_data.insert("response".to_string(), function_response.response.clone());
@@ -137,6 +141,20 @@ pub fn adk_part_to_wire(part: &adk_core::Part) -> Result<a2a_protocol_types::Par
             let data = json!({ "server_tool_response": server_tool_response.clone() });
             Ok(a2a_protocol_types::Part::data(data))
         }
+        // Embedded resources: text → text part; blob → base64 raw bytes with media type.
+        adk_core::Part::EmbeddedResource { resource } => match resource {
+            adk_core::EmbeddedResource::Text(text) => {
+                Ok(a2a_protocol_types::Part::text(text.text.clone()))
+            }
+            adk_core::EmbeddedResource::Blob(blob) => {
+                let encoded = general_purpose::STANDARD.encode(&blob.data);
+                let mut part = a2a_protocol_types::Part::raw(encoded);
+                if let Some(mime_type) = &blob.mime_type {
+                    part = part.with_media_type(mime_type.clone());
+                }
+                Ok(part)
+            }
+        },
     }
 }
 
@@ -248,17 +266,17 @@ pub fn adk_message_to_wire(
     if let Some(ref meta) = msg.metadata {
         let mut clean_meta = meta.clone();
 
-        if let Some(ext_val) = clean_meta.remove("_a2a_extensions") {
-            if let Ok(exts) = serde_json::from_value::<Vec<String>>(ext_val) {
-                extensions = Some(exts);
-            }
+        if let Some(ext_val) = clean_meta.remove("_a2a_extensions")
+            && let Ok(exts) = serde_json::from_value::<Vec<String>>(ext_val)
+        {
+            extensions = Some(exts);
         }
 
-        if let Some(ref_val) = clean_meta.remove("_a2a_reference_task_ids") {
-            if let Ok(ids) = serde_json::from_value::<Vec<String>>(ref_val) {
-                reference_task_ids =
-                    Some(ids.into_iter().map(a2a_protocol_types::TaskId::new).collect());
-            }
+        if let Some(ref_val) = clean_meta.remove("_a2a_reference_task_ids")
+            && let Ok(ids) = serde_json::from_value::<Vec<String>>(ref_val)
+        {
+            reference_task_ids =
+                Some(ids.into_iter().map(a2a_protocol_types::TaskId::new).collect());
         }
 
         if !clean_meta.is_empty() {
@@ -342,14 +360,16 @@ pub fn wire_task_to_internal(task: &a2a_protocol_types::Task) -> Result<TaskStor
 }
 
 /// Convert a `TaskStoreEntry` to an `a2a_protocol_types::Task`.
+///
+/// The [`OWNER_METADATA_KEY`] entry is server-side bookkeeping and is not copied.
 pub fn internal_task_to_wire(entry: &TaskStoreEntry) -> Result<a2a_protocol_types::Task, A2aError> {
-    let metadata = if entry.metadata.is_empty() {
-        None
-    } else {
-        let obj: Map<String, Value> =
-            entry.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        Some(Value::Object(obj))
-    };
+    let obj: Map<String, Value> = entry
+        .metadata
+        .iter()
+        .filter(|(key, _)| key.as_str() != OWNER_METADATA_KEY)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let metadata = (!obj.is_empty()).then_some(Value::Object(obj));
 
     let history = if entry.history.is_empty() { None } else { Some(entry.history.clone()) };
 
@@ -385,7 +405,7 @@ mod tests {
         let wire = a2a_protocol_types::Part::raw(&encoded).with_media_type("image/png");
         let adk = wire_part_to_adk(&wire).unwrap();
         match adk {
-            adk_core::Part::InlineData { mime_type, data } => {
+            adk_core::Part::InlineData { mime_type, data, .. } => {
                 assert_eq!(mime_type, "image/png");
                 assert_eq!(data, b"binary data");
             }
@@ -399,7 +419,7 @@ mod tests {
             .with_media_type("application/pdf");
         let adk = wire_part_to_adk(&wire).unwrap();
         match adk {
-            adk_core::Part::FileData { mime_type, file_uri } => {
+            adk_core::Part::FileData { mime_type, file_uri, .. } => {
                 assert_eq!(mime_type, "application/pdf");
                 assert_eq!(file_uri, "https://example.com/f.pdf");
             }
@@ -440,7 +460,7 @@ mod tests {
         let wire = a2a_protocol_types::Part::data(data);
         let adk = wire_part_to_adk(&wire).unwrap();
         match adk {
-            adk_core::Part::FunctionResponse { function_response, id } => {
+            adk_core::Part::FunctionResponse { function_response, id, .. } => {
                 assert_eq!(function_response.name, "get_weather");
                 assert_eq!(function_response.response["temp"], 72);
                 assert_eq!(id.as_deref(), Some("call_1"));
@@ -504,6 +524,8 @@ mod tests {
         let adk = adk_core::Part::InlineData {
             mime_type: "image/png".to_string(),
             data: b"binary".to_vec(),
+            uri: None,
+            annotations: None,
         };
         let wire = adk_part_to_wire(&adk).unwrap();
         match wire.content {
@@ -521,6 +543,7 @@ mod tests {
         let adk = adk_core::Part::FileData {
             mime_type: "application/pdf".to_string(),
             file_uri: "https://example.com/f.pdf".to_string(),
+            annotations: None,
         };
         let wire = adk_part_to_wire(&adk).unwrap();
         assert!(
@@ -557,6 +580,7 @@ mod tests {
                 json!({"result": 42}),
             ),
             id: Some("r1".to_string()),
+            annotations: None,
         };
         let wire = adk_part_to_wire(&adk).unwrap();
         match wire.content {
@@ -622,11 +646,13 @@ mod tests {
         let original = adk_core::Part::InlineData {
             mime_type: "image/jpeg".to_string(),
             data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            uri: None,
+            annotations: None,
         };
         let wire = adk_part_to_wire(&original).unwrap();
         let back = wire_part_to_adk(&wire).unwrap();
         match back {
-            adk_core::Part::InlineData { mime_type, data } => {
+            adk_core::Part::InlineData { mime_type, data, .. } => {
                 assert_eq!(mime_type, "image/jpeg");
                 assert_eq!(data, vec![0xFF, 0xD8, 0xFF, 0xE0]);
             }
@@ -639,11 +665,12 @@ mod tests {
         let original = adk_core::Part::FileData {
             mime_type: "text/plain".to_string(),
             file_uri: "gs://bucket/file.txt".to_string(),
+            annotations: None,
         };
         let wire = adk_part_to_wire(&original).unwrap();
         let back = wire_part_to_adk(&wire).unwrap();
         match back {
-            adk_core::Part::FileData { mime_type, file_uri } => {
+            adk_core::Part::FileData { mime_type, file_uri, .. } => {
                 assert_eq!(mime_type, "text/plain");
                 assert_eq!(file_uri, "gs://bucket/file.txt");
             }

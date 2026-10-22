@@ -23,15 +23,15 @@ Add the feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.0.0", features = ["managed-runtime"] }
+adk-rust = { version = "2.3.0", features = ["managed-runtime"] }
 ```
 
 Or use the `adk-managed` crate directly:
 
 ```toml
 [dependencies]
-adk-managed = "2.0.0"
-adk-session = "2.0.0"
+adk-managed = "2.3.0"
+adk-session = "2.3.0"
 ```
 
 ### Minimal Example (ScriptedLlm — no API key)
@@ -144,7 +144,7 @@ The central async trait defining the full agent lifecycle:
 Declarative agent definition with builder API:
 
 ```rust,ignore
-let def = ManagedAgentDef::new("my-agent", ModelRef::Shorthand("gemini-2.5-flash".into()))
+let def = ManagedAgentDef::new("my-agent", ModelRef::Shorthand("gemini-3.7-flash".into()))
     .with_system("You are a helpful assistant.")
     .with_description("Research agent with web search")
     .with_tools(vec![ToolConfig::BuiltIn(ManagedBuiltinTool::WebSearch)]);
@@ -179,9 +179,9 @@ Provider-neutral model reference supporting all providers:
 
 ```rust,ignore
 // Shorthand (provider inferred from name)
-ModelRef::Shorthand("gemini-2.5-flash".into())
-ModelRef::Shorthand("gpt-4.1".into())
-ModelRef::Shorthand("claude-3.5-sonnet".into())
+ModelRef::Shorthand("gemini-3.7-flash".into())
+ModelRef::Shorthand("gpt-5.6-terra".into())
+ModelRef::Shorthand("claude-sonnet-5".into())
 
 // Structured (explicit provider)
 ModelRef::Structured {
@@ -279,3 +279,129 @@ cargo run --manifest-path examples/managed_runtime_hello/Cargo.toml
 ```
 
 This runs fixture F-1 end-to-end with `ScriptedLlm` (no API key required).
+
+## Managed state durability
+
+Managed session state — the event log, sequence position, parked tool calls, and lifecycle
+status — lives in a `ManagedStateStore`. The store reports its own guarantee:
+
+| Durability | Meaning |
+|------------|---------|
+| `ProcessLocal` | Replay and resume work while the process runs. A crash loses the state, and another process cannot resume the session. |
+| `CrashDurable` | State is written to a backing store before the write is acknowledged, so another process can reconstruct the session. |
+
+**Only `InMemoryManagedStateStore` ships, and it is `ProcessLocal`.** Check the guarantee rather
+than inferring it from the presence of checkpointing:
+
+```rust
+use adk_managed::{Durability, InMemoryManagedStateStore, ManagedStateStore};
+
+let store = InMemoryManagedStateStore::new();
+assert_eq!(store.durability(), Durability::ProcessLocal);
+assert!(!store.durability().survives_process_loss());
+```
+
+### Checkpointing versus flushing
+
+`CheckpointManager::checkpoint` records an event and the new run state together, so replay never
+sees one without the other. That is a write to the manager's own fields. `flush` writes the
+snapshot to the configured store, and `restore` rebuilds a manager from it:
+
+```rust
+use adk_managed::{CheckpointManager, InMemoryManagedStateStore, ManagedStateStore};
+use std::sync::Arc;
+
+# async fn example() -> Result<(), adk_managed::types::RuntimeError> {
+let store: Arc<dyn ManagedStateStore> = Arc::new(InMemoryManagedStateStore::new());
+let manager = CheckpointManager::new("session-1".to_string()).with_store(Arc::clone(&store));
+manager.flush().await?;
+
+let restored = CheckpointManager::restore("session-1".to_string(), store).await?;
+assert_eq!(restored.session_id(), "session-1");
+# Ok(())
+# }
+```
+
+## Status reporting
+
+`ManagedAgentRuntime::status` reads the same handle the session loop writes to, so normal
+transitions are visible, not just control-plane ones:
+
+| Transition | Cause |
+|------------|-------|
+| `Queued` → `Running` | A turn begins |
+| `Running` → `Idle` | The turn completes and usage is recorded |
+| any → `Paused` | `pause` |
+| any → `Archived` | `archive` or `delete_session` |
+
+> **Note:** before this was one shared handle, `status` reported `Queued` for the entire life
+> of a session, including while it was executing turns. Control-plane transitions
+> (pause, resume, archive) were visible because they wrote to the handle directly.
+
+## Deletion semantics
+
+`delete_session` removes both planes:
+
+1. Sets the session terminal and cancels its loop.
+2. Removes the runtime handle.
+3. Deletes the persisted conversation through the injected `SessionService`, under the same
+   identity `start_session` created it with.
+
+If step 3 fails, `delete_session` returns an error naming the app, user, and session that
+still hold data — the handle is already gone at that point, so the caller has to be told
+what needs manual cleanup rather than being allowed to assume success.
+
+```rust,ignore
+runtime.delete_session(&session).await?;
+// The handle is gone and the conversation is no longer in the session backend.
+```
+
+> **Important:** deletion removes the conversation for the session under its owner. See
+> [Session ownership](#session-ownership).
+
+## Session ownership
+
+`start_session` requires a `ManagedOwner`. The session is persisted under that identity, and
+every Runner call the session loop makes uses it:
+
+```rust
+use adk_managed::{ManagedAgentRuntime, ManagedOwner};
+
+# async fn start(runtime: &dyn ManagedAgentRuntime, agent: &adk_managed::AgentHandle)
+# -> Result<(), adk_managed::RuntimeError> {
+let owner = ManagedOwner::new("support-console", "user-42")?;
+let session = runtime.start_session(agent, &owner, None).await?;
+# Ok(())
+# }
+```
+
+> **Important:** `checkpoint` was documented as "atomically persist" with a guarantee that
+> "replay will see a consistent view after any crash", and loading was described as returning
+> "everything needed to reconstruct a session after a restart". Neither held: both operated on
+> in-memory fields with no transaction against any persistent store. With the shipped store,
+> `restore` in a new process finds nothing.
+Both components are required and must be non-blank. Sessions belonging to different owners are
+addressed separately, so lookup and deletion are scoped to one owner and cannot reach another's
+data.
+
+> **Note:** every managed session was previously persisted under the constants `managed` /
+> `managed_user`, so all of them shared one logical namespace: nothing could be scoped to a
+> caller and no session could be attributed to one.
+
+## Environment configuration
+
+`EnvironmentConfig` carries `env_vars` and `working_dir`. This runtime **rejects** a
+configuration that requests either:
+
+```text
+invalid request: EnvironmentConfig cannot be honoured by this runtime: sessions run
+in-process, so per-session environment variables and working directories would have to mutate
+process-global state shared with other sessions. Pass `None`, or configure a sandboxed runtime.
+```
+
+Sessions run in-process, so applying per-session environment variables or a working directory
+would mutate state shared with every other session. Refusing is the honest outcome; a sandboxed
+execution boundary is what would make the request satisfiable.
+
+> **Note:** the argument was previously named `_env` and discarded, so a caller supplying
+> environment configuration received a session that silently ignored it.

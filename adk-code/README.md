@@ -16,8 +16,10 @@ The crate provides:
 - Sandbox policy model (`SandboxPolicy`, `BackendCapabilities`) with fail-closed validation
 - Rust-first code execution via `RustExecutor` (check → build → delegate) and legacy `RustSandboxExecutor`
 - Embedded JavaScript execution via `EmbeddedJsExecutor` (boa_engine, `embedded-js` feature)
+- Embedded Python execution via `MontyOneShotExecutor` / `MontyReplExecutor` (Pydantic Monty, `embedded-python` feature)
 - WASM guest module execution via `WasmGuestExecutor` (phase 1 placeholder)
 - Docker container execution via `DockerExecutor` (persistent, `docker` feature) and `ContainerCommandExecutor` (ephemeral, always available)
+- Vertex AI Agent Engine managed sandboxes via `VertexSandboxClient` / `SandboxCodeExecutor` (`vertex-sandbox` feature)
 - `CodeTool` implementing `adk_core::Tool` for LLM agent integration
 - Structured Rust compiler diagnostics parsing
 - Workspace abstraction for multi-agent collaborative project builds
@@ -68,7 +70,9 @@ User code must provide `fn run(input: serde_json::Value) -> serde_json::Value`. 
 |---------------|------------------------------------------|---------|
 | (none)        | Core types, `RustExecutor`, `RustSandboxExecutor`, `ContainerCommandExecutor`, `WasmGuestExecutor`, `CodeTool`, `Workspace` | ✅ |
 | `embedded-js` | `EmbeddedJsExecutor` via `boa_engine`    | ❌      |
+| `embedded-python` | `MontyOneShotExecutor` / `MontyReplExecutor` via the Monty interpreter | ❌ |
 | `docker`      | `DockerExecutor` via `bollard` (persistent Docker containers) | ❌ |
+| `vertex-sandbox` | `VertexSandboxClient` / `SandboxCodeExecutor` / `VertexSandboxTool` — Vertex AI Agent Engine managed sandboxes | ❌ |
 
 ## Execution Backends
 
@@ -76,18 +80,31 @@ User code must provide `fn run(input: serde_json::Value) -> serde_json::Value`. 
 
 | Backend | Isolation | Timeout | Network | Filesystem | Environment | Persistent |
 |---------|-----------|---------|---------|------------|-------------|------------|
-| `RustSandboxExecutor` | HostLocal | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `RustSandboxExecutor` | HostLocal | ✅ | ❌ | ❌ | ✅ | ❌ |
 | `RustExecutor` | Delegated | ✅ | Delegated | Delegated | Delegated | ❌ |
-| `EmbeddedJsExecutor` | InProcess | ✅ | ✅* | ✅* | ✅* | ❌ |
+| `EmbeddedJsExecutor` | InProcess | ✅† | ✅* | ✅* | ✅* | ❌ |
+| `MontyOneShotExecutor` | InProcess | ✅ | ✅* | ✅ | ✅ | ❌ |
+| `MontyReplExecutor` | InProcess | ✅ | ✅* | ✅ | ✅ | ✅ |
 | `WasmGuestExecutor` | InProcess | ✅ | ✅* | ✅* | ✅* | ❌ |
 | `ContainerCommandExecutor` | ContainerEphemeral | ✅ | ✅ | ✅ | ✅ | ❌ |
 | `DockerExecutor` | ContainerPersistent | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 *Enforcement by omission — the engine has no APIs for these operations.
 
+†The deadline is enforced on the result; runtime limits stop the interpreter. See [EmbeddedJsExecutor](#embeddedjsexecutor-embedded-js-feature).
+
+`validate_policy()` rejects every request on a backend that reports `enforce_environment_policy: false`: both `EnvironmentPolicy::None` and `EnvironmentPolicy::AllowList` restrict what the code sees, and such a backend passes the host environment through.
+
 ### RustSandboxExecutor (legacy)
 
-Host-local Rust compilation and execution. Compiles with `rustc`, runs the binary as a child process. Honest about capabilities: can enforce timeouts and output truncation, but not network/filesystem/environment restrictions.
+Host-local Rust compilation and execution. Compiles with `rustc`, runs the binary as a child process. Enforces timeouts (including stdin delivery), output truncation, and environment restrictions, but not network or filesystem restrictions.
+
+| Process | Environment |
+|---------|-------------|
+| `rustc` | Cleared, plus the toolchain allowlist from `ProcessBackend::toolchain_env()` (`PATH`, `HOME`, `RUSTUP_HOME`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`, `TMPDIR`, and on Windows `LIB`, `SystemRoot`, and similar) |
+| Compiled binary | Cleared, plus the variables named by `EnvironmentPolicy::AllowList` (and `SystemRoot` on Windows) |
+
+`env!` and `option_env!` in user code therefore cannot embed host credentials into the binary, and `std::env::var` sees only allowlisted variables.
 
 ```rust
 use adk_code::{RustSandboxExecutor, RustSandboxConfig, CodeExecutor};
@@ -115,6 +132,13 @@ let executor = RustExecutor::new(backend, RustExecutorConfig {
     rustc_flags: vec![],
 });
 ```
+
+| Step | Where it runs | Environment |
+|------|---------------|-------------|
+| Check, build | Inside the backend when it reports `filesystem_read_isolation` and supports `Language::Command` (Unix only); otherwise on the host | Cleared, plus the toolchain allowlist |
+| Execute | Inside the backend | Whatever the backend exposes; `ProcessBackend` clears it |
+
+Compile-time file access such as `include_str!` follows wherever `rustc` runs. `rustc` runs on the host only when the backend does not confine reads, so it reaches no file the binary could not also read at run time. On Windows, `rustc` always runs on the host.
 
 `RustExecutor::execute()` returns a `CodeResult` with:
 - `exec_result` — sandbox execution result (stdout, stderr, exit_code, duration)
@@ -145,6 +169,43 @@ let request = ExecutionRequest {
 ```
 
 User code is wrapped in an IIFE so `return` works. Input is injected as a global `input` variable. Return value is converted to JSON.
+
+Each evaluation runs on its own thread, and `execute()` returns `ExecutionStatus::Timeout` once the policy timeout passes. Boa cannot be preempted, so an abandoned evaluation runs until it finishes or reaches a runtime limit:
+
+| Limit | Value |
+|-------|-------|
+| Loop iterations per call frame | 10,000,000 |
+| Call depth | 512 |
+| VM stack values | 10,240 |
+
+Runtime-limit errors cannot be caught by `try`/`catch`; a limit reached before the deadline yields `ExecutionStatus::Failed`. Loop limits count per call frame, work inside a single native builtin (such as a pathological regular expression) is not counted, and there is no heap limit.
+
+### Monty executors (`embedded-python` feature)
+
+In-process Python execution via the [Pydantic Monty](https://github.com/pydantic/monty) interpreter — no container, no subprocess, microsecond startup. One builder produces two products: `build_one_shot()` runs each call in a fresh interpreter, `build_repl()` persists interpreter state (variables, functions, imports) across calls.
+
+Every OS call Monty can emit (filesystem, `os.getenv`/`os.environ`, `datetime.now()`/`date.today()`) is serviced against grants the host authors at construction; ungranted access raises a catchable in-script `OSError`. Monty has no network or subprocess surface at all. Registered host functions become callable Python functions, and both executors describe their built environment through `CodeExecutor::prompt_snippet()`.
+
+```rust
+use adk_code::{MontyExecutorBuilder, PathAccess};
+use serde_json::json;
+
+let builder = MontyExecutorBuilder::new()
+    .allow_path("/data", "/srv/agent/data", PathAccess::ReadOnly)
+    .allow_path("/out", "/srv/agent/out", PathAccess::ReadWrite)
+    .environ_var("PROJECT", "acme")
+    .system_clock()
+    .function_fn("row_count", "Count rows in the loaded dataset.", |args, _kwargs| async move {
+        Ok(json!(args.len()))
+    });
+
+let one_shot = builder.clone().build_one_shot()?;   // fresh interpreter per call
+let repl = builder.build_repl()?;                   // state persists across calls
+```
+
+The per-request `SandboxPolicy` may only narrow within the builder's grants; a request exceeding them is rejected fail-closed before any code runs. The value of the script's final expression becomes `ExecutionResult::output`; `print()` output is captured as stdout.
+
+The `embedded_python` module is also the workspace's shared Monty integration kernel: it exposes the JSON↔Monty conversion (`json_to_monty` / `monty_to_json`), the OS-call servicing function (`resolve_os_call`), `PathAccess`, and re-exports of the `monty` / `monty-types` / `monty-fs` crates — so the Monty release is pinned exactly once, here. `adk-codeact-monty` builds its `CodeRuntime` on this kernel.
 
 ### WasmGuestExecutor
 
@@ -204,6 +265,59 @@ Presets: `DockerConfig::python()`, `DockerConfig::node()`, `DockerConfig::custom
 Builder methods: `setup_command()`, `pip_install()`, `npm_install()`, `with_network()`, `bind_mount()`, `env()`.
 
 Lifecycle: `start()` → `execute()` (reusable) → `stop()` / `cleanup()`. Set `auto_start: true` (default) to start on first execute.
+
+The container's network mode, bind mounts, and environment are fixed at creation, so `execute()` checks each request's `SandboxPolicy` against the `DockerConfig` with `DockerConfig::validate_sandbox_policy()` and rejects a stricter request with `ExecutionError::UnsupportedPolicy`:
+
+| Policy | Satisfied when |
+|--------|----------------|
+| `NetworkPolicy::Disabled` | The config does not call `with_network()` |
+| `FilesystemPolicy::None` | There are no bind mounts |
+| `FilesystemPolicy::WorkspaceReadOnly { root }` | Every bind mount is `:ro` and its host path lies under `root` |
+| `FilesystemPolicy::WorkspaceReadWrite { root }` | Every bind mount's host path lies under `root` |
+| `FilesystemPolicy::Paths { read_only, read_write }` | Every bind mount lies under a `read_write` path, or is `:ro` and lies under a `read_only` path |
+| `EnvironmentPolicy::None` | The config sets no `env()` variables |
+| `EnvironmentPolicy::AllowList(names)` | Every `env()` variable is in `names`; the named host variables are also passed to the exec |
+
+The networked container in the example above therefore needs requests built with `NetworkPolicy::Enabled`; `SandboxPolicy::strict_rust()` disables the network and is rejected.
+
+### Vertex AI Agent Engine sandboxes (`vertex-sandbox` feature)
+
+A client for the Agent Engine `sandboxEnvironments` surface (v1beta1) — fully
+managed, isolated code-execution sandboxes under a reasoning engine. Built on
+the shared `adk-gcp` plumbing (ADC credential caching, bounded transport, LRO
+polling, scope validation).
+
+```rust
+use adk_code::vertex_sandbox::{
+    CreateSandboxRequest, SandboxCodeExecutor, VertexSandboxClient, VertexSandboxConfig,
+    VertexSandboxTool,
+};
+use std::sync::Arc;
+
+let client = Arc::new(VertexSandboxClient::new_with_adc(
+    VertexSandboxConfig::new("my-project", "us-central1"),
+)?);
+
+// Direct: create, execute, delete.
+let sandbox = client.create_sandbox("4242", CreateSandboxRequest::new("my-sandbox")).await?;
+let name = sandbox.name.unwrap();
+let result = client.execute_code(&name, "print('hello')", &[]).await?;
+println!("{}", result.stdout);
+client.delete_sandbox(&name).await?;
+
+// Managed: per-session lazy creation with recreate-on-not-running semantics
+// (adk-python AgentEngineSandboxCodeExecutor parity), plus an agent tool.
+let executor = Arc::new(SandboxCodeExecutor::for_engine(client, "4242"));
+let tool = VertexSandboxTool::new(executor);
+```
+
+- `create_sandbox` / `delete_sandbox` wait their long-running operations;
+  `get_sandbox` / `list_sandboxes` are plain reads; `:execute` is synchronous.
+- `execute_code` implements the chunk conventions shared with adk-python and
+  the Vertex AI SDK: a JSON code chunk, `file_name`-attributed file chunks,
+  and `msg_out`/`msg_err` console output.
+- Files are limited to 100 MB per request (rejected before sending) and per
+  response. Every `:execute` call resets the sandbox TTL server-side.
 
 ## CodeTool
 

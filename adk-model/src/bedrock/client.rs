@@ -71,6 +71,59 @@ impl BedrockClient {
         Ok(Self { client, model_id, region, retry_config: RetryConfig::default(), prompt_caching })
     }
 
+    /// Use an explicit Bedrock bearer key without reading the process credential chain.
+    ///
+    /// # Errors
+    ///
+    /// This constructor does not fail today; the `Result` leaves room for key validation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::bedrock::{BedrockClient, BedrockConfig};
+    ///
+    /// let config = BedrockConfig::new("us-east-1", "anthropic.claude-sonnet-4-6-v1:0");
+    /// let client = BedrockClient::new_with_api_key(config, "bedrock-api-key")?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    pub fn new_with_api_key(config: BedrockConfig, api_key: &str) -> Result<Self, AdkError> {
+        let mut sdk = aws_sdk_bedrockruntime::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_bedrockruntime::config::Region::new(config.region.clone()))
+            .bearer_token(aws_sdk_bedrockruntime::config::Token::new(api_key, None));
+        if let Some(endpoint) = &config.endpoint_url {
+            sdk = sdk.endpoint_url(endpoint);
+        }
+        Ok(Self::from_client(config, aws_sdk_bedrockruntime::Client::from_conf(sdk.build())))
+    }
+
+    /// Supply a configured SDK client, preserving its identity and transport ownership.
+    ///
+    /// ADK retries are disabled because the supplied client carries its own retry
+    /// configuration.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use adk_model::bedrock::{BedrockClient, BedrockConfig};
+    ///
+    /// # async fn example() {
+    /// let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    /// let sdk = aws_sdk_bedrockruntime::Client::new(&sdk_config);
+    /// let config = BedrockConfig::new("us-east-1", "anthropic.claude-sonnet-4-6-v1:0");
+    /// let client = BedrockClient::from_client(config, sdk);
+    /// # }
+    /// ```
+    pub fn from_client(config: BedrockConfig, client: aws_sdk_bedrockruntime::Client) -> Self {
+        Self {
+            client,
+            model_id: config.model_id,
+            region: config.region,
+            retry_config: RetryConfig::disabled(),
+            prompt_caching: config.prompt_caching,
+        }
+    }
+
     /// Set the retry configuration, consuming and returning `self`.
     #[must_use]
     pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
@@ -253,8 +306,13 @@ impl BedrockClient {
                     ConverseStreamOutput::ContentBlockStop(_) => {
                         // If we were accumulating tool arguments, emit the complete FunctionCall.
                         if let (Some(name), Some(id)) = (tool_name.take(), tool_id.take()) {
-                            let args: serde_json::Value =
-                                serde_json::from_str(&tool_args_buf).unwrap_or_default();
+                            // A zero-argument tool streams no input, which decodes to `{}`.
+                            let args = crate::tool_args::parse_streamed_tool_arguments(
+                                "bedrock",
+                                "model.bedrock.invalid_tool_arguments",
+                                &name,
+                                &tool_args_buf,
+                            )?;
                             tool_args_buf.clear();
 
                             yield LlmResponse {
@@ -315,6 +373,11 @@ impl BedrockClient {
                     ConverseStreamOutput::Metadata(metadata_event) => {
                         if let Some(usage) = &metadata_event.usage {
                             pending_usage = Some(adk_core::UsageMetadata {
+                                provider_usage: Some(serde_json::json!({
+                                    "inputTokens":usage.input_tokens, "outputTokens":usage.output_tokens,
+                                    "totalTokens":usage.total_tokens, "cacheReadInputTokens":usage.cache_read_input_tokens,
+                                    "cacheWriteInputTokens":usage.cache_write_input_tokens,
+                                })),
                                 prompt_token_count: usage.input_tokens,
                                 candidates_token_count: usage.output_tokens,
                                 total_token_count: usage.total_tokens,
@@ -334,6 +397,8 @@ impl BedrockClient {
             if let Some(mut stop) = pending_stop {
                 stop.usage_metadata = pending_usage.take();
                 yield stop;
+            } else {
+                Err(AdkError::model("incomplete Bedrock event stream"))?;
             }
         };
 

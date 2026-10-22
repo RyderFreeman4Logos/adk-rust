@@ -18,7 +18,13 @@ adk-core.workspace = true
 adk-agent = { workspace = true, features = ["skills"] }
 adk-runner = { workspace = true, features = ["artifacts", "plugins", "skills"] }
 adk-session.workspace = true
+adk-skill.workspace = true
 adk-artifact.workspace = true
+# Optional: Agent Engine dispatch surface (memory class methods)
+adk-memory = { workspace = true, optional = true }
+adk-gcp = { workspace = true, optional = true }
+adk-tool = { workspace = true, optional = true }
+google-cloud-auth = { version = "1.8", optional = true, default-features = false, features = ["default-rustls-provider"] }
 adk-telemetry.workspace = true
 tokio = { workspace = true, features = ["sync", "signal", "macros", "rt", "time"] }
 tokio-stream.workspace = true
@@ -40,7 +46,7 @@ rust-embed = "8.9.0"
 mime_guess = "2.0.5"
 reqwest.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
-a2a-protocol-types = { version = "0.5", optional = true }
+a2a-protocol-types = { version = "0.12.1", optional = true }
 # Optional: YAML agent definition parsing
 serde_yaml = { version = "0.9", optional = true }
 # Optional: filesystem watcher for hot reload
@@ -68,6 +74,18 @@ a2a-interceptors = []
 openai-webhooks = ["dep:hmac", "dep:sha2", "dep:hex"]
 # Enable background run endpoints and cron job management
 background = ["dep:cron"]
+# Enable the Gemini Enterprise Agent Platform (ReasoningEngine) dispatch surface
+# and the turnkey serve_agent_engine entrypoint (tokio/net for the listener)
+agent-engine = ["dep:adk-memory", "tokio/net"]
+# Remote ReasoningEngine invocation: call other deployed Agent Engine agents
+# as sub-agents over reasoningEngines:streamQuery (alt=sse)
+vertex-remote-engine = [
+    "agent-engine",
+    "dep:adk-gcp",
+    "dep:adk-tool",
+    "adk-tool/vertex-agent-registry",
+    "dep:google-cloud-auth",
+]
 
 [dev-dependencies]
 async-stream.workspace = true

@@ -2,7 +2,8 @@
 
 //! # adk-gemini
 //!
-//! A Rust client library for Google's Gemini 2.0 API.
+//! A Rust client library for Google's Gemini API (Studio + Vertex AI),
+//! supporting current model generations such as Gemini 2.5 and 3.x.
 //!
 //! ## Crate Organization
 //!
@@ -129,7 +130,8 @@ pub use safety::model::{
 
 pub use tools::model::{
     FunctionCall, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration,
-    FunctionResponse, FunctionResponsePart, Tool, ToolConfig,
+    FunctionResponse, FunctionResponsePart, RagResource, RagRetrievalConfig, RagRetrievalFilter,
+    Tool, ToolConfig, VertexRagStore,
 };
 
 // ========== Batch Processing ==========
@@ -166,4 +168,4 @@ pub use pricing::{CostBreakdown, GeminiPricing, estimate_cost, estimate_cost_lon
 // ========== Schema Adapter ==========
 // Provider-specific schema normalization for Gemini function-calling API
 
-pub use schema_adapter::GeminiSchemaAdapter;
+pub use schema_adapter::{GeminiSchemaAdapter, GeminiSchemaDialect};

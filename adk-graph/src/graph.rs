@@ -68,7 +68,7 @@ impl StateGraph {
     ///     .add_node_fn("a", |_| async { Ok(Default::default()) })
     ///     .add_node_fn("b", |_| async { Ok(Default::default()) })
     ///     .add_deferred_node_fn("join", |_| async { Ok(Default::default()) },
-    ///         DeferredNodeConfig { merge_strategy: MergeStrategy::Collect, fan_in_timeout: None })
+    ///         DeferredNodeConfig { merge_strategy: MergeStrategy::Collect, ..Default::default() })
     ///     .add_edge("a", "join")
     ///     .add_edge("b", "join");
     /// ```
@@ -166,8 +166,14 @@ impl StateGraph {
     }
 
     /// Compile the graph for execution
-    pub fn compile(self) -> Result<CompiledGraph> {
+    pub fn compile(mut self) -> Result<CompiledGraph> {
+        // A node with requirements on the graph that holds it states them now, so
+        // a mismatch cannot reach a run. `SubgraphNode` checks its channel map here.
+        for node in self.nodes.values() {
+            node.validate_against(&self.schema)?;
+        }
         self.validate()?;
+        self.defer_unconditional_fan_in();
 
         Ok(CompiledGraph {
             schema: self.schema,
@@ -176,13 +182,68 @@ impl StateGraph {
             checkpointer: None,
             interrupt_before: HashSet::new(),
             interrupt_after: HashSet::new(),
-            recursion_limit: 50,
+            recursion_limit: 100,
             timeout_policies: HashMap::new(),
             default_timeout: None,
+            default_retry: None,
+            error_handlers: HashMap::new(),
+            default_error_handler: None,
             deferred_configs: self.deferred_configs,
+            max_concurrency: None,
+            retry_policies: HashMap::new(),
+            strict_channels: false,
+            retention: None,
             #[cfg(feature = "node-cache")]
             cache_policies: HashMap::new(),
+            #[cfg(feature = "node-cache")]
+            node_caches: HashMap::new(),
         })
+    }
+
+    /// Mark any node reached by more than one unconditional edge as deferred.
+    ///
+    /// The frontier advances from whichever nodes finished in the last
+    /// super-step, so without this a join becomes eligible as soon as one
+    /// predecessor lands. On branches of unequal length it then runs once per
+    /// arriving predecessor, applying its updates repeatedly and reading a
+    /// half-built state.
+    ///
+    /// Only `Direct` and `Entry` edges count. A conditional predecessor may never
+    /// fire, and waiting for one that cannot arrive would deadlock the join. A
+    /// graph whose fan-in arrives through conditional edges therefore still needs
+    /// `mark_deferred` and a `fan_in_timeout`.
+    ///
+    /// An explicit configuration always wins, so a caller who wants the earlier
+    /// behaviour keeps it by configuring the node themselves.
+    fn defer_unconditional_fan_in(&mut self) {
+        let mut in_degree: HashMap<&str, usize> = HashMap::new();
+        for edge in &self.edges {
+            match edge {
+                Edge::Direct { target, .. } => {
+                    if let Some(name) = target.node_name() {
+                        *in_degree.entry(name).or_insert(0) += 1;
+                    }
+                }
+                Edge::Entry { targets } => {
+                    for target in targets {
+                        *in_degree.entry(target.as_str()).or_insert(0) += 1;
+                    }
+                }
+                // A conditional edge selects one target at run time, so its
+                // targets are not guaranteed arrivals.
+                Edge::Conditional { .. } => {}
+            }
+        }
+
+        let fan_ins: Vec<String> = in_degree
+            .into_iter()
+            .filter(|(name, degree)| *degree > 1 && self.nodes.contains_key(*name))
+            .map(|(name, _)| name.to_string())
+            .collect();
+
+        for name in fan_ins {
+            self.deferred_configs.entry(name).or_default();
+        }
     }
 
     /// Validate the graph structure
@@ -191,6 +252,13 @@ impl StateGraph {
         let has_entry = self.edges.iter().any(|e| matches!(e, Edge::Entry { .. }));
         if !has_entry {
             return Err(GraphError::NoEntryPoint);
+        }
+
+        // Reject a node that cannot execute. A configuration whose backend is
+        // unavailable should fail here, not part-way through a run when earlier nodes
+        // may already have had side effects.
+        for node in self.nodes.values() {
+            node.validate()?;
         }
 
         // Check all node references exist
@@ -232,6 +300,82 @@ impl StateGraph {
     }
 }
 
+/// Turns a node failure into state and a route, instead of ending the run.
+///
+/// Called after the node's retry budget is spent. Returning a
+/// [`crate::node::NodeOutput`] lets the handler record what happened
+/// and name a recovery node with
+/// [`with_goto`](crate::node::NodeOutput::with_goto). Returning `Err` ends the
+/// run as before.
+pub type NodeErrorHandler =
+    Arc<dyn Fn(&str, &GraphError, &State) -> Result<crate::node::NodeOutput> + Send + Sync>;
+
+/// Policies a graph applies to every node that does not set its own.
+///
+/// Repeating the same retry or timeout on twenty nodes is easy to get wrong by
+/// omission. A default states it once; a per-node value always wins.
+///
+/// # Example
+///
+/// ```
+/// use adk_graph::graph::NodeDefaults;
+/// use adk_graph::retry::RetryPolicy;
+/// use adk_graph::timeout::TimeoutPolicy;
+/// use std::time::Duration;
+///
+/// let defaults = NodeDefaults::new().with_retry(RetryPolicy::new(3)).with_timeout(
+///     TimeoutPolicy { run_timeout: Some(Duration::from_secs(30)), ..Default::default() },
+/// );
+/// # let _ = defaults;
+/// ```
+#[derive(Clone, Default)]
+pub struct NodeDefaults {
+    /// Retry policy for a node with none of its own.
+    pub retry: Option<crate::retry::RetryPolicy>,
+    /// Timeout policy for a node with none of its own.
+    pub timeout: Option<crate::timeout::TimeoutPolicy>,
+    /// Failure handler for a node with none of its own.
+    pub error_handler: Option<NodeErrorHandler>,
+}
+
+impl std::fmt::Debug for NodeDefaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeDefaults")
+            .field("retry", &self.retry)
+            .field("timeout", &self.timeout)
+            .field("error_handler", &self.error_handler.as_ref().map(|_| "<handler>"))
+            .finish()
+    }
+}
+
+impl NodeDefaults {
+    /// An empty set of defaults, which changes nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Applies this retry policy to every node that sets none.
+    pub fn with_retry(mut self, policy: crate::retry::RetryPolicy) -> Self {
+        self.retry = Some(policy);
+        self
+    }
+
+    /// Applies this timeout policy to every node that sets none.
+    pub fn with_timeout(mut self, policy: crate::timeout::TimeoutPolicy) -> Self {
+        self.timeout = Some(policy);
+        self
+    }
+
+    /// Applies this failure handler to every node that sets none.
+    pub fn with_error_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&str, &GraphError, &State) -> Result<crate::node::NodeOutput> + Send + Sync + 'static,
+    {
+        self.error_handler = Some(Arc::new(handler));
+        self
+    }
+}
+
 /// A compiled graph ready for execution
 pub struct CompiledGraph {
     pub(crate) schema: StateSchema,
@@ -245,11 +389,29 @@ pub struct CompiledGraph {
     pub(crate) timeout_policies: HashMap<String, crate::timeout::TimeoutPolicy>,
     /// Default timeout policy applied to all nodes without an explicit override.
     pub(crate) default_timeout: Option<crate::timeout::TimeoutPolicy>,
+    /// Retry policy for every node that sets none of its own.
+    pub(crate) default_retry: Option<crate::retry::RetryPolicy>,
+    /// Per-node failure handlers, keyed by node name.
+    pub(crate) error_handlers: HashMap<String, NodeErrorHandler>,
+    /// Failure handler for every node that sets none of its own.
+    pub(crate) default_error_handler: Option<NodeErrorHandler>,
     /// Deferred node configurations, keyed by node name.
     pub(crate) deferred_configs: HashMap<String, crate::deferred::DeferredNodeConfig>,
+    /// Ceiling on how many nodes execute at once. `None` runs the whole frontier.
+    pub(crate) max_concurrency: Option<usize>,
+    /// Per-node retry policies, keyed by node name.
+    pub(crate) retry_policies: HashMap<String, crate::retry::RetryPolicy>,
+    /// Whether a node writing an undeclared channel fails the run.
+    pub(crate) strict_channels: bool,
+    /// How many checkpoints to keep per thread. `None` keeps every one.
+    pub(crate) retention: Option<crate::checkpoint::RetentionPolicy>,
     /// Per-node cache policies, keyed by node name.
     #[cfg(feature = "node-cache")]
     pub(crate) cache_policies: HashMap<String, crate::cache::NodeCachePolicy>,
+    /// Per-node caches built from `cache_policies`, shared by every run of this
+    /// graph so a later run reuses what an earlier one stored.
+    #[cfg(feature = "node-cache")]
+    pub(crate) node_caches: HashMap<String, Arc<crate::cache::NodeCache>>,
 }
 
 impl CompiledGraph {
@@ -283,6 +445,191 @@ impl CompiledGraph {
         self
     }
 
+    /// Cap how many nodes execute concurrently within one super-step.
+    ///
+    /// A wide fan-out otherwise dispatches its whole frontier at once, which can
+    /// exhaust a connection pool or trip a provider rate limit. Nodes beyond the
+    /// cap wait for a slot; the dispatch order is the frontier's, sorted, so it
+    /// does not depend on timing.
+    ///
+    /// Without this the frontier runs unbounded, which stays the default.
+    pub fn with_max_concurrency(mut self, limit: usize) -> Self {
+        self.max_concurrency = Some(limit.max(1));
+        self
+    }
+
+    /// Fail the run when a node writes a channel the schema does not declare.
+    ///
+    /// An undeclared channel otherwise takes the overwrite reducer, because that
+    /// is the fallback for a name the schema does not hold. A graph that declared
+    /// a list channel and then wrote a near-miss name keeps only the last value
+    /// and reports nothing. Enforcement turns that into
+    /// [`crate::error::GraphError::UndeclaredChannel`].
+    ///
+    /// A graph that declares no channels accepts any name even under
+    /// enforcement, because there is nothing to check against.
+    ///
+    /// Off by default: a graph may legitimately declare the channels a caller
+    /// reads and let its nodes pass other values between themselves.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::edge::{END, START};
+    /// use adk_graph::graph::StateGraph;
+    /// use adk_graph::node::NodeOutput;
+    /// use serde_json::json;
+    ///
+    /// let graph = StateGraph::with_channels(&["total"])
+    ///     .add_node_fn("sum", |_ctx| async move {
+    ///         Ok(NodeOutput::new().with_update("total", json!(3)))
+    ///     })
+    ///     .add_edge(START, "sum")
+    ///     .add_edge("sum", END)
+    ///     .compile()
+    ///     .unwrap()
+    ///     .with_strict_channels();
+    /// # let _ = graph;
+    /// ```
+    pub fn with_strict_channels(mut self) -> Self {
+        self.strict_channels = true;
+        self
+    }
+
+    /// Discards old checkpoints as the run proceeds.
+    ///
+    /// A thread otherwise accumulates one checkpoint per super-step for as long as
+    /// it lives, which costs storage and slows a `list`. The newest is always kept,
+    /// because it is the one a resume loads.
+    ///
+    /// Off by default, so an existing thread keeps its whole history and time
+    /// travel can still reach every step.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::checkpoint::{MemoryCheckpointer, RetentionPolicy};
+    /// use adk_graph::edge::{END, START};
+    /// use adk_graph::graph::StateGraph;
+    /// use adk_graph::node::NodeOutput;
+    ///
+    /// let graph = StateGraph::with_channels(&["value"])
+    ///     .add_node_fn("step", |_ctx| async move { Ok(NodeOutput::new()) })
+    ///     .add_edge(START, "step")
+    ///     .add_edge("step", END)
+    ///     .compile()?
+    ///     .with_checkpointer(MemoryCheckpointer::new())
+    ///     .with_checkpoint_retention(RetentionPolicy::keep_last(20));
+    /// # let _ = graph;
+    /// # Ok::<(), adk_graph::error::GraphError>(())
+    /// ```
+    pub fn with_checkpoint_retention(mut self, policy: crate::checkpoint::RetentionPolicy) -> Self {
+        self.retention = Some(policy);
+        self
+    }
+
+    /// Applies policies to every node that does not set its own.
+    ///
+    /// Repeating the same retry or timeout across twenty nodes is easy to get
+    /// wrong by omission. A per-node value always wins over the default.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::edge::{END, START};
+    /// use adk_graph::graph::{NodeDefaults, StateGraph};
+    /// use adk_graph::node::NodeOutput;
+    /// use adk_graph::retry::RetryPolicy;
+    ///
+    /// let graph = StateGraph::with_channels(&["value"])
+    ///     .add_node_fn("fetch", |_ctx| async move { Ok(NodeOutput::new()) })
+    ///     .add_edge(START, "fetch")
+    ///     .add_edge("fetch", END)
+    ///     .compile()?
+    ///     // Every node retries three times, unless it says otherwise.
+    ///     .with_node_defaults(NodeDefaults::new().with_retry(RetryPolicy::new(3)))
+    ///     // And this one gets five.
+    ///     .with_node_retry("fetch", RetryPolicy::new(5));
+    /// # let _ = graph;
+    /// # Ok::<(), adk_graph::error::GraphError>(())
+    /// ```
+    pub fn with_node_defaults(mut self, defaults: NodeDefaults) -> Self {
+        if let Some(retry) = defaults.retry {
+            self.default_retry = Some(retry);
+        }
+        if let Some(timeout) = defaults.timeout {
+            self.default_timeout = Some(timeout);
+        }
+        if let Some(handler) = defaults.error_handler {
+            self.default_error_handler = Some(handler);
+        }
+        self
+    }
+
+    /// Handles one node's failure instead of ending the run.
+    ///
+    /// Called once the node's retry budget is spent. The handler receives the node
+    /// name, the error, and the state as it stands, and returns the updates to
+    /// apply — typically recording what failed and naming a recovery node with
+    /// [`NodeOutput::with_goto`](crate::node::NodeOutput::with_goto). Returning
+    /// `Err` ends the run.
+    ///
+    /// An interrupt is never routed here: a pause is not a failure.
+    pub fn with_node_error_handler<F>(mut self, node: &str, handler: F) -> Self
+    where
+        F: Fn(&str, &GraphError, &State) -> Result<crate::node::NodeOutput> + Send + Sync + 'static,
+    {
+        self.error_handlers.insert(node.to_string(), Arc::new(handler));
+        self
+    }
+
+    /// Whether this graph holds a checkpointer.
+    pub fn has_checkpointer(&self) -> bool {
+        self.checkpointer.is_some()
+    }
+
+    /// Whether this graph declares any static interrupt gate.
+    ///
+    /// A dynamic interrupt cannot be seen from the graph, because a node decides
+    /// at run time, so this reports only the declared gates.
+    pub fn can_pause(&self) -> bool {
+        !self.interrupt_before.is_empty() || !self.interrupt_after.is_empty()
+    }
+
+    /// The failure handler for a node, per-node first, then the graph default.
+    pub(crate) fn error_handler_for(&self, node: &str) -> Option<&NodeErrorHandler> {
+        self.error_handlers.get(node).or(self.default_error_handler.as_ref())
+    }
+
+    /// Attach a retry policy to one node.
+    ///
+    /// A node with no policy is attempted once, which is the behaviour of a graph
+    /// that configures none.
+    pub fn with_node_retry(mut self, node: &str, policy: crate::retry::RetryPolicy) -> Self {
+        self.retry_policies.insert(node.to_string(), policy);
+        self
+    }
+
+    /// A node by name, for a caller that needs to run one on its own.
+    pub fn node(&self, name: &str) -> Option<Arc<dyn Node>> {
+        self.nodes.get(name).cloned()
+    }
+
+    /// The declared state channel names, sorted.
+    pub fn state_channels(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.schema.channels.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The retry policy for a node.
+    ///
+    /// The per-node policy wins; otherwise the graph's default applies. `None`
+    /// when neither is set, which means one attempt.
+    pub(crate) fn retry_policy_for(&self, node: &str) -> Option<&crate::retry::RetryPolicy> {
+        self.retry_policies.get(node).or(self.default_retry.as_ref())
+    }
+
     /// Get the effective timeout policy for a node.
     ///
     /// Returns the per-node policy if one was configured via
@@ -303,42 +650,92 @@ impl CompiledGraph {
     }
 
     /// Get next nodes after executing the given nodes
-    pub fn get_next_nodes(&self, executed: &[String], state: &State) -> Vec<String> {
+    /// # Errors
+    ///
+    /// Returns [`GraphError::UnknownRouteTarget`] when a router answers with a
+    /// key that is not among the declared targets. A route to `END` is declared,
+    /// so it is not an error; a key nobody declared is, because the branch would
+    /// otherwise stop and the run would report success having skipped the work.
+    pub fn get_next_nodes(&self, executed: &[String], state: &State) -> Result<Vec<String>> {
         let mut next = Vec::new();
 
         for edge in &self.edges {
             match edge {
                 Edge::Direct { source, target: EdgeTarget::Node(n) }
-                    if executed.contains(source) =>
+                    if executed.contains(source) && !next.contains(n) =>
                 {
-                    if !next.contains(n) {
-                        next.push(n.clone());
-                    }
+                    next.push(n.clone());
                 }
                 Edge::Conditional { source, router, targets } if executed.contains(source) => {
                     let route = router(state);
-                    if let Some(EdgeTarget::Node(n)) = targets.get(&route)
-                        && !next.contains(n)
-                    {
-                        next.push(n.clone());
+                    match targets.get(&route) {
+                        Some(EdgeTarget::Node(n)) if !next.contains(n) => next.push(n.clone()),
+                        // Declared, and either already queued or the end of this branch.
+                        Some(_) => {}
+                        None => {
+                            return Err(GraphError::UnknownRouteTarget(format!(
+                                "node '{source}' routed to '{route}', which is not a declared target. Declared: {declared:?}",
+                                declared = {
+                                    let mut keys: Vec<&str> =
+                                        targets.keys().map(String::as_str).collect();
+                                    keys.sort_unstable();
+                                    keys
+                                }
+                            )));
+                        }
                     }
-                    // If route leads to END or not found in targets, next will be empty for this path
                 }
                 _ => {}
             }
         }
 
-        next
+        Ok(next)
+    }
+
+    /// Reports the conditional dispatches the executed nodes produce.
+    ///
+    /// Only conditional edges appear: a direct edge involves no decision. Used
+    /// for [`StreamEvent::RouteDispatched`](crate::stream::StreamEvent::RouteDispatched),
+    /// and called only when a caller asked for the debug stream, so a router is
+    /// not evaluated again on the common path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::UnknownRouteTarget`] on an undeclared route key,
+    /// matching [`Self::get_next_nodes`].
+    pub fn route_dispatches(
+        &self,
+        executed: &[String],
+        state: &State,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let mut dispatches = Vec::new();
+        for edge in &self.edges {
+            if let Edge::Conditional { source, router, targets } = edge
+                && executed.contains(source)
+            {
+                let route = router(state);
+                match targets.get(&route) {
+                    Some(EdgeTarget::Node(n)) => {
+                        dispatches.push((source.clone(), vec![n.clone()]));
+                    }
+                    Some(_) => dispatches.push((source.clone(), Vec::new())),
+                    None => {
+                        return Err(GraphError::UnknownRouteTarget(format!(
+                            "node '{source}' routed to '{route}', which is not a declared target"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(dispatches)
     }
 
     /// Check if any of the executed nodes lead to END
     pub fn leads_to_end(&self, executed: &[String], state: &State) -> bool {
         for edge in &self.edges {
             match edge {
-                Edge::Direct { source, target } if executed.contains(source) => {
-                    if target.is_end() {
-                        return true;
-                    }
+                Edge::Direct { source, target } if executed.contains(source) && target.is_end() => {
+                    return true;
                 }
                 Edge::Conditional { source, router, targets } if executed.contains(source) => {
                     let route = router(state);
@@ -462,11 +859,11 @@ mod tests {
         // Test routing
         let mut state = State::new();
         state.insert("next".to_string(), json!("path_a"));
-        let next = graph.get_next_nodes(&["router".to_string()], &state);
+        let next = graph.get_next_nodes(&["router".to_string()], &state).unwrap();
         assert_eq!(next, vec!["path_a".to_string()]);
 
         state.insert("next".to_string(), json!("path_b"));
-        let next = graph.get_next_nodes(&["router".to_string()], &state);
+        let next = graph.get_next_nodes(&["router".to_string()], &state).unwrap();
         assert_eq!(next, vec!["path_b".to_string()]);
     }
 }

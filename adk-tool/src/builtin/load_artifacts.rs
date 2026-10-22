@@ -78,7 +78,7 @@ impl Tool for LoadArtifactsTool {
                             "type": "text",
                             "text": text,
                         }),
-                        adk_core::Part::InlineData { mime_type, data } => {
+                        adk_core::Part::InlineData { mime_type, data, .. } => {
                             // Base64 encode binary data for JSON transport
                             let encoded = STANDARD.encode(&data);
                             json!({

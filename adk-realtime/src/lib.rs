@@ -42,7 +42,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let model = OpenAIRealtimeModel::new(api_key, "gpt-realtime");
+//!     let model = OpenAIRealtimeModel::new(api_key, "gpt-realtime-2.1");
 //!
 //!     let agent = RealtimeAgent::builder("voice_assistant")
 //!         .model(Arc::new(model))
@@ -66,7 +66,7 @@
 //! use adk_realtime::{RealtimeModel, RealtimeConfig, ServerEvent};
 //! use adk_realtime::openai::OpenAIRealtimeModel;
 //!
-//! let model = OpenAIRealtimeModel::new(api_key, "gpt-realtime");
+//! let model = OpenAIRealtimeModel::new(api_key, "gpt-realtime-2.1");
 //! let session = model.connect(config).await?;
 //!
 //! while let Some(event) = session.next_event().await {
@@ -120,4 +120,4 @@ pub use error::{RealtimeError, Result};
 pub use events::{ClientEvent, ServerEvent, ToolCall, ToolResponse};
 pub use model::{BoxedModel, RealtimeModel};
 pub use runner::RealtimeRunner;
-pub use session::{BoxedSession, RealtimeSession, RealtimeSessionExt};
+pub use session::{BoxedSession, DisconnectReason, RealtimeSession, RealtimeSessionExt};

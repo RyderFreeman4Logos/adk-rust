@@ -21,11 +21,18 @@ graph-memory-tools = ["memory-tools", "adk-memory/graph-memory"]
 # Enable Model Context Protocol clients and local child-process transport.
 mcp = ["dep:rmcp"]
 # Enable HTTP transport for remote MCP servers (streamable HTTP)
-http-transport = ["mcp", "rmcp/transport-streamable-http-client-reqwest", "reqwest"]
+http-transport = [
+    "mcp",
+    "rmcp/transport-streamable-http-client-reqwest",
+    "reqwest",
+    "dep:reqwest-mcp",
+]
 # Enable code execution tools (CodeTool, etc.)
 code = ["dep:adk-code", "dep:adk-sandbox"]
 # Enable embedded JavaScript execution (requires boa_engine)
 code-embedded-js = ["code", "adk-code/embedded-js"]
+# Enable embedded Python execution via the Monty interpreter
+code-embedded-python = ["code", "adk-code/embedded-python"]
 # Enable Docker SDK-based persistent container execution
 code-docker = ["code", "adk-code/docker"]
 # Enable native Slack toolset (send messages, read channels, reactions, threads)
@@ -36,6 +43,10 @@ bigquery = ["dep:gcp-bigquery-client"]
 spanner = ["dep:google-cloud-spanner"]
 # Enable MCP sampling callback support (sampling/createMessage handling)
 mcp-sampling = ["mcp"]
+# Enable the Vertex AI Example Store client and few-shot retrieval provider
+example-store = ["adk-gcp", "google-cloud-auth", "reqwest"]
+# Enable the Google Agent Registry client and the agent discovery tool
+vertex-agent-registry = ["adk-gcp", "google-cloud-auth", "reqwest"]
 
 [dependencies]
 adk-core.workspace = true
@@ -46,7 +57,7 @@ tokio = { workspace = true, features = ["fs", "process", "sync", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 schemars = "1.0"
-rmcp = { version = "1.6", features = ["client", "transport-child-process"], optional = true }
+rmcp = { version = "3.1", features = ["client", "transport-child-process", "elicitation"], optional = true }
 tracing.workspace = true
 base64 = "0.22"
 uuid.workspace = true
@@ -60,10 +71,18 @@ adk-code = { workspace = true, optional = true }
 adk-sandbox = { workspace = true, optional = true }
 # Optional: HTTP client for remote MCP servers and Slack toolset
 reqwest = { workspace = true, optional = true }
+# rmcp 2.x uses reqwest 0.13 for its Streamable HTTP transport. Keep this
+# transport-specific client separate from the workspace's provider-facing
+# reqwest version until the wider workspace migration is complete.
+reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 # Optional: BigQuery toolset
 gcp-bigquery-client = { version = "0.28", optional = true }
 # Optional: Spanner toolset
 google-cloud-spanner = { version = "0.33", optional = true }
+# Optional: ADC credentials for the Vertex AI Example Store and Agent Registry clients
+google-cloud-auth = { version = "1.8", optional = true, default-features = false, features = ["default-rustls-provider"] }
+# Optional: shared Google Cloud REST plumbing for the Example Store and Agent Registry clients
+adk-gcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Internal dev-deps are path-only (no version) so cargo strips them from the
@@ -73,6 +92,11 @@ proptest = "1.5"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 adk-code = { path = "../adk-code" }
 adk-sandbox = { path = "../adk-sandbox" }
+# Server side of rmcp, used only to drive an in-process peer in the protocol
+# negotiation tests. Not a runtime dependency: adk-tool is an MCP client.
+rmcp = { version = "3.1", features = ["client", "server", "elicitation"] }
+# Mock upstream for the Example Store contract tests.
+axum = "0.8"
 
 [[test]]
 name = "mcp_server_lifecycle_integration_tests"
@@ -81,3 +105,15 @@ required-features = ["mcp"]
 [[test]]
 name = "mcp_roundtrip_property_tests"
 required-features = ["mcp"]
+
+[[test]]
+name = "example_store_contract"
+required-features = ["example-store"]
+
+[[test]]
+name = "example_store_live"
+required-features = ["example-store"]
+
+[[test]]
+name = "agent_registry_contract"
+required-features = ["vertex-agent-registry"]

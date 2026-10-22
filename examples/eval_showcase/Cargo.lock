@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adk-core"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "adk-eval"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "adk-core",
  "adk-memory",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "adk-memory"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "adk-model"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "adk-core",
  "adk-telemetry",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "adk-runner"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "adk-core",
  "adk-session",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "adk-session"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "adk-telemetry"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -671,9 +671,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.37.5"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
 ]

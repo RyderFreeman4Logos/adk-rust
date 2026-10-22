@@ -51,11 +51,11 @@ The ADK agent runtime (the `Llm` trait, tool loop, and `Runner`) uses `generateC
 
 ```toml
 # Direct client (adk-gemini)
-adk-gemini = { version = "2.0.0", features = ["interactions"] }
+adk-gemini = { version = "2.3.0", features = ["interactions"] }
 
 # Through the model facade / umbrella
-adk-model = { version = "2.0.0", features = ["gemini-interactions"] }
-adk-rust  = { version = "2.0.0", features = ["gemini-interactions"] }
+adk-model = { version = "2.3.0", features = ["gemini-interactions"] }
+adk-rust  = { version = "2.3.0", features = ["gemini-interactions"] }
 ```
 
 The feature adds **no new dependencies** and is fully additive to the existing `generateContent` API.
@@ -222,8 +222,8 @@ The transport is gated behind the `gemini-interactions` feature (forwarded from
 `adk-rust` → `adk-model` → `adk-gemini/interactions`):
 
 ```toml
-adk-model = { version = "2.0.0", features = ["gemini-interactions"] }
-adk-rust  = { version = "2.0.0", features = ["gemini-interactions"] }
+adk-model = { version = "2.3.0", features = ["gemini-interactions"] }
+adk-rust  = { version = "2.3.0", features = ["gemini-interactions"] }
 ```
 
 Flip the switch on the model and wrap it in a normal `LlmAgent` and `Runner` —
@@ -242,7 +242,7 @@ use std::sync::Arc;
 // 1. Build a Gemini model and toggle the Interactions transport.
 //    `use_interactions_api` validates the model id against the allowlist and
 //    returns `Result<Self>`, so it is fallible (`?`).
-let model = GeminiModel::new(std::env::var("GEMINI_API_KEY")?, "gemini-2.5-flash")?
+let model = GeminiModel::new(std::env::var("GEMINI_API_KEY")?, "gemini-3.7-flash")?
     .use_interactions_api(true)?;
 
 // 2. Wrap it in a normal LlmAgent — unchanged agent API.
@@ -311,7 +311,7 @@ Override any of these with `interaction_options`:
 use adk_model::gemini::{BackgroundMode, InteractionOptions};
 use std::time::Duration;
 
-let model = GeminiModel::new(api_key, "gemini-2.5-flash")?
+let model = GeminiModel::new(api_key, "gemini-3.7-flash")?
     .use_interactions_api(true)?
     .interaction_options(InteractionOptions {
         store: true,
@@ -340,7 +340,10 @@ A **model** target sets the request `model` field; an **agent** target sets the
 
 **Model targets:**
 
+- `gemini-3.7-flash`
+- `gemini-3.6-flash`
 - `gemini-3.5-flash`
+- `gemini-3.5-flash-lite`
 - `gemini-3.1-flash-lite`
 - `gemini-3.1-pro-preview`
 - `gemini-3-flash-preview`
@@ -349,6 +352,10 @@ A **model** target sets the request `model` field; an **agent** target sets the
 - `gemini-2.5-flash-lite`
 - `lyria-3-clip-preview`
 - `lyria-3-pro-preview`
+
+This is the transport's compatibility allowlist, not a recommendation list.
+New applications should start with `gemini-3.7-flash`; older and preview IDs
+remain listed because the Interactions endpoint still accepts them.
 
 **Agent targets:**
 
@@ -393,7 +400,7 @@ use std::sync::Arc;
 let search_agent = Arc::new(
     LlmAgentBuilder::new("grounded-search")
         .instruction("Answer the query using Google Search. Be factual and concise.")
-        .model(Arc::new(GeminiModel::new(&api_key, "gemini-2.5-flash")?))
+        .model(Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?))
         .tool(Arc::new(GoogleSearchTool::new()))
         .build()?,
 );
@@ -406,7 +413,7 @@ let weather_tool: Arc<dyn adk_core::Tool> = Arc::new(/* your FunctionTool */);
 
 // Now the tool set is uniform (all function tools) and the Interactions
 // transport accepts it.
-let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?.use_interactions_api(true)?;
+let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?.use_interactions_api(true)?;
 let agent = Arc::new(
     LlmAgentBuilder::new("assistant")
         .model(Arc::new(model))

@@ -102,7 +102,7 @@ async fn test_vision_streaming() {
     let content = Content {
         role: "user".to_string(),
         parts: vec![
-            Part::InlineData { mime_type: "image/jpeg".to_string(), data: image_bytes },
+            Part::inline_data("image/jpeg", image_bytes),
             Part::Text { text: "What is in this image? Answer briefly.".to_string() },
         ],
     };

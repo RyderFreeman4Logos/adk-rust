@@ -297,6 +297,52 @@ if let Some(m) = matched {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### Write Skills
+
+`SkillWriter` writes into the `.skills` directory `load_skill_index` discovers. Writes go through
+a unique sibling temporary file, are synchronized, and atomically replace the destination on Unix
+and Windows, so a crash mid-write cannot leave a half-written skill that breaks the index load.
+
+```rust
+use adk_skill::{SkillDraft, SkillWriter, load_skill_index};
+
+let root = tempfile::tempdir().unwrap();
+let writer = SkillWriter::new(root.path());
+
+writer.write(
+    &SkillDraft::new("disk-triage", "Diagnose low disk space. Use when a disk alert fires.")
+        .with_body("1. Check the largest directories.\n2. Report the growth rate.")
+        .with_tags(["ops"])
+        .with_metadata_entry("incidents", serde_json::json!(["INC-1", "INC-2"])),
+)?;
+
+let index = load_skill_index(root.path())?;
+assert!(index.find_by_name("disk-triage").is_some());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+A skill name becomes a filename, so `validate_skill_name` enforces the specification's
+`[a-z0-9-]` rule (1–64 characters, no leading or trailing hyphen). That check is also the
+path-safety boundary: `../escape` and `nested/name` are rejected before any file is touched.
+
+Use `with_metadata_entry` to record provenance. A skill an agent derived from experience should
+carry the incidents and timestamp behind it, so a change in behaviour is auditable rather than
+unexplained.
+
+### Reload After Writing
+
+`SkillInjector` holds an index snapshotted at construction, and `build_plugin` captures it by
+handle — a plugin already handed to a runner keeps using the index it was built from. To pick up
+a skill written since, call `reloaded` and rebuild the plugin from the result:
+
+```rust,ignore
+let injector = injector.reloaded()?;
+let plugin = injector.build_plugin("skills");
+```
+
+`reloaded` returns an error when the injector was built with `from_index`, since there is no root
+to rescan.
+
 ### Build A Plugin Manager
 
 ```rust
@@ -307,6 +353,53 @@ let plugin_manager = injector.build_plugin_manager("skills");
 # let _ = plugin_manager;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+## Progressive Disclosure (Google ADK-style)
+
+Enable the optional `progressive-disclosure` feature to expose skills as a
+context-aware `Toolset` rather than injecting an instruction body into every
+matching user message. It provides three always-available tools:
+
+1. `list_skills` — L1: names and descriptions only.
+2. `load_skill` — L2: loads one skill's instructions and activates its declared
+   `allowed-tools` for the next model turn.
+3. `load_skill_resource` — L3: reads a file from a skill's `references/`,
+   `assets/`, or `scripts/` directory.
+
+`SkillToolset` automatically injects the progressive-disclosure protocol into
+each model request, so individual agents do not need to repeat it in their
+instructions. The protocol is generated at runtime from the tools actually
+available to the toolset. Use `build_skill_system_instruction(...)` to generate
+a variant for a prefixed or filtered toolset, or
+`DEFAULT_SKILL_SYSTEM_INSTRUCTION` for the default exported value.
+
+The activation record contains the skill's content ID and hash, so a changed or
+removed skill cannot silently retain its old permissions. Resources require
+activation by default and reject path traversal. Set
+`ResourceAccessPolicy::GoogleCompatible` only when direct resource reads are
+required for interoperability.
+
+```rust,ignore
+use adk_core::ToolRegistry;
+use adk_skill::{SkillToolset, SkillToolsetConfig, load_skill_index};
+use std::sync::Arc;
+
+let index = Arc::new(load_skill_index(".")?);
+let skills = SkillToolset::new(index, Arc::new(my_tool_registry), SkillToolsetConfig::default());
+let agent = LlmAgent::builder().toolset(Arc::new(skills)).build()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Existing `SkillInjector` and `ContextCoordinator` APIs remain unchanged. The
+new toolset is opt-in and can coexist with them while applications migrate.
+
+When both `progressive-disclosure` and `vertex-skill-registry` are enabled,
+attach an existing `SkillRegistryClient` through
+`SkillToolset::with_registry_client`. This adds the registry's semantic
+`search_skills` tool and fetches a selected package only on `load_skill`.
+Local names still take precedence. Registry activations retain their fully
+qualified resource name and content hash, so they can be validated on later
+model turns.
 
 ## Error Model
 
@@ -324,8 +417,9 @@ Type alias: `SkillResult<T> = Result<T, SkillError>`
 
 - No embedding/vector retrieval (lexical matching only).
 - No incremental file reload API yet.
-- No remote catalog (`skills-ref`/MCP) in this crate yet.
-- No script/file reference execution layer in this crate (selection + injection only).
+- Script execution is not provided by progressive disclosure yet; use an
+  `adk-sandbox` or `adk-code` integration rather than executing skill scripts
+  directly.
 - No standard CLI for skill management (use `adk-cli` wrapper if available).
 
 ## Application Integration Patterns

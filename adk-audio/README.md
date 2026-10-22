@@ -8,14 +8,14 @@ Provides unified traits for Text-to-Speech (TTS), Speech-to-Text (STT), music ge
 
 ```toml
 [dependencies]
-adk-audio = "2.0.0"
+adk-audio = "2.3.0"
 ```
 
 Or via the umbrella crate (experimental):
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.0.0", features = ["audio"] }
+adk-rust = { version = "2.3.0", features = ["audio"] }
 ```
 
 ## Feature Flags
@@ -25,7 +25,7 @@ adk-rust = { version = "2.0.0", features = ["audio"] }
 | `tts` (default) | Cloud TTS providers (ElevenLabs, OpenAI, Gemini, Cartesia) | `reqwest`, `base64` |
 | `stt` (default) | Cloud STT providers (Whisper API, Deepgram, AssemblyAI) | `reqwest`, `tokio-tungstenite` |
 | `music` | Music generation providers | `reqwest` |
-| `fx` | DSP processors (normalizer, resampler, noise, compressor, trimmer, pitch) | `rubato`, `dasp` |
+| `fx` | DSP processors (normalizer, resampler, noise, compressor, trimmer, pitch) | None |
 | `vad` | Voice Activity Detection | `webrtc-vad` |
 | `mlx` | Local inference model loading (tokenizers + HF Hub, cross-platform) | `tokenizers`, `hf-hub` |
 | `onnx` | ONNX Runtime local inference (cross-platform) | `ort`, `tokenizers`, `hf-hub` |

@@ -10,7 +10,7 @@ pub fn adk_parts_to_a2a(
         .iter()
         .map(|part| match part {
             Part::Text { text } => Ok(crate::a2a::Part::text(text.clone())),
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 let encoded = general_purpose::STANDARD.encode(data);
                 Ok(crate::a2a::Part::file(crate::a2a::FileContent {
                     name: None,
@@ -19,7 +19,7 @@ pub fn adk_parts_to_a2a(
                     uri: None,
                 }))
             }
-            Part::FileData { mime_type, file_uri } => {
+            Part::FileData { mime_type, file_uri, .. } => {
                 // FileData contains a URI reference to a file
                 Ok(crate::a2a::Part::file(crate::a2a::FileContent {
                     name: None,
@@ -48,7 +48,7 @@ pub fn adk_parts_to_a2a(
                 // Convert thinking traces to text for A2A protocol
                 Ok(crate::a2a::Part::text(thinking.clone()))
             }
-            Part::FunctionResponse { function_response, id } => {
+            Part::FunctionResponse { function_response, id, .. } => {
                 let mut data = Map::new();
                 let mut resp_data = Map::new();
                 resp_data.insert("name".to_string(), Value::String(function_response.name.clone()));
@@ -70,6 +70,21 @@ pub fn adk_parts_to_a2a(
                 data.insert("server_tool_response".to_string(), server_tool_response.clone());
                 Ok(crate::a2a::Part::Data { data, metadata: None })
             }
+            // Embedded resources: text → text part; blob → inline file bytes.
+            Part::EmbeddedResource { resource } => match resource {
+                adk_core::EmbeddedResource::Text(text) => {
+                    Ok(crate::a2a::Part::text(text.text.clone()))
+                }
+                adk_core::EmbeddedResource::Blob(blob) => {
+                    let encoded = general_purpose::STANDARD.encode(&blob.data);
+                    Ok(crate::a2a::Part::file(crate::a2a::FileContent {
+                        name: None,
+                        mime_type: blob.mime_type.clone(),
+                        bytes: Some(encoded),
+                        uri: Some(blob.uri.clone()),
+                    }))
+                }
+            },
         })
         .collect()
 }
@@ -87,6 +102,8 @@ pub fn a2a_parts_to_adk(parts: &[crate::a2a::Part]) -> Result<Vec<Part>> {
                     Ok(Part::InlineData {
                         mime_type: file.mime_type.clone().unwrap_or_default(),
                         data,
+                        uri: file.uri.clone(),
+                        annotations: None,
                     })
                 } else {
                     Err(adk_core::AdkError::agent("File part with URI not supported"))
@@ -114,6 +131,7 @@ pub fn a2a_parts_to_adk(parts: &[crate::a2a::Part]) -> Result<Vec<Part>> {
                     Ok(Part::FunctionResponse {
                         function_response: adk_core::FunctionResponseData::new(name, response),
                         id,
+                        annotations: None,
                     })
                 } else {
                     Err(adk_core::AdkError::agent("Unknown data part format"))

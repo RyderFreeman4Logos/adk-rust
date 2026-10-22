@@ -38,7 +38,7 @@ use axum::Router;
 
 use crate::a2a::types::{AgentCapabilities, AgentCard};
 use crate::config::ServerConfig;
-use crate::rest::create_app_with_a2a;
+use crate::rest::{ServerBuilder, create_app_with_a2a};
 
 /// Convenience wrapper for quickly starting an A2A-capable server.
 ///
@@ -116,7 +116,7 @@ impl A2aServer {
 /// # Defaults
 ///
 /// - Session service: [`InMemorySessionService`]
-/// - Bind address: `0.0.0.0:8080`
+/// - Bind address: `127.0.0.1:8080` (loopback; call `bind_addr` to expose it)
 /// - Agent card name: from `agent.name()`
 /// - Agent card description: from `agent.description()`
 /// - Agent card version: `"1.0.0"`
@@ -133,6 +133,7 @@ pub struct A2aServerBuilder {
     agent_card_url: Option<String>,
     streaming_enabled: bool,
     push_notifications_enabled: bool,
+    skill_index: Option<Arc<adk_skill::SkillIndex>>,
 }
 
 impl Default for A2aServerBuilder {
@@ -140,13 +141,17 @@ impl Default for A2aServerBuilder {
         Self {
             agent: None,
             session_service: None,
-            bind_addr: "0.0.0.0:8080".to_string(),
+            // Loopback, not every interface. An A2A server executes agent and tool work, so
+            // exposing it beyond this host is a decision the operator should make explicitly
+            // — the previous default published it to the network on `build()`.
+            bind_addr: "127.0.0.1:8080".to_string(),
             agent_card_name: None,
             agent_card_description: None,
             agent_card_version: None,
             agent_card_url: None,
             streaming_enabled: true,
             push_notifications_enabled: false,
+            skill_index: None,
         }
     }
 }
@@ -170,7 +175,8 @@ impl A2aServerBuilder {
 
     /// Set the bind address for the server.
     ///
-    /// Defaults to `"0.0.0.0:8080"`.
+    /// Defaults to `"127.0.0.1:8080"` (loopback only). Pass `"0.0.0.0:8080"` to
+    /// accept connections on every interface.
     pub fn bind_addr(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -221,6 +227,28 @@ impl A2aServerBuilder {
     /// Defaults to `false`.
     pub fn push_notifications(mut self, enabled: bool) -> Self {
         self.push_notifications_enabled = enabled;
+        self
+    }
+
+    /// Expose the skills in `skill_index` on the served agent card.
+    ///
+    /// The card at `/.well-known/agent.json` appends one `skills[]` entry per
+    /// indexed skill, mapped by
+    /// [`agent_skills_from_index`](crate::a2a::agent_skills_from_index).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    ///
+    /// let index = adk_skill::load_skill_index(".")?;
+    /// let server = A2aServer::builder()
+    ///     .agent(my_agent)
+    ///     .skill_index(Arc::new(index))
+    ///     .build()?;
+    /// ```
+    pub fn skill_index(mut self, skill_index: Arc<adk_skill::SkillIndex>) -> Self {
+        self.skill_index = Some(skill_index);
         self
     }
 
@@ -279,7 +307,14 @@ impl A2aServerBuilder {
             self.push_notifications_enabled,
         );
 
-        let router = create_app_with_a2a(config, Some(&base_url));
+        let router = match self.skill_index {
+            // `ServerBuilder` with only A2A enabled builds the same router as
+            // `create_app_with_a2a`, and is the wiring path for indexed skills.
+            Some(skill_index) => {
+                ServerBuilder::new(config).with_a2a(&base_url).with_skill_index(skill_index).build()
+            }
+            None => create_app_with_a2a(config, Some(&base_url)),
+        };
 
         Ok(A2aServerApp { router, bind_addr: self.bind_addr })
     }
@@ -446,7 +481,9 @@ mod tests {
     #[test]
     fn test_builder_defaults() {
         let builder = A2aServer::builder();
-        assert_eq!(builder.bind_addr, "0.0.0.0:8080");
+        // Loopback, deliberately. An A2A server runs agent and tool work, so publishing it
+        // to every interface is an explicit `bind_addr` call, not a default.
+        assert_eq!(builder.bind_addr, "127.0.0.1:8080");
         assert!(builder.streaming_enabled);
         assert!(!builder.push_notifications_enabled);
         assert!(builder.agent.is_none());
@@ -482,7 +519,7 @@ mod tests {
         let result = A2aServer::builder().agent(agent).build();
         assert!(result.is_ok());
         let app = result.unwrap();
-        assert_eq!(app.bind_addr(), "0.0.0.0:8080");
+        assert_eq!(app.bind_addr(), "127.0.0.1:8080", "the default must stay on loopback");
     }
 
     #[test]

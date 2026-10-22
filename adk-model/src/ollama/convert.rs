@@ -1,5 +1,7 @@
 //! Type conversions between ADK core types and ollama-rs types.
 
+use std::collections::HashSet;
+
 use crate::attachment;
 use adk_core::{Content, FinishReason, LlmResponse, Part, UsageMetadata};
 use ollama_rs::generation::chat::{ChatMessage, ChatMessageResponse};
@@ -13,10 +15,10 @@ pub fn content_to_chat_message(content: &Content) -> Option<ChatMessage> {
         .filter_map(|p| match p {
             Part::Text { text } => Some(text.clone()),
             Part::Thinking { thinking, .. } => Some(thinking.clone()),
-            Part::InlineData { mime_type, data } => {
+            Part::InlineData { mime_type, data, .. } => {
                 Some(attachment::inline_attachment_to_text(mime_type, data))
             }
-            Part::FileData { mime_type, file_uri } => {
+            Part::FileData { mime_type, file_uri, .. } => {
                 Some(attachment::file_attachment_to_text(mime_type, file_uri))
             }
             _ => None,
@@ -53,7 +55,13 @@ pub fn content_to_chat_message(content: &Content) -> Option<ChatMessage> {
 }
 
 /// Convert Ollama ChatMessageResponse to ADK LlmResponse.
-pub fn chat_response_to_llm_response(response: &ChatMessageResponse, partial: bool) -> LlmResponse {
+///
+/// Text-encoded tool calls are recognised only for tools in `declared_tools`.
+pub fn chat_response_to_llm_response(
+    response: &ChatMessageResponse,
+    partial: bool,
+    declared_tools: &HashSet<String>,
+) -> LlmResponse {
     let mut parts = Vec::new();
 
     // Extract thinking content if present
@@ -68,9 +76,10 @@ pub fn chat_response_to_llm_response(response: &ChatMessageResponse, partial: bo
         // Check for text-based tool calls (Qwen, Llama, Mistral Nemo format)
         // as a fallback when Ollama doesn't parse them natively
         if response.message.tool_calls.is_empty() {
-            if let Some(parsed_parts) =
-                crate::tool_call_parser::parse_text_tool_calls(&response.message.content)
-            {
+            if let Some(parsed_parts) = crate::tool_call_parser::parse_declared_tool_calls(
+                &response.message.content,
+                declared_tools,
+            ) {
                 parts.extend(parsed_parts);
             } else {
                 parts.push(Part::Text { text: response.message.content.clone() });
@@ -166,10 +175,7 @@ mod tests {
     fn content_to_chat_message_keeps_inline_attachment_payload() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::InlineData {
-                mime_type: "application/pdf".to_string(),
-                data: b"%PDF".to_vec(),
-            }],
+            parts: vec![Part::inline_data("application/pdf", b"%PDF".to_vec())],
         };
         let message = content_to_chat_message(&content).expect("message should be created");
         assert!(message.content.contains("application/pdf"));
@@ -180,10 +186,7 @@ mod tests {
     fn content_to_chat_message_keeps_file_attachment_payload() {
         let content = Content {
             role: "user".to_string(),
-            parts: vec![Part::FileData {
-                mime_type: "text/csv".to_string(),
-                file_uri: "https://example.com/data.csv".to_string(),
-            }],
+            parts: vec![Part::file_data("text/csv", "https://example.com/data.csv")],
         };
         let message = content_to_chat_message(&content).expect("message should be created");
         assert!(message.content.contains("text/csv"));

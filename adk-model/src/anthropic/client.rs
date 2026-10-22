@@ -6,22 +6,19 @@ use super::error::AnthropicApiError;
 use super::rate_limit::RateLimitInfo;
 use super::schema_adapter::AnthropicSchemaAdapter;
 use crate::retry::{RetryConfig, ServerRetryHint, execute_with_retry, is_retryable_model_error};
-use adk_anthropic::{
-    Anthropic, ContentBlock, ContentBlockDelta, ContentBlockDeltaEvent, MessageStreamEvent,
-    StopReason, TextDelta,
-};
+use adk_anthropic::{Anthropic, ContentBlock};
+#[cfg(test)]
+use adk_anthropic::{ContentBlockDelta, ContentBlockDeltaEvent, MessageStreamEvent, TextDelta};
 use adk_core::{
-    AdkError, ErrorCategory, ErrorComponent, FinishReason, Llm, LlmRequest, Part, SchemaAdapter,
-    SchemaCache,
+    AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest, Part, SchemaAdapter, SchemaCache,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
-use std::pin::pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::Span;
 use tracing::field;
-use tracing::{Span, debug};
 
 /// Anthropic client for Claude models.
 pub struct AnthropicClient {
@@ -35,10 +32,42 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
+    fn rejects_sampling(model: &str) -> bool {
+        [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+        ]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+    }
+
+    fn supports_fast_mode(model: &str) -> bool {
+        model.starts_with("claude-opus-5") || model.starts_with("claude-opus-4-8")
+    }
+
     /// Create a new Anthropic client.
     pub fn new(config: AnthropicConfig) -> Result<Self, AdkError> {
-        let client = Anthropic::new(Some(config.api_key.clone()))
-            .map_err(|e| AdkError::model(format!("Failed to create Anthropic client: {e}")))?;
+        crate::catalog::warn_if_obsolete("anthropic", &config.model);
+        let mut client = match &config.base_url {
+            // `with_base_url` validates when called, so the opt-in has to precede it;
+            // the public endpoint only satisfies the explicit constructor.
+            Some(base_url) if config.allow_insecure_http => {
+                Anthropic::new_with_base_url(config.api_key.clone(), "https://api.anthropic.com")
+                    .and_then(|client| client.allow_insecure_http().with_base_url(base_url.clone()))
+            }
+            Some(base_url) => {
+                Anthropic::new_with_base_url(config.api_key.clone(), base_url.clone())
+            }
+            None => Anthropic::new(Some(config.api_key.clone())),
+        }
+        .map_err(|e| AdkError::model(format!("Failed to create Anthropic client: {e}")))?;
+        // This adapter owns retries; do not nest the SDK's independent retry loop.
+        client = client.with_max_retries(0);
 
         Ok(Self {
             client,
@@ -52,7 +81,7 @@ impl AnthropicClient {
 
     /// Create a client with just an API key (uses default model).
     pub fn from_api_key(api_key: impl Into<String>) -> Result<Self, AdkError> {
-        Self::new(AnthropicConfig::new(api_key, "claude-sonnet-4-6"))
+        Self::new(AnthropicConfig::new(api_key, crate::catalog::ANTHROPIC_DEFAULT))
     }
 
     /// Access the underlying `adk_anthropic::Anthropic` HTTP client.
@@ -67,6 +96,30 @@ impl AnthropicClient {
     /// ```
     pub fn inner(&self) -> &adk_anthropic::Anthropic {
         &self.client
+    }
+
+    /// Adds default HTTP headers while preserving authentication and automatic beta headers.
+    ///
+    /// Headers with the same name replace the existing default value. This method only
+    /// stores the headers on the existing client, so unlike the OpenAI clients'
+    /// `with_default_headers` it cannot fail and returns `Self`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_anthropic::{HeaderMap, HeaderValue};
+    /// use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("x-session-id", HeaderValue::from_static("conversation-1"));
+    /// let client = AnthropicClient::new(AnthropicConfig::new("api-key", "claude-sonnet-4-6"))?
+    ///     .with_default_headers(headers);
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    #[must_use]
+    pub fn with_default_headers(mut self, headers: adk_anthropic::HeaderMap) -> Self {
+        self.client = self.client.with_default_headers(headers);
+        self
     }
 
     /// Access the current Anthropic configuration.
@@ -106,6 +159,48 @@ impl AnthropicClient {
         request: &LlmRequest,
         anthropic_config: &super::config::AnthropicConfig,
     ) -> Result<adk_anthropic::MessageCreateParams, AdkError> {
+        if Self::rejects_sampling(model) {
+            let sampling = request.config.as_ref().is_some_and(|config| {
+                config.temperature.is_some() || config.top_p.is_some() || config.top_k.is_some()
+            });
+            if sampling {
+                return Err(AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::InvalidInput,
+                    "model.anthropic.claude5_sampling_unsupported",
+                    format!(
+                        "model '{model}' rejects explicit temperature, top_p, and top_k values; remove sampling parameters and use adaptive thinking effort instead"
+                    ),
+                )
+                .with_provider("anthropic"));
+            }
+            if matches!(
+                anthropic_config.thinking,
+                Some(super::config::ThinkingMode::Enabled { .. })
+            ) {
+                return Err(AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::InvalidInput,
+                    "model.anthropic.claude5_manual_thinking_unsupported",
+                    format!(
+                        "model '{model}' rejects budget-based extended thinking; use ThinkingMode::Adaptive with an effort level"
+                    ),
+                )
+                .with_provider("anthropic"));
+            }
+        }
+        if anthropic_config.fast_mode && !Self::supports_fast_mode(model) {
+            return Err(AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::InvalidInput,
+                "model.anthropic.fast_mode_unsupported",
+                format!(
+                    "model '{model}' does not support Anthropic fast mode; use claude-opus-5 or claude-opus-4-8, or disable fast_mode"
+                ),
+            )
+            .with_provider("anthropic"));
+        }
+
         let mut system_parts: Vec<String> = Vec::new();
         let mut messages = Vec::new();
 
@@ -186,7 +281,8 @@ impl AnthropicClient {
             } else {
                 use std::sync::LazyLock;
                 static ADAPTER: AnthropicSchemaAdapter = AnthropicSchemaAdapter;
-                static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(SchemaCache::new);
+                static SCHEMA_CACHE: LazyLock<SchemaCache> =
+                    LazyLock::new(|| SchemaCache::for_adapter(Arc::new(AnthropicSchemaAdapter)));
                 convert::convert_tools(&filtered_tools, &ADAPTER, &SCHEMA_CACHE)?
             }
         };
@@ -218,7 +314,9 @@ impl AnthropicClient {
         }
 
         // Requirement 7.3: Force temperature to 1.0 when thinking is enabled
-        let temperature = if anthropic_config.thinking.is_some() {
+        let temperature = if Self::rejects_sampling(model) {
+            None
+        } else if anthropic_config.thinking.is_some() {
             Some(1.0)
         } else {
             request.config.as_ref().and_then(|c| c.temperature)
@@ -355,10 +453,12 @@ fn merge_consecutive_messages(messages: &mut Vec<adk_anthropic::MessageParam>) {
 /// structured context (error type, message, status code, request ID).
 ///
 /// The resulting `AnthropicApiError` is then converted to `AdkError` via its
-/// `From` impl. The request ID, when present, is also recorded on the current
-/// tracing span as `anthropic.request_id` (Requirement 4.2).
+/// `From` impl, carrying any server `Retry-After` delay as the retry hint. The
+/// request ID, when present, is also recorded on the current tracing span as
+/// `anthropic.request_id` (Requirement 4.2).
 pub(super) fn convert_anthropic_error(e: adk_anthropic::Error) -> AdkError {
     let api_error = to_anthropic_api_error(&e);
+    let retry_after = extract_retry_hint(&e).and_then(|hint| hint.retry_after);
 
     // Requirement 4.2: record request-id on the active tracing span when present
     if let Some(ref rid) = api_error.request_id {
@@ -373,7 +473,7 @@ pub(super) fn convert_anthropic_error(e: adk_anthropic::Error) -> AdkError {
         "anthropic api error"
     );
 
-    api_error.into()
+    crate::retry::with_retry_after(api_error.into(), retry_after)
 }
 
 /// Build an [`AnthropicApiError`] from an `adk_anthropic::Error`, extracting the
@@ -382,7 +482,7 @@ pub(super) fn convert_anthropic_error(e: adk_anthropic::Error) -> AdkError {
 ///
 /// Requirements 4.1, 4.2, 4.4: Parse structured error body fields and
 /// capture the request-id header value.
-fn to_anthropic_api_error(e: &adk_anthropic::Error) -> AnthropicApiError {
+pub(super) fn to_anthropic_api_error(e: &adk_anthropic::Error) -> AnthropicApiError {
     match e {
         adk_anthropic::Error::Api { status_code, error_type, message, request_id } => {
             AnthropicApiError {
@@ -459,7 +559,6 @@ fn to_anthropic_api_error(e: &adk_anthropic::Error) -> AnthropicApiError {
 
 /// Extract a [`ServerRetryHint`] from an `adk_anthropic::Error`, if the error
 /// contains a server-provided `retry_after` value.
-#[allow(dead_code)]
 fn extract_retry_hint(e: &adk_anthropic::Error) -> Option<ServerRetryHint> {
     match e {
         adk_anthropic::Error::RateLimit { retry_after: Some(secs), .. }
@@ -522,226 +621,9 @@ impl Llm for AnthropicClient {
                 })
                 .await?;
 
-                // Pin the stream for iteration
-                let mut pinned_stream = pin!(event_stream);
-
-                // Track tool calls being built
-                let mut current_tool_calls: Vec<(String, String, String)> = Vec::new(); // (id, name, args_json)
-                let mut current_tool_index: Option<usize> = None;
-                let mut pending_server_parts: Vec<Part> = Vec::new();
-
-                // Track usage from MessageStart for propagation to final MessageDelta
-                let mut stream_input_tokens: i32 = 0;
-                let mut stream_cache_read_tokens: Option<i32> = None;
-                let mut stream_cache_creation_tokens: Option<i32> = None;
-
-                while let Some(event_result) = pinned_stream.next().await {
-                    // Requirement 3.4: Handle error events from the stream.
-                    // The adk-anthropic SSE parser converts `event: error` into stream Err values
-                    // with structured error info. We emit these as LlmResponse with error fields
-                    // rather than propagating as AdkError.
-                    let event = match event_result {
-                        Ok(ev) => ev,
-                        Err(ref e) => {
-                            // Requirement 4.2: extract request-id from stream errors
-                            let api_err = to_anthropic_api_error(e);
-                            if let Some(ref rid) = api_err.request_id {
-                                Span::current().record("anthropic.request_id", rid.as_str());
-                            }
-                            // Requirement 11.4: Record error details as a span event
-                            tracing::error!(
-                                error.type_ = %api_err.error_type,
-                                error.message = %api_err.message,
-                                error.status_code = api_err.status_code,
-                                "anthropic stream error"
-                            );
-                            yield convert::from_stream_error(&api_err.error_type, &api_err.message);
-                            continue;
-                        }
-                    };
-
-                    match event {
-                        MessageStreamEvent::ContentBlockStart(start_event) => {
-                            // Check if this is a tool_use block
-                            let index = start_event.index;
-                            match start_event.content_block {
-                                ContentBlock::ToolUse(tool_use) => {
-                                    current_tool_index = Some(index);
-                                    while current_tool_calls.len() <= index {
-                                        current_tool_calls
-                                            .push((String::new(), String::new(), String::new()));
-                                    }
-                                    current_tool_calls[index] = (
-                                        tool_use.id.clone(),
-                                        tool_use.name.clone(),
-                                        String::new(),
-                                    );
-                                }
-                                ContentBlock::ServerToolUse(server_tool_use) => {
-                                    if let Ok(val) = serde_json::to_value(server_tool_use) {
-                                        pending_server_parts
-                                            .push(Part::ServerToolCall { server_tool_call: val });
-                                    }
-                                }
-                                ContentBlock::WebSearchToolResult(web_search_result) => {
-                                    if let Ok(val) = serde_json::to_value(web_search_result) {
-                                        pending_server_parts.push(Part::ServerToolResponse {
-                                            server_tool_response: val,
-                                        });
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        MessageStreamEvent::ContentBlockDelta(ContentBlockDeltaEvent { index, delta }) => {
-                            match delta {
-                                ContentBlockDelta::TextDelta(TextDelta { text }) => {
-                                    if !text.is_empty() {
-                                        yield convert::from_text_delta(&text);
-                                    }
-                                }
-                                ContentBlockDelta::InputJsonDelta(json_delta) => {
-                                    // Accumulate tool call arguments
-                                    if let Some(idx) = current_tool_index {
-                                        if idx < current_tool_calls.len() {
-                                            current_tool_calls[idx].2.push_str(&json_delta.partial_json);
-                                        }
-                                    } else if index < current_tool_calls.len() {
-                                        current_tool_calls[index].2.push_str(&json_delta.partial_json);
-                                    }
-                                }
-                                // Requirement 3.1: Emit thinking deltas wrapped in <thinking> tags
-                                ContentBlockDelta::ThinkingDelta(td) => {
-                                    if !td.thinking.is_empty() {
-                                        yield convert::from_thinking_delta(&td.thinking);
-                                    }
-                                }
-                                // Requirement 3.2: Accumulate signature deltas silently
-                                ContentBlockDelta::SignatureDelta(_) => {}
-                                // Requirement 3.5: Log unrecognized deltas at debug level
-                                ContentBlockDelta::CitationsDelta(cd) => {
-                                    debug!(?cd, "citations delta received (not yet mapped)");
-                                }
-                            }
-                        }
-                        MessageStreamEvent::ContentBlockStop { .. } => {
-                            current_tool_index = None;
-                        }
-                        MessageStreamEvent::MessageDelta(delta_event) => {
-                            // Check for stop reason
-                            if let Some(stop_reason) = &delta_event.delta.stop_reason {
-                                let finish_reason = match stop_reason {
-                                    StopReason::EndTurn => Some(FinishReason::Stop),
-                                    StopReason::MaxTokens => Some(FinishReason::MaxTokens),
-                                    StopReason::StopSequence => Some(FinishReason::Stop),
-                                    StopReason::ToolUse => Some(FinishReason::Stop),
-                                    StopReason::PauseTurn => Some(FinishReason::Stop),
-                                    StopReason::Refusal => Some(FinishReason::Safety),
-                                    StopReason::PauseRun => Some(FinishReason::Stop),
-                                    StopReason::ModelContextWindowExceeded => Some(FinishReason::MaxTokens),
-                                };
-
-                                // If we have accumulated tool calls, emit them
-                                let mut parts = std::mem::take(&mut pending_server_parts);
-                                if !current_tool_calls.is_empty() {
-                                    let tool_calls = current_tool_calls
-                                        .drain(..)
-                                        .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
-                                        .map(|(id, name, args_str)| {
-                                            let args: serde_json::Value = serde_json::from_str(&args_str)
-                                                .unwrap_or(serde_json::json!({}));
-                                            Part::FunctionCall {
-                                                name,
-                                                args,
-                                                id: Some(id),
-                                                thought_signature: None,
-                                            }
-                                        })
-                                        .collect::<Vec<_>>();
-                                    parts.extend(tool_calls);
-                                }
-
-                                if !parts.is_empty() {
-                                    yield adk_core::LlmResponse {
-                                        content: Some(adk_core::Content {
-                                            role: "model".to_string(),
-                                            parts,
-                                        }),
-                                        usage_metadata: Some(adk_core::UsageMetadata {
-                                            prompt_token_count: stream_input_tokens,
-                                            candidates_token_count: delta_event.usage.output_tokens,
-                                            total_token_count: stream_input_tokens + delta_event.usage.output_tokens,
-                                            cache_read_input_token_count: stream_cache_read_tokens,
-                                            cache_creation_input_token_count: stream_cache_creation_tokens,
-                                            ..Default::default()
-                                        }),
-                                        finish_reason,
-                                        citation_metadata: None,
-                                        partial: false,
-                                        turn_complete: true,
-                                        interrupted: false,
-                                        error_code: None,
-                                        error_message: None,
-                                        provider_metadata: None,
-                                        interaction_id: None,
-                                    };
-                                    continue;
-                                }
-
-                                // Emit final message
-                                yield adk_core::LlmResponse {
-                                    content: None,
-                                    usage_metadata: Some(adk_core::UsageMetadata {
-                                        prompt_token_count: stream_input_tokens,
-                                        candidates_token_count: delta_event.usage.output_tokens,
-                                        total_token_count: stream_input_tokens + delta_event.usage.output_tokens,
-                                        cache_read_input_token_count: stream_cache_read_tokens,
-                                        cache_creation_input_token_count: stream_cache_creation_tokens,
-                                        ..Default::default()
-                                    }),
-                                    finish_reason,
-                                    citation_metadata: None,
-                                    partial: false,
-                                    turn_complete: true,
-                                    interrupted: false,
-                                    error_code: None,
-                                    error_message: None,
-                                    provider_metadata: None,
-                                    interaction_id: None,
-                                };
-                            }
-                        }
-                        MessageStreamEvent::MessageStop(_) => {
-                            // Stream complete
-                        }
-                        // Requirement 3.3: Treat ping as keep-alive no-op
-                        MessageStreamEvent::Ping => {}
-                        // Requirement 3.5: Log unrecognized events at debug level
-                        MessageStreamEvent::MessageStart(start_event) => {
-                            debug!("message_start event received");
-                            // Store input tokens for the final UsageMetadata
-                            stream_input_tokens = start_event.message.usage.input_tokens;
-                            // Store cache token counts for propagation to the final MessageDelta
-                            stream_cache_read_tokens = start_event.message.usage.cache_read_input_tokens;
-                            stream_cache_creation_tokens = start_event.message.usage.cache_creation_input_tokens;
-                            // Requirement 6.3: Extract cache usage from the initial message usage
-                            let cache_meta = convert::extract_cache_usage(&start_event.message.usage);
-                            if !cache_meta.is_empty() {
-                                debug!(
-                                    cache_creation = ?start_event.message.usage.cache_creation_input_tokens,
-                                    cache_read = ?start_event.message.usage.cache_read_input_tokens,
-                                    "cache usage tokens received in stream"
-                                );
-                            }
-                        }
-                        // New adk-anthropic event variants — log at debug level for now
-                        MessageStreamEvent::ToolInputStart { .. }
-                        | MessageStreamEvent::ToolInputDelta { .. }
-                        | MessageStreamEvent::CompactionEvent(_)
-                        | MessageStreamEvent::StreamError { .. } => {
-                            debug!("unhandled stream event variant received");
-                        }
-                    }
+                let mut responses = super::streaming::responses(event_stream);
+                while let Some(response) = responses.next().await {
+                    yield response?;
                 }
             } else {
                 // Non-streaming mode
@@ -768,9 +650,6 @@ impl Llm for AnthropicClient {
                 // the actual `request-id` header value.
                 Span::current().record("anthropic.request_id", message.id.as_str());
 
-                // Requirement 6.3: Extract cache usage tokens into provider metadata
-                let (_response, _cache_metadata) = convert::from_anthropic_message(&message);
-
                 yield convert::from_anthropic_message(&message).0;
             }
         };
@@ -792,6 +671,159 @@ mod tests {
             tools: std::collections::HashMap::new(),
             config: None,
             previous_response_id: None,
+        }
+    }
+
+    #[test]
+    fn retry_after_from_anthropic_errors_becomes_the_retry_hint() {
+        let rate_limited =
+            convert_anthropic_error(adk_anthropic::Error::rate_limit("slow down", Some(12)));
+        assert_eq!(rate_limited.category, ErrorCategory::RateLimited);
+        assert_eq!(rate_limited.retry.retry_after(), Some(std::time::Duration::from_secs(12)));
+
+        let overloaded =
+            convert_anthropic_error(adk_anthropic::Error::service_unavailable("busy", Some(3)));
+        assert_eq!(overloaded.category, ErrorCategory::Unavailable);
+        assert_eq!(overloaded.retry.retry_after(), Some(std::time::Duration::from_secs(3)));
+
+        let internal = convert_anthropic_error(adk_anthropic::Error::internal_server("oops", None));
+        assert!(internal.is_retryable(), "Anthropic api_error (500) is transient");
+    }
+
+    #[test]
+    fn custom_base_url_reaches_the_underlying_anthropic_client() {
+        let client = AnthropicClient::new(
+            AnthropicConfig::new("test-key", "claude-sonnet-4-6")
+                .with_base_url("https://gateway.example.test/anthropic"),
+        )
+        .unwrap();
+
+        assert_eq!(client.client.base_url(), "https://gateway.example.test/anthropic");
+    }
+
+    #[test]
+    fn cleartext_base_url_requires_the_opt_in() {
+        const GATEWAY: &str = "http://10.60.1.20:8080/api/v1/llm/anthropic";
+        let error = AnthropicClient::new(
+            AnthropicConfig::new("test-key", "claude-sonnet-5").with_base_url(GATEWAY),
+        )
+        .err()
+        .expect("a non-loopback http base URL needs allow_insecure_http");
+        assert!(error.message.contains("allow_insecure_http"), "got: {error}");
+
+        for config in [
+            AnthropicConfig::new("test-key", "claude-sonnet-5")
+                .allow_insecure_http()
+                .with_base_url(GATEWAY),
+            AnthropicConfig::new("test-key", "claude-sonnet-5")
+                .with_base_url(GATEWAY)
+                .allow_insecure_http(),
+        ] {
+            let client = AnthropicClient::new(config).unwrap();
+            assert_eq!(client.client.base_url(), GATEWAY);
+            assert_eq!(client.client.api_key(), "test-key");
+        }
+    }
+
+    #[test]
+    fn allow_insecure_http_is_omitted_from_serialized_config_by_default() {
+        let config = AnthropicConfig::new("test-key", "claude-sonnet-5");
+        let value = serde_json::to_value(&config).unwrap();
+        assert!(value.get("allow_insecure_http").is_none(), "got: {value}");
+        let restored: AnthropicConfig = serde_json::from_value(value).unwrap();
+        assert!(!restored.allow_insecure_http);
+
+        let value = serde_json::to_value(config.allow_insecure_http()).unwrap();
+        assert_eq!(value["allow_insecure_http"], true);
+        let restored: AnthropicConfig = serde_json::from_value(value).unwrap();
+        assert!(restored.allow_insecure_http);
+    }
+
+    #[test]
+    fn claude_5_rejects_sampling_before_network_io() {
+        let mut request = make_request(vec![Content::new("user").with_text("hello")]);
+        request.config =
+            Some(GenerateContentConfig { temperature: Some(0.2), ..Default::default() });
+
+        let error = AnthropicClient::build_message_params(
+            "claude-sonnet-5",
+            4096,
+            &request,
+            &AnthropicConfig::default(),
+        )
+        .expect_err("Claude 5 sampling parameters should be rejected locally");
+
+        assert_eq!(error.code, "model.anthropic.claude5_sampling_unsupported");
+    }
+
+    #[test]
+    fn claude_5_rejects_budget_thinking_before_network_io() {
+        let request = make_request(vec![Content::new("user").with_text("hello")]);
+        let config = AnthropicConfig::new("test", "claude-sonnet-5").with_thinking_mode(
+            super::super::config::ThinkingMode::Enabled { budget_tokens: 2048 },
+        );
+
+        let error =
+            AnthropicClient::build_message_params("claude-sonnet-5", 4096, &request, &config)
+                .expect_err("Claude 5 budget thinking should be rejected locally");
+
+        assert_eq!(error.code, "model.anthropic.claude5_manual_thinking_unsupported");
+    }
+
+    #[test]
+    fn claude_5_adaptive_thinking_omits_sampling() {
+        let request = make_request(vec![Content::new("user").with_text("hello")]);
+        let config = AnthropicConfig::new("test", "claude-sonnet-5")
+            .with_thinking_mode(super::super::config::ThinkingMode::Adaptive);
+
+        let params =
+            AnthropicClient::build_message_params("claude-sonnet-5", 4096, &request, &config)
+                .expect("adaptive thinking should be supported");
+
+        assert!(params.temperature.is_none());
+        assert!(matches!(params.thinking, Some(adk_anthropic::ThinkingConfig::Adaptive { .. })));
+    }
+
+    #[test]
+    fn current_claude_models_enforce_sampling_contracts() {
+        let mut request = make_request(vec![Content::new("user").with_text("hello")]);
+        request.config = Some(GenerateContentConfig { top_p: Some(0.9), ..Default::default() });
+
+        for model in [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+        ] {
+            let error = AnthropicClient::build_message_params(
+                model,
+                4096,
+                &request,
+                &AnthropicConfig::default(),
+            )
+            .expect_err("restricted sampling should be rejected locally");
+            assert_eq!(error.code, "model.anthropic.claude5_sampling_unsupported");
+        }
+    }
+
+    #[test]
+    fn fast_mode_is_limited_to_supported_opus_models() {
+        let request = make_request(vec![Content::new("user").with_text("hello")]);
+
+        for model in ["claude-sonnet-5", "claude-fable-5", "claude-mythos-5"] {
+            let config = AnthropicConfig::new("test", model).with_fast_mode(true);
+            let error = AnthropicClient::build_message_params(model, 4096, &request, &config)
+                .expect_err("unsupported fast mode should be rejected locally");
+            assert_eq!(error.code, "model.anthropic.fast_mode_unsupported");
+        }
+
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            let config = AnthropicConfig::new("test", model).with_fast_mode(true);
+            let params = AnthropicClient::build_message_params(model, 4096, &request, &config)
+                .expect("supported Opus fast mode should be accepted");
+            assert_eq!(params.speed, Some(adk_anthropic::SpeedMode::Fast));
         }
     }
 
@@ -992,6 +1024,7 @@ mod tests {
                         serde_json::json!({"result": "ok"}),
                     ),
                     id: Some("call_1".to_string()),
+                    annotations: None,
                 }],
             },
             Content {
@@ -1038,7 +1071,7 @@ mod tests {
             serde_json::json!({
                 "built_in_tools": [
                     {
-                        "type": "web_fetch_20250910"
+                        "type": "unsupported_tool_00000000"
                     }
                 ]
             }),
@@ -1148,11 +1181,7 @@ mod tests {
                 MessageStreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     delta: ContentBlockDelta::TextDelta(TextDelta { ref text }),
                     ..
-                }) => {
-                    if !text.is_empty() {
-                        responses.push(convert::from_text_delta(text));
-                    }
-                }
+                }) if !text.is_empty() => responses.push(convert::from_text_delta(text)),
                 _ => {}
             }
         }

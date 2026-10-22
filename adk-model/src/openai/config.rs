@@ -17,12 +17,52 @@ pub enum ReasoningEffort {
     High,
 }
 
+/// Complete reasoning-effort vocabulary supported across OpenAI model generations.
+///
+/// This additive type preserves the original exhaustive [`ReasoningEffort`] enum while
+/// exposing the `none`, `minimal`, `xhigh`, and `max` values used by newer models.
+/// GPT-5.6 supports every value except `minimal` through the Responses API;
+/// Chat Completions supports up to `xhigh`. Older GPT-5 models may support
+/// `minimal` but not `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAIReasoningEffort {
+    /// Disable reasoning for the lowest latency.
+    None,
+    /// Use minimal reasoning on models that retain the legacy setting.
+    Minimal,
+    /// Use low reasoning effort.
+    Low,
+    /// Use balanced reasoning effort.
+    Medium,
+    /// Use high reasoning effort.
+    High,
+    /// Use extra-high reasoning effort.
+    XHigh,
+    /// Use maximum reasoning effort on models that support it through Responses.
+    Max,
+}
+
+impl From<ReasoningEffort> for OpenAIReasoningEffort {
+    fn from(value: ReasoningEffort) -> Self {
+        match value {
+            ReasoningEffort::Low => Self::Low,
+            ReasoningEffort::Medium => Self::Medium,
+            ReasoningEffort::High => Self::High,
+        }
+    }
+}
+
 /// Configuration for OpenAI API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OpenAIConfig {
-    /// OpenAI API key.
+    /// OpenAI API key. Never serialized; deserializing a config without it
+    /// yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
-    /// Model name (e.g., "gpt-5-mini", "gpt-4-turbo").
+    /// Model name (e.g., "gpt-5.6-terra", "gpt-5.6-sol").
     pub model: String,
     /// Optional organization ID.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,11 +81,24 @@ pub struct OpenAIConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
+impl std::fmt::Debug for OpenAIConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("organization_id", &self.organization_id)
+            .field("project_id", &self.project_id)
+            .field("base_url", &self.base_url)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .finish()
+    }
+}
+
 impl Default for OpenAIConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            model: "gpt-4o-mini".to_string(),
+            model: crate::catalog::OPENAI_DEFAULT.to_string(),
             organization_id: None,
             project_id: None,
             base_url: None,
@@ -94,9 +147,13 @@ impl OpenAIConfig {
 }
 
 /// Configuration for Azure OpenAI Service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AzureConfig {
-    /// Azure OpenAI API key.
+    /// Azure OpenAI API key. Never serialized; deserializing a config without
+    /// it yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
     /// Azure resource endpoint (e.g., `https://my-resource.openai.azure.com`).
     pub api_base: String,
@@ -104,6 +161,17 @@ pub struct AzureConfig {
     pub api_version: String,
     /// Deployment name/ID.
     pub deployment_id: String,
+}
+
+impl std::fmt::Debug for AzureConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("api_base", &self.api_base)
+            .field("api_version", &self.api_version)
+            .field("deployment_id", &self.deployment_id)
+            .finish()
+    }
 }
 
 impl AzureConfig {
@@ -189,9 +257,13 @@ pub enum ReasoningSummary {
 ///     .with_reasoning_effort(ReasoningEffort::High)
 ///     .with_reasoning_summary(ReasoningSummary::Concise);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OpenAIResponsesConfig {
-    /// OpenAI API key.
+    /// OpenAI API key. Never serialized; deserializing a config without it
+    /// yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
     /// Model name (e.g., "o3", "o4-mini", "gpt-4.1").
     pub model: String,
@@ -225,6 +297,24 @@ pub struct OpenAIResponsesConfig {
     /// Open Responses-compatible endpoints (LM Studio, Ollama, vLLM).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_responses_mode: Option<bool>,
+}
+
+impl std::fmt::Debug for OpenAIResponsesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIResponsesConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("organization_id", &self.organization_id)
+            .field("project_id", &self.project_id)
+            .field("base_url", &self.base_url)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("reasoning_summary", &self.reasoning_summary)
+            .field("transport", &self.transport)
+            .field("service_tier", &self.service_tier)
+            .field("prompt_cache_retention", &self.prompt_cache_retention)
+            .field("open_responses_mode", &self.open_responses_mode)
+            .finish()
+    }
 }
 
 impl OpenAIResponsesConfig {

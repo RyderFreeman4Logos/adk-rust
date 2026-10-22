@@ -1,13 +1,15 @@
 //! Shared OpenAI-compatible provider implementation.
 
-use crate::openai::convert;
+use crate::openai::{OpenAIReasoningEffort, convert};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
+use crate::sse::take_line;
 use adk_core::{
-    AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, Llm, LlmRequest, LlmResponse,
-    LlmResponseStream, Part, SchemaAdapter, SchemaCache, UsageMetadata,
+    AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, GenericSchemaAdapter, Llm,
+    LlmRequest, LlmResponse, LlmResponseStream, Part, SchemaAdapter, SchemaCache, UsageMetadata,
 };
 use async_openai::types::chat::{
-    CreateChatCompletionRequestArgs, ReasoningEffort, ResponseFormat, ResponseFormatJsonSchema,
+    CreateChatCompletionRequestArgs, ReasoningEffort as OaiReasoningEffort, ResponseFormat,
+    ResponseFormatJsonSchema,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -15,12 +17,37 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Assistant-message field accepted by an OpenAI-compatible provider for reasoning replay.
+///
+/// Reasoning replay is disabled by default. Enabling it selects `reasoning_content`;
+/// an explicit field overrides that choice for endpoints such as newer vLLM servers.
+///
+/// # Example
+///
+/// ```
+/// use adk_model::ReasoningReplayField;
+///
+/// let field = ReasoningReplayField::ReasoningContent;
+/// assert_eq!(field, ReasoningReplayField::ReasoningContent);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReasoningReplayField {
+    /// Use the `reasoning_content` assistant-message field.
+    ReasoningContent,
+    /// Use the `reasoning` assistant-message field, as used by newer vLLM servers.
+    Reasoning,
+}
+
 /// Configuration for OpenAI-compatible providers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OpenAICompatibleConfig {
     /// Provider display name used in error messages.
     pub provider_name: String,
-    /// API key.
+    /// API key. Never serialized; deserializing a config without it yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
     /// Model name.
     pub model: String,
@@ -35,9 +62,24 @@ pub struct OpenAICompatibleConfig {
     pub project_id: Option<String>,
     /// Optional reasoning effort for OpenAI reasoning models.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<OaiReasoningEffort>,
     /// Whether to allow the model to call multiple tools in a single turn.
     pub parallel_tool_calls: bool,
+}
+
+impl std::fmt::Debug for OpenAICompatibleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAICompatibleConfig")
+            .field("provider_name", &self.provider_name)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("organization_id", &self.organization_id)
+            .field("project_id", &self.project_id)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .finish()
+    }
 }
 
 impl OpenAICompatibleConfig {
@@ -80,7 +122,7 @@ impl OpenAICompatibleConfig {
     }
 
     /// Set reasoning effort for reasoning models.
-    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+    pub fn with_reasoning_effort(mut self, effort: OaiReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self
     }
@@ -95,7 +137,7 @@ impl OpenAICompatibleConfig {
 
     /// Fireworks AI preset.
     ///
-    /// Default model: `accounts/fireworks/models/llama-v3p1-8b-instruct`
+    /// Default model: `accounts/fireworks/models/kimi-k2p6`
     pub fn fireworks(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("fireworks")
@@ -104,7 +146,7 @@ impl OpenAICompatibleConfig {
 
     /// Together AI preset.
     ///
-    /// Default model: `meta-llama/Llama-3.3-70B-Instruct-Turbo`
+    /// Default model: `MiniMaxAI/MiniMax-M2.7`
     pub fn together(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("together")
@@ -113,7 +155,7 @@ impl OpenAICompatibleConfig {
 
     /// Mistral AI preset.
     ///
-    /// Default model: `mistral-small-latest`
+    /// Default model: `mistral-medium-latest`
     pub fn mistral(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("mistral")
@@ -122,7 +164,7 @@ impl OpenAICompatibleConfig {
 
     /// Perplexity preset.
     ///
-    /// Default model: `sonar`
+    /// Default model: `sonar-pro`
     pub fn perplexity(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("perplexity")
@@ -131,7 +173,7 @@ impl OpenAICompatibleConfig {
 
     /// Cerebras preset.
     ///
-    /// Default model: `llama-3.3-70b`
+    /// Default model: `gpt-oss-120b`
     pub fn cerebras(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("cerebras")
@@ -140,7 +182,7 @@ impl OpenAICompatibleConfig {
 
     /// SambaNova preset.
     ///
-    /// Default model: `Meta-Llama-3.3-70B-Instruct`
+    /// Default model: `gpt-oss-120b`
     pub fn sambanova(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("sambanova")
@@ -149,15 +191,40 @@ impl OpenAICompatibleConfig {
 
     /// xAI (Grok) preset.
     ///
-    /// Default model: `grok-3-mini`
+    /// Default model: `grok-4.6`
     pub fn xai(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model).with_provider_name("xai").with_base_url("https://api.x.ai/v1")
+    }
+
+    /// OrcaRouter preset.
+    ///
+    /// OrcaRouter routes one OpenAI-compatible endpoint to models from several
+    /// vendors; model IDs carry a vendor prefix such as `openai/` or `anthropic/`.
+    ///
+    /// Default model suggestion: `openai/gpt-5.6-terra`
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+    ///
+    /// let config = OpenAICompatibleConfig::orcarouter("sk-orca-...", "openai/gpt-5.6-terra");
+    /// assert_eq!(config.base_url.as_deref(), Some("https://api.orcarouter.ai/v1"));
+    ///
+    /// let model = OpenAICompatible::new(config)?;
+    /// # let _ = model;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    pub fn orcarouter(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::new(api_key, model)
+            .with_provider_name("orcarouter")
+            .with_base_url("https://api.orcarouter.ai/v1")
     }
 
     /// Google Gemini (OpenAI-compatible) preset.
     ///
     /// Targets Gemini's OpenAI-compatibility endpoint, letting you use a Gemini
-    /// API key and a Gemini model (e.g. `gemini-3.5-flash`) through the OpenAI
+    /// API key and a Gemini model (e.g. `gemini-3.7-flash`) through the OpenAI
     /// Chat Completions wire format. Use a `GEMINI_API_KEY` for the `api_key`.
     ///
     /// For native Gemini features (thinking levels, server-side tools, the
@@ -165,7 +232,7 @@ impl OpenAICompatibleConfig {
     /// This preset is for callers who want a single OpenAI-compatible code path
     /// across providers.
     ///
-    /// Default model suggestion: `gemini-3.5-flash`.
+    /// Default model suggestion: `gemini-3.7-flash`.
     pub fn gemini(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("gemini")
@@ -174,7 +241,7 @@ impl OpenAICompatibleConfig {
 
     /// MiniMax preset.
     ///
-    /// Default model: `minimax-m2.7`
+    /// Default model: `MiniMax-M2.7` (case-sensitive)
     pub fn minimax(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("minimax")
@@ -192,7 +259,7 @@ impl OpenAICompatibleConfig {
 
     /// Zhipu AI (GLM) preset.
     ///
-    /// Default model: `glm-5.1`
+    /// Default model: `glm-5.2`
     pub fn zhipu(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("zhipu")
@@ -201,7 +268,7 @@ impl OpenAICompatibleConfig {
 
     /// Baidu ERNIE (Qianfan) preset via OpenAI-compatible endpoint.
     ///
-    /// Default model: `ernie-5`
+    /// Default model: `ernie-5.1`
     ///
     /// Note: Uses the Qianfan OpenAI-compatible endpoint. For the native
     /// Qianfan API with OAuth2 token exchange, use a dedicated client.
@@ -224,41 +291,180 @@ impl OpenAICompatibleConfig {
     }
 }
 
+/// Error codes a compatible client reports.
+///
+/// Native services routed through [`OpenAICompatible`] keep the codes their
+/// dedicated clients reported, because error codes are part of the public contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ErrorCodes {
+    /// Transport failure before a response arrived.
+    pub(crate) request: &'static str,
+    /// Non-success HTTP status without a status-specific code.
+    pub(crate) api_error: &'static str,
+    /// Response body that is not valid JSON.
+    pub(crate) parse: &'static str,
+    /// Tool-call arguments that are not a JSON object.
+    pub(crate) invalid_tool_arguments: &'static str,
+    /// Status-specific codes that take precedence over `api_error`.
+    pub(crate) status: &'static [(u16, &'static str)],
+}
+
+impl ErrorCodes {
+    /// Codes for providers reached through the generic compatible client.
+    pub(crate) const COMPATIBLE: Self = Self {
+        request: "model.openai_compat.request",
+        api_error: "model.openai_compat.api_error",
+        parse: "model.openai_compat.parse",
+        invalid_tool_arguments: "model.openai_compat.invalid_tool_arguments",
+        status: &[],
+    };
+
+    fn for_status(&self, status: u16) -> &'static str {
+        self.status
+            .iter()
+            .find_map(|(candidate, code)| (*candidate == status).then_some(*code))
+            .unwrap_or(self.api_error)
+    }
+}
+
 /// Shared OpenAI-compatible client implementation.
 pub struct OpenAICompatible {
+    completion_url: Option<String>,
     http: reqwest::Client,
+    /// Headers added to every request, kept so later calls extend rather than replace them.
+    default_headers: http::HeaderMap,
+    request_adapter: Option<crate::openai::RequestAdapter>,
     api_key: String,
     base_url: String,
     model: String,
     provider_name: String,
     retry_config: RetryConfig,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<OpenAIReasoningEffort>,
     organization_id: Option<String>,
     parallel_tool_calls: bool,
+    reasoning_replay_field: Option<ReasoningReplayField>,
+    error_codes: ErrorCodes,
 }
 
 impl OpenAICompatible {
     /// Create a new OpenAI-compatible client.
     pub fn new(config: OpenAICompatibleConfig) -> Result<Self, AdkError> {
+        let reasoning_effort = config.reasoning_effort.clone().map(|effort| match effort {
+            OaiReasoningEffort::None => OpenAIReasoningEffort::None,
+            OaiReasoningEffort::Minimal => OpenAIReasoningEffort::Minimal,
+            OaiReasoningEffort::Low => OpenAIReasoningEffort::Low,
+            OaiReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
+            OaiReasoningEffort::High => OpenAIReasoningEffort::High,
+            OaiReasoningEffort::Xhigh => OpenAIReasoningEffort::XHigh,
+        });
+        Self::new_with_reasoning_effort(config, reasoning_effort)
+    }
+
+    /// Create an OpenAI-compatible client with the complete OpenAI reasoning vocabulary.
+    ///
+    /// This supports newer values such as `none`, `xhigh`, and `max` without changing
+    /// the backward-compatible [`OpenAICompatibleConfig::reasoning_effort`] field type.
+    pub fn new_with_reasoning_effort(
+        config: OpenAICompatibleConfig,
+        reasoning_effort: Option<OpenAIReasoningEffort>,
+    ) -> Result<Self, AdkError> {
+        crate::catalog::warn_if_obsolete(&config.provider_name, &config.model);
         let base_url = config.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            completion_url: None,
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| AdkError::model("failed to initialize compatible HTTP transport"))?,
+            default_headers: http::HeaderMap::new(),
+            request_adapter: None,
             api_key: config.api_key,
             base_url,
             model: config.model,
             provider_name: config.provider_name,
             retry_config: RetryConfig::default(),
-            reasoning_effort: config.reasoning_effort,
+            reasoning_effort,
             organization_id: config.organization_id,
             parallel_tool_calls: config.parallel_tool_calls,
+            reasoning_replay_field: None,
+            error_codes: ErrorCodes::COMPATIBLE,
         })
+    }
+
+    /// Adds default HTTP headers to every request, replacing earlier defaults with the same name.
+    ///
+    /// The bearer token and organization headers set per request take precedence, and
+    /// redirects stay disabled. Unlike builder methods that only store a value, this
+    /// method rebuilds the underlying `reqwest` client, so it returns `Result`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+    /// use http::header::{HeaderMap, HeaderValue};
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("x-session-id", HeaderValue::from_static("conversation-1"));
+    /// let client = OpenAICompatible::new(OpenAICompatibleConfig::new("api-key", "model"))?
+    ///     .with_default_headers(headers)?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Internal` error with code `model.openai.http_client_init` when the
+    /// HTTP client cannot be built.
+    pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Result<Self, AdkError> {
+        self.default_headers.extend(headers);
+        self.http = reqwest::Client::builder()
+            .default_headers(self.default_headers.clone())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| {
+                AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::Internal,
+                    "model.openai.http_client_init",
+                    format!("failed to initialize the {} HTTP client: {err}", self.provider_name),
+                )
+                .with_provider(&self.provider_name)
+                .with_source(err)
+            })?;
+        Ok(self)
     }
 
     /// Set the retry configuration (builder pattern).
     #[must_use]
     pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
+        self
+    }
+
+    /// Customize generation request fields and headers before each HTTP attempt.
+    ///
+    /// The adapter runs under this client's [`RetryConfig`]; see
+    /// [`RequestAdapter`](crate::openai::RequestAdapter) for an example.
+    #[must_use]
+    pub fn with_request_adapter(mut self, adapter: crate::openai::RequestAdapter) -> Self {
+        self.request_adapter = Some(adapter);
+        self
+    }
+
+    /// Use a native service's fully qualified Chat Completions route.
+    pub(crate) fn with_completion_url(mut self, url: String) -> Self {
+        self.completion_url = Some(url);
+        self
+    }
+
+    pub(crate) fn with_reasoning_effort(mut self, effort: Option<OpenAIReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Report a native service's error codes instead of the compatible ones.
+    pub(crate) fn with_error_codes(mut self, error_codes: ErrorCodes) -> Self {
+        self.error_codes = error_codes;
         self
     }
 
@@ -271,22 +477,129 @@ impl OpenAICompatible {
     pub fn retry_config(&self) -> &RetryConfig {
         &self.retry_config
     }
+
+    /// Enables or disables assistant reasoning replay through `reasoning_content`.
+    ///
+    /// Disabled by default. Passing `true` selects `reasoning_content`, replacing
+    /// any previous field selection; passing `false` clears the selection.
+    /// This controls history serialization, not whether the model thinks.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+    ///
+    /// let client = OpenAICompatible::new(OpenAICompatibleConfig::new("key", "model"))?
+    ///     .with_reasoning_replay(true);
+    /// # let _ = client;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    #[must_use]
+    pub fn with_reasoning_replay(mut self, enabled: bool) -> Self {
+        self.reasoning_replay_field = enabled.then_some(ReasoningReplayField::ReasoningContent);
+        self
+    }
+
+    /// Enables assistant reasoning replay with an explicit provider field.
+    ///
+    /// Newer vLLM servers use `ReasoningReplayField::Reasoning`. Older deployments
+    /// may still require `reasoning_content`; select the field the endpoint accepts.
+    /// The last call to either reasoning-replay builder determines the selection.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{
+    ///     OpenAICompatible, OpenAICompatibleConfig, ReasoningReplayField,
+    /// };
+    ///
+    /// let client = OpenAICompatible::new(OpenAICompatibleConfig::new("key", "model"))?
+    ///     .with_reasoning_replay_field(ReasoningReplayField::Reasoning);
+    /// # let _ = client;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    #[must_use]
+    pub fn with_reasoning_replay_field(mut self, field: ReasoningReplayField) -> Self {
+        self.reasoning_replay_field = Some(field);
+        self
+    }
+}
+
+fn inject_assistant_reasoning(
+    body: &mut serde_json::Value,
+    contents: &[Content],
+    field: Option<ReasoningReplayField>,
+) {
+    let Some(field) = field else {
+        return;
+    };
+    let Some(messages) = body.get_mut("messages").and_then(serde_json::Value::as_array_mut) else {
+        return;
+    };
+    let field_name = match field {
+        ReasoningReplayField::ReasoningContent => "reasoning_content",
+        ReasoningReplayField::Reasoning => "reasoning",
+    };
+
+    for (message, content) in messages.iter_mut().zip(contents) {
+        if !matches!(content.role.as_str(), "model" | "assistant") {
+            continue;
+        }
+        let Some(reasoning) = convert::extract_reasoning_content(&content.parts) else {
+            continue;
+        };
+        let Some(message) = message.as_object_mut() else {
+            continue;
+        };
+
+        message.insert(field_name.to_string(), serde_json::Value::String(reasoning));
+    }
+}
+
+/// Provider capabilities that shape a Chat Completions request body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChatCapabilities {
+    /// Value of `parallel_tool_calls` sent with tool declarations.
+    pub(crate) parallel_tool_calls: bool,
+    /// Send inline PDFs as `file` parts. Only OpenAI and Azure OpenAI accept them,
+    /// so every other compatible provider keeps the text fallback.
+    pub(crate) native_pdf: bool,
 }
 
 /// Build the serialized JSON request body from an `LlmRequest`.
 ///
 /// This is shared between the streaming and non-streaming paths so that
 /// request parameter construction is identical regardless of mode.
-/// Also used by `AzureOpenAIClient` for consistent request building.
 pub(crate) fn build_request_json(
     model: &str,
     request: &LlmRequest,
-    reasoning_effort: &Option<ReasoningEffort>,
-    parallel_tool_calls: bool,
+    reasoning_effort: &Option<OpenAIReasoningEffort>,
+    capabilities: ChatCapabilities,
+    reasoning_replay_field: Option<ReasoningReplayField>,
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Result<serde_json::Value, AdkError> {
-    let messages: Vec<_> = request.contents.iter().map(convert::content_to_message).collect();
+    let bare_model = model.strip_prefix("models/").unwrap_or(model);
+    if matches!(bare_model, "gemini-3.6-flash" | "gemini-3.7-flash")
+        && request.config.as_ref().is_some_and(|config| {
+            config.temperature.is_some() || config.top_p.is_some() || config.top_k.is_some()
+        })
+    {
+        return Err(AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::InvalidInput,
+            "model.gemini.sampling_unsupported",
+            format!(
+                "{bare_model} does not accept temperature, top_p, or top_k; remove explicit sampling parameters"
+            ),
+        )
+        .with_provider("gemini"));
+    }
+    let contents = crate::tool_result::with_images(&request.contents);
+    let messages: Vec<_> = contents
+        .iter()
+        .map(|content| convert::content_to_message(content, capabilities.native_pdf))
+        .collect();
 
     let mut request_builder = CreateChatCompletionRequestArgs::default();
     request_builder.model(model).messages(messages);
@@ -295,11 +608,11 @@ pub(crate) fn build_request_json(
         let tools = convert::convert_tools(&request.tools, adapter, cache);
         request_builder.tools(tools);
         // OpenAI defaults parallel_tool_calls to true.
-        request_builder.parallel_tool_calls(parallel_tool_calls);
+        request_builder.parallel_tool_calls(capabilities.parallel_tool_calls);
     }
 
-    if let Some(effort) = reasoning_effort {
-        request_builder.reasoning_effort(effort.clone());
+    if let Some(effort) = reasoning_effort.and_then(to_oai_reasoning_effort) {
+        request_builder.reasoning_effort(effort);
     }
 
     if let Some(config) = &request.config {
@@ -321,7 +634,7 @@ pub(crate) fn build_request_json(
             let json_schema = ResponseFormatJsonSchema {
                 name: request.model.replace(['-', '.', '/'], "_"),
                 description: None,
-                schema: Some(schema_with_strict),
+                schema: schema_with_strict,
                 strict: Some(true),
             };
             request_builder.response_format(ResponseFormat::JsonSchema { json_schema });
@@ -334,6 +647,12 @@ pub(crate) fn build_request_json(
 
     let mut body = serde_json::to_value(&openai_request)
         .map_err(|e| AdkError::model(format!("failed to serialize request: {e}")))?;
+
+    if matches!(reasoning_effort, Some(OpenAIReasoningEffort::Max)) {
+        body["reasoning_effort"] = serde_json::Value::String("max".to_string());
+    }
+
+    inject_assistant_reasoning(&mut body, &contents, reasoning_replay_field);
 
     // Merge provider-specific extensions from config.extensions["openai"] into
     // the request body.  This allows users to pass provider-specific fields
@@ -351,6 +670,29 @@ pub(crate) fn build_request_json(
     Ok(body)
 }
 
+fn to_oai_reasoning_effort(effort: OpenAIReasoningEffort) -> Option<OaiReasoningEffort> {
+    match effort {
+        OpenAIReasoningEffort::None => Some(OaiReasoningEffort::None),
+        OpenAIReasoningEffort::Minimal => Some(OaiReasoningEffort::Minimal),
+        OpenAIReasoningEffort::Low => Some(OaiReasoningEffort::Low),
+        OpenAIReasoningEffort::Medium => Some(OaiReasoningEffort::Medium),
+        OpenAIReasoningEffort::High => Some(OaiReasoningEffort::High),
+        OpenAIReasoningEffort::XHigh => Some(OaiReasoningEffort::Xhigh),
+        OpenAIReasoningEffort::Max => None,
+    }
+}
+
+/// Destination, credentials and error codes of one generation request.
+#[derive(Clone)]
+struct RequestTarget {
+    url: String,
+    api_key: String,
+    organization_id: Option<String>,
+    provider_name: String,
+    adapter: Option<crate::openai::RequestAdapter>,
+    error_codes: ErrorCodes,
+}
+
 /// Send an HTTP POST and handle error status codes.
 ///
 /// Returns the raw `reqwest::Response` on success so the caller can decide
@@ -358,13 +700,23 @@ pub(crate) fn build_request_json(
 /// stream (streaming).
 async fn send_request(
     http: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-    organization_id: &Option<String>,
+    target: &RequestTarget,
     body: &serde_json::Value,
-    provider_name: &str,
 ) -> Result<reqwest::Response, AdkError> {
-    let mut http_req = http.post(url).bearer_auth(api_key).json(body);
+    let RequestTarget { url, api_key, organization_id, provider_name, adapter, error_codes } =
+        target;
+    let mut http_req = http.post(url);
+    if !api_key.is_empty() {
+        http_req = http_req.bearer_auth(api_key);
+    }
+    if let Some(adapter) = adapter {
+        let mut body = body.clone();
+        let mut headers = reqwest::header::HeaderMap::new();
+        adapter(&mut body, &mut headers)?;
+        http_req = http_req.headers(headers).json(&body);
+    } else {
+        http_req = http_req.json(body);
+    }
 
     if let Some(org_id) = organization_id {
         http_req = http_req.header("OpenAI-Organization", org_id);
@@ -374,7 +726,7 @@ async fn send_request(
         AdkError::new(
             ErrorComponent::Model,
             ErrorCategory::Unavailable,
-            "model.openai_compat.request",
+            error_codes.request,
             format!("{provider_name} request error: {e}"),
         )
         .with_provider(provider_name)
@@ -383,25 +735,21 @@ async fn send_request(
     if !http_resp.status().is_success() {
         let status = http_resp.status();
         let status_code = status.as_u16();
+        let retry_after = http_resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::retry::parse_retry_after);
         let body = http_resp.text().await.unwrap_or_default();
-        let category = match status_code {
-            401 => ErrorCategory::Unauthorized,
-            403 => ErrorCategory::Forbidden,
-            404 => ErrorCategory::NotFound,
-            408 => ErrorCategory::Timeout,
-            429 => ErrorCategory::RateLimited,
-            503 | 529 => ErrorCategory::Unavailable,
-            _ if status_code >= 500 => ErrorCategory::Internal,
-            _ => ErrorCategory::InvalidInput,
-        };
-        return Err(AdkError::new(
+        let error = AdkError::new(
             ErrorComponent::Model,
-            category,
-            "model.openai_compat.api_error",
+            crate::retry::category_for_status_code(status_code),
+            error_codes.for_status(status_code),
             format!("{provider_name} API error (HTTP {status}): {body}"),
         )
         .with_upstream_status(status_code)
-        .with_provider(provider_name));
+        .with_provider(provider_name);
+        return Err(crate::retry::with_retry_after(error, retry_after));
     }
 
     Ok(http_resp)
@@ -419,38 +767,39 @@ fn parse_finish_reason(fr: &str) -> FinishReason {
     }
 }
 
+/// Accumulate string deltas while treating structured values as complete snapshots.
+fn append_tool_call_arguments(accumulator: &mut String, arguments: &serde_json::Value) {
+    match arguments {
+        serde_json::Value::String(fragment) => accumulator.push_str(fragment),
+        serde_json::Value::Null => {}
+        structured => {
+            let empty_snapshot = matches!(structured, serde_json::Value::Object(fields) if fields.is_empty())
+                || matches!(structured, serde_json::Value::Array(items) if items.is_empty());
+            if !empty_snapshot {
+                accumulator.clear();
+                accumulator.push_str(&structured.to_string());
+            }
+        }
+    }
+}
+
+fn parse_tool_call_arguments(
+    provider_name: &str,
+    error_codes: ErrorCodes,
+    tool_name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, AdkError> {
+    crate::tool_args::parse_streamed_tool_arguments(
+        provider_name,
+        error_codes.invalid_tool_arguments,
+        tool_name,
+        arguments,
+    )
+}
+
 /// Parse usage metadata from a raw SSE chunk JSON value.
 fn parse_usage_from_chunk(chunk: &serde_json::Value) -> Option<UsageMetadata> {
-    let u = chunk.get("usage")?;
-    let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let completion_tokens = u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let total_tokens = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-
-    let prompt_details = u.get("prompt_tokens_details");
-    let completion_details = u.get("completion_tokens_details");
-
-    Some(UsageMetadata {
-        prompt_token_count: prompt_tokens,
-        candidates_token_count: completion_tokens,
-        total_token_count: total_tokens,
-        cache_read_input_token_count: prompt_details
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        thinking_token_count: completion_details
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        audio_input_token_count: prompt_details
-            .and_then(|d| d.get("audio_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        audio_output_token_count: completion_details
-            .and_then(|d| d.get("audio_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        ..Default::default()
-    })
+    chunk.get("usage").and_then(convert::usage_metadata_from_raw)
 }
 
 #[async_trait]
@@ -477,21 +826,39 @@ impl Llm for OpenAICompatible {
         let model = self.model.clone();
         let provider_name = self.provider_name.clone();
         let http = self.http.clone();
-        let api_key = self.api_key.clone();
-        let base_url = self.base_url.clone();
         let retry_config = self.retry_config.clone();
-        let reasoning_effort = self.reasoning_effort.clone();
-        let organization_id = self.organization_id.clone();
+        let reasoning_effort = self.reasoning_effort;
+        let reasoning_replay_field = self.reasoning_replay_field;
+        let error_codes = self.error_codes;
+        let target = RequestTarget {
+            url: self
+                .completion_url
+                .clone()
+                .unwrap_or_else(|| format!("{}/chat/completions", self.base_url)),
+            api_key: self.api_key.clone(),
+            organization_id: self.organization_id.clone(),
+            provider_name: provider_name.clone(),
+            adapter: self.request_adapter.clone(),
+            error_codes,
+        };
+        // Text-encoded tool calls are honoured only for tools this request declared.
+        let declared_tools: std::collections::HashSet<String> =
+            request.tools.keys().cloned().collect();
 
         // Normalize tool schemas at request time using the schema adapter.
         let adapter = self.schema_adapter();
         use std::sync::LazyLock;
-        static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(SchemaCache::new);
+        static SCHEMA_CACHE: LazyLock<SchemaCache> =
+            LazyLock::new(|| SchemaCache::for_adapter(std::sync::Arc::new(GenericSchemaAdapter)));
         let request_body = build_request_json(
             &model,
             &request,
             &reasoning_effort,
-            self.parallel_tool_calls,
+            ChatCapabilities {
+                parallel_tool_calls: self.parallel_tool_calls,
+                native_pdf: matches!(provider_name.as_str(), "openai" | "azure-openai"),
+            },
+            reasoning_replay_field,
             adapter,
             &SCHEMA_CACHE,
         )?;
@@ -511,42 +878,42 @@ impl Llm for OpenAICompatible {
                     );
                 }
 
-                let url = format!("{base_url}/chat/completions");
-
                 // Retry covers only the initial HTTP request, not stream consumption.
                 let response = execute_with_retry(&retry_config, is_retryable_model_error, || {
                     let http = http.clone();
-                    let url = url.clone();
-                    let api_key = api_key.clone();
-                    let organization_id = organization_id.clone();
+                    let target = target.clone();
                     let body = body.clone();
-                    let provider_name = provider_name.clone();
-                    async move {
-                        send_request(&http, &url, &api_key, &organization_id, &body, &provider_name).await
-                    }
+                    async move { send_request(&http, &target, &body).await }
                 })
                 .await?;
 
                 // Process SSE byte stream (following DeepSeekClient pattern).
                 let mut byte_stream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut buffer = Vec::new();
                 let mut tool_call_accumulators: HashMap<u32, (String, String, String)> =
                     HashMap::new();
-                let mut text_tool_buffer = crate::tool_call_parser::ToolCallBuffer::new();
+                let mut text_tool_buffer =
+                    crate::tool_call_parser::ToolCallBuffer::for_declared_tools(declared_tools);
+                let mut pending_final_response: Option<LlmResponse> = None;
 
                 while let Some(chunk_result) = byte_stream.next().await {
                     let chunk = chunk_result.map_err(|e| {
                         AdkError::model(format!("stream read error: {e}"))
                     })?;
 
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
 
                     // Process complete SSE lines.
-                    while let Some(line_end) = buffer.find('\n') {
-                        let line = buffer[..line_end].trim().to_string();
-                        buffer = buffer[line_end + 1..].to_string();
+                    while let Some(line) = take_line(&mut buffer)? {
 
-                        if line.is_empty() || line == "data: [DONE]" {
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        if line == "data: [DONE]" {
+                            if let Some(response) = pending_final_response.take() {
+                                yield response;
+                            }
                             continue;
                         }
 
@@ -560,10 +927,19 @@ impl Llm for OpenAICompatible {
                                     continue;
                                 }
                             };
+                            let usage_metadata = parse_usage_from_chunk(&chunk_json);
 
                             let choice = match chunk_json.get("choices").and_then(|c| c.get(0)) {
                                 Some(c) => c,
-                                None => continue,
+                                None => {
+                                    if let Some(usage_metadata) = usage_metadata
+                                        && let Some(mut response) = pending_final_response.take()
+                                    {
+                                        response.usage_metadata = Some(usage_metadata);
+                                        yield response;
+                                    }
+                                    continue;
+                                }
                             };
                             let delta = match choice.get("delta") {
                                 Some(d) => d,
@@ -599,10 +975,8 @@ impl Llm for OpenAICompatible {
                                         if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                                             entry.1 = name.to_string();
                                         }
-                                        if let Some(args_chunk) =
-                                            func.get("arguments").and_then(|v| v.as_str())
-                                        {
-                                            entry.2.push_str(args_chunk);
+                                        if let Some(arguments) = func.get("arguments") {
+                                            append_tool_call_arguments(&mut entry.2, arguments);
                                         }
                                     }
                                 }
@@ -611,7 +985,6 @@ impl Llm for OpenAICompatible {
                             // Check for finish_reason → emit final response.
                             if let Some(ref fr) = finish_reason_str {
                                 let finish_reason = Some(parse_finish_reason(fr));
-                                let usage_metadata = parse_usage_from_chunk(&chunk_json);
 
                                 // Emit accumulated tool calls if any.
                                 if !tool_call_accumulators.is_empty() {
@@ -622,19 +995,22 @@ impl Llm for OpenAICompatible {
                                     let parts: Vec<Part> = sorted_calls
                                         .into_iter()
                                         .map(|(_, (id, name, args_str))| {
-                                            let args: serde_json::Value =
-                                                serde_json::from_str(&args_str)
-                                                    .unwrap_or(serde_json::json!({}));
-                                            Part::FunctionCall {
+                                            let args = parse_tool_call_arguments(
+                                                &provider_name,
+                                                error_codes,
+                                                &name,
+                                                &args_str,
+                                            )?;
+                                            Ok(Part::FunctionCall {
                                                 name,
                                                 args,
                                                 id: Some(id),
                                                 thought_signature: None,
-                                            }
+                                            })
                                         })
-                                        .collect();
+                                        .collect::<Result<Vec<_>, AdkError>>()?;
 
-                                    yield LlmResponse {
+                                    let response = LlmResponse {
                                         content: Some(Content {
                                             role: "model".to_string(),
                                             parts,
@@ -652,6 +1028,11 @@ impl Llm for OpenAICompatible {
                                         provider_metadata: None,
                                         interaction_id: None,
                                     };
+                                    if response.usage_metadata.is_some() {
+                                        yield response;
+                                    } else {
+                                        pending_final_response = Some(response);
+                                    }
                                     continue;
                                 }
 
@@ -662,7 +1043,7 @@ impl Llm for OpenAICompatible {
                                         parts.push(Part::Text { text: text.to_string() });
                                     }
 
-                                yield LlmResponse {
+                                let response = LlmResponse {
                                     content: if parts.is_empty() { None } else {
                                         Some(Content {
                                             role: "model".to_string(),
@@ -680,6 +1061,11 @@ impl Llm for OpenAICompatible {
                                     provider_metadata: None,
                                     interaction_id: None,
                                 };
+                                if response.usage_metadata.is_some() {
+                                    yield response;
+                                } else {
+                                    pending_final_response = Some(response);
+                                }
                                 continue;
                             }
 
@@ -747,6 +1133,10 @@ impl Llm for OpenAICompatible {
                     }
                 }
 
+                if let Some(response) = pending_final_response.take() {
+                    yield response;
+                }
+
                 // Flush any remaining buffered content from the tool call buffer
                 for part in text_tool_buffer.flush() {
                     let is_tool = matches!(part, Part::FunctionCall { .. });
@@ -759,7 +1149,7 @@ impl Llm for OpenAICompatible {
                         finish_reason: if is_tool { Some(adk_core::FinishReason::Stop) } else { None },
                         citation_metadata: None,
                         partial: !is_tool,
-                        turn_complete: is_tool,
+                        turn_complete: false,
                         interrupted: false,
                         error_code: None,
                         error_message: None,
@@ -777,21 +1167,16 @@ impl Llm for OpenAICompatible {
                     let model = model.clone();
                     let provider_name = provider_name.clone();
                     let http = http.clone();
-                    let api_key = api_key.clone();
-                    let base_url = base_url.clone();
+                    let target = target.clone();
                     let body = request_body.clone();
-                    let organization_id = organization_id.clone();
                     async move {
-                        let url = format!("{base_url}/chat/completions");
-                        let http_resp =
-                            send_request(&http, &url, &api_key, &organization_id, &body, &provider_name)
-                                .await?;
+                        let http_resp = send_request(&http, &target, &body).await?;
 
                         let raw_json: serde_json::Value = http_resp.json().await.map_err(|e| {
                             AdkError::new(
                                 ErrorComponent::Model,
                                 ErrorCategory::Internal,
-                                "model.openai_compat.parse",
+                                error_codes.parse,
                                 format!("{provider_name} response parse error: {e}"),
                             )
                             .with_provider(&provider_name)
@@ -811,7 +1196,15 @@ impl Llm for OpenAICompatible {
                 })
                 .await?;
 
-                let adk_response = convert::from_raw_openai_response(&response);
+                let adk_response = convert::from_raw_openai_response(&response, &declared_tools).map_err(|error| {
+                    AdkError::new(
+                        ErrorComponent::Model,
+                        ErrorCategory::Internal,
+                        error_codes.invalid_tool_arguments,
+                        format!("{provider_name} returned {error}"),
+                    )
+                    .with_provider(&provider_name)
+                })?;
                 yield adk_response;
             };
 
@@ -823,6 +1216,54 @@ impl Llm for OpenAICompatible {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adk_core::{GenericSchemaAdapter, LlmRequest, SchemaCache};
+    use std::sync::Arc;
+
+    mod sse_lines {
+        use super::take_line;
+
+        #[test]
+        fn preserves_every_split() {
+            let expected = r#"data: {"text":"é中文🙂�","arguments":"{\"path\":\"资料.txt\",\"text\":\"改动🙂\"}"}"#;
+            let framed = format!("{expected}\r\n");
+            for split in 0..framed.len() {
+                let mut buffer = framed.as_bytes()[..split].to_vec();
+                assert_eq!(take_line(&mut buffer).unwrap(), None);
+                buffer.extend_from_slice(&framed.as_bytes()[split..]);
+                assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some(expected));
+                assert!(buffer.is_empty());
+            }
+        }
+
+        #[test]
+        fn accepts_bytewise_delivery() {
+            let expected = "data: 中文🙂é";
+            let mut buffer = Vec::new();
+            for byte in expected.as_bytes() {
+                buffer.push(*byte);
+                assert_eq!(take_line(&mut buffer).unwrap(), None);
+            }
+            buffer.push(b'\n');
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some(expected));
+            assert!(buffer.is_empty());
+        }
+
+        #[test]
+        fn leaves_following_lines() {
+            let mut buffer = "data: 第一行\r\n\r\ndata: 第二行🙂\n".as_bytes().to_vec();
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some("data: 第一行"));
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some(""));
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some("data: 第二行🙂"));
+            assert_eq!(take_line(&mut buffer).unwrap(), None);
+        }
+
+        #[test]
+        fn rejects_invalid_utf8() {
+            for invalid in [b"data: \xc3(\n".as_slice(), b"data: \xf0\x9f\n".as_slice()] {
+                assert!(take_line(&mut invalid.to_vec()).is_err());
+            }
+        }
+    }
 
     #[test]
     fn test_parallel_tool_calls_config() {
@@ -846,6 +1287,238 @@ mod tests {
     }
 
     #[test]
+    fn streamed_tool_arguments_require_valid_json() {
+        let parsed = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"{"command":"pwd"}"#,
+        )
+        .expect("valid arguments should parse");
+        assert_eq!(parsed["command"], "pwd");
+
+        assert_eq!(
+            parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "no_args", "")
+                .expect("an empty compatible payload should normalize"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "no_args",
+                "   "
+            )
+            .expect("a whitespace-only compatible payload should normalize"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "no_args",
+                "[]"
+            )
+            .expect("an empty array compatible payload should normalize"),
+            serde_json::json!({})
+        );
+
+        let error = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"{"command":"#,
+        )
+        .expect_err("truncated arguments must remain invalid");
+        assert_eq!(error.component, ErrorComponent::Model);
+        assert_eq!(error.category, ErrorCategory::Internal);
+        assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
+        assert_eq!(error.details.provider.as_deref(), Some("compatible-provider"));
+
+        let error = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"["pwd"]"#,
+        )
+        .expect_err("non-empty array arguments must remain invalid");
+        assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
+    }
+
+    #[test]
+    fn streamed_structured_tool_arguments_are_canonicalized() {
+        let mut arguments = String::new();
+        append_tool_call_arguments(&mut arguments, &serde_json::json!({"command": "pwd"}));
+
+        assert_eq!(
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "bash",
+                &arguments
+            )
+            .expect("a structured object should normalize"),
+            serde_json::json!({"command": "pwd"})
+        );
+    }
+
+    #[test]
+    fn streamed_empty_snapshot_before_string_fragments_is_ignored() {
+        for placeholder in [serde_json::json!({}), serde_json::json!([])] {
+            let mut arguments = String::new();
+            append_tool_call_arguments(&mut arguments, &placeholder);
+            assert_eq!(
+                parse_tool_call_arguments(
+                    "compatible-provider",
+                    ErrorCodes::COMPATIBLE,
+                    "no_args",
+                    &arguments
+                )
+                .expect("an empty snapshot should remain a no-argument call"),
+                serde_json::json!({})
+            );
+
+            append_tool_call_arguments(&mut arguments, &serde_json::json!(r#"{"command""#));
+            append_tool_call_arguments(&mut arguments, &serde_json::json!(r#": "pwd"}"#));
+
+            assert_eq!(
+                parse_tool_call_arguments(
+                    "compatible-provider",
+                    ErrorCodes::COMPATIBLE,
+                    "bash",
+                    &arguments
+                )
+                .expect("empty snapshots must not prefix string fragments"),
+                serde_json::json!({"command": "pwd"})
+            );
+        }
+    }
+
+    #[test]
+    fn gpt_56_chat_tools_preserve_configured_reasoning() {
+        let adapter = GenericSchemaAdapter;
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        let mut request = LlmRequest {
+            model: crate::catalog::OPENAI_DEFAULT.to_string(),
+            contents: Vec::new(),
+            config: None,
+            tools: HashMap::new(),
+            previous_response_id: None,
+        };
+        request.tools.insert(
+            "lookup".to_string(),
+            serde_json::json!({
+                "description": "Look up a record",
+                "parameters": {"type": "object", "properties": {}}
+            }),
+        );
+
+        for (configured_effort, expected) in [
+            (None, None),
+            (Some(OpenAIReasoningEffort::Medium), Some("medium")),
+            (Some(OpenAIReasoningEffort::Max), Some("max")),
+        ] {
+            let body = build_request_json(
+                crate::catalog::OPENAI_DEFAULT,
+                &request,
+                &configured_effort,
+                ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+                None,
+                &adapter,
+                &cache,
+            )
+            .expect("request should build");
+
+            assert_eq!(body.get("reasoning_effort").and_then(serde_json::Value::as_str), expected);
+        }
+    }
+
+    #[test]
+    fn gpt_56_without_tools_keeps_server_reasoning_default() {
+        let adapter = GenericSchemaAdapter;
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        let request = LlmRequest {
+            model: crate::catalog::OPENAI_DEFAULT.to_string(),
+            contents: Vec::new(),
+            config: None,
+            tools: HashMap::new(),
+            previous_response_id: None,
+        };
+
+        let body = build_request_json(
+            crate::catalog::OPENAI_DEFAULT,
+            &request,
+            &None,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+            None,
+            &adapter,
+            &cache,
+        )
+        .expect("request should build");
+
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn gpt_56_chat_serializes_max_reasoning() {
+        let adapter = GenericSchemaAdapter;
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        let request = LlmRequest {
+            model: crate::catalog::OPENAI_DEFAULT.to_string(),
+            contents: Vec::new(),
+            config: None,
+            tools: HashMap::new(),
+            previous_response_id: None,
+        };
+
+        let body = build_request_json(
+            crate::catalog::OPENAI_DEFAULT,
+            &request,
+            &Some(OpenAIReasoningEffort::Max),
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+            None,
+            &adapter,
+            &cache,
+        )
+        .expect("request should build");
+
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn gemini_37_compatible_path_rejects_sampling_locally() {
+        let mut request = LlmRequest::new("gemini-3.7-flash", Vec::new());
+        request.config =
+            Some(adk_core::GenerateContentConfig { top_p: Some(0.9), ..Default::default() });
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+
+        let error = build_request_json(
+            "gemini-3.7-flash",
+            &request,
+            &None,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+            None,
+            &GenericSchemaAdapter,
+            &cache,
+        )
+        .expect_err("sampling should be rejected before network I/O");
+
+        assert_eq!(error.code, "model.gemini.sampling_unsupported");
+    }
+
+    #[test]
+    fn orcarouter_preset_sets_endpoint_and_provider() {
+        let config = OpenAICompatibleConfig::orcarouter("test-key", "openai/gpt-5.6-terra");
+        assert_eq!(config.provider_name, "orcarouter");
+        assert_eq!(config.model, "openai/gpt-5.6-terra");
+        assert_eq!(config.base_url.as_deref(), Some("https://api.orcarouter.ai/v1"));
+        assert_eq!(config.api_key, "test-key");
+
+        let client = OpenAICompatible::new(config).expect("client builds");
+        assert_eq!(client.name(), "openai/gpt-5.6-terra");
+    }
+
+    #[test]
     fn gemini_preset_sets_endpoint_and_provider() {
         let config = OpenAICompatibleConfig::gemini("test-key", "gemini-3.5-flash");
         assert_eq!(config.provider_name, "gemini");
@@ -861,8 +1534,8 @@ mod tests {
     fn gemini_preset_supports_reasoning_effort() {
         // Gemini's OpenAI-compat layer maps reasoning_effort onto thinking levels.
         let config = OpenAICompatibleConfig::gemini("k", "gemini-3.5-flash")
-            .with_reasoning_effort(ReasoningEffort::Low);
-        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Low));
+            .with_reasoning_effort(OaiReasoningEffort::Low);
+        assert_eq!(config.reasoning_effort, Some(OaiReasoningEffort::Low));
     }
 
     #[test]

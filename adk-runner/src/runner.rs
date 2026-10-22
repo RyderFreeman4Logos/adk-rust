@@ -3,8 +3,8 @@ use crate::cache::CacheManager;
 #[cfg(feature = "artifacts")]
 use adk_artifact::ArtifactService;
 use adk_core::{
-    Agent, AppName, CacheCapable, Content, ContextCacheConfig, EventStream, Memory,
-    ReadonlyContext, Result, RunConfig, SessionId, UserId,
+    Agent, AppName, CacheCapable, Content, ContextCacheConfig, Event, EventStream, InvocationId,
+    Memory, ReadonlyContext, Result, RunConfig, SessionId, UserId,
 };
 #[cfg(feature = "plugins")]
 use adk_plugin::PluginManager;
@@ -12,8 +12,82 @@ use adk_session::SessionService;
 #[cfg(feature = "skills")]
 use adk_skill::{SkillInjector, SkillInjectorConfig};
 use async_stream::stream;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
+
+/// A run currently in flight, tracked so it can be interrupted.
+///
+/// Keyed by run ID rather than session ID: a session ID is only unique within an
+/// app and user, and one identity may have several runs in flight at once.
+#[derive(Debug, Clone)]
+struct ActiveRun {
+    identity: adk_core::AdkIdentity,
+    token: CancellationToken,
+}
+
+/// Registry of in-flight runs, keyed by run ID.
+type ActiveRuns = Arc<std::sync::Mutex<std::collections::HashMap<u64, ActiveRun>>>;
+
+fn preserve_streamed_content(accumulated: &mut HashMap<String, Content>, event: &mut Event) {
+    if event.llm_response.partial {
+        if let Some(chunk) = &event.llm_response.content {
+            accumulated
+                .entry(event.id.clone())
+                .and_modify(|content| content.parts.extend(chunk.parts.clone()))
+                .or_insert_with(|| chunk.clone());
+        }
+    } else if event.llm_response.content.is_none() {
+        event.llm_response.content = accumulated.remove(&event.id);
+    } else {
+        accumulated.remove(&event.id);
+    }
+}
+
+/// Deregisters a run when its event stream is dropped.
+///
+/// Removal is by run ID, so a finishing run can never deregister a different run
+/// that happens to share the same session ID.
+struct ActiveRunCleanup {
+    active_runs: ActiveRuns,
+    run_id: u64,
+}
+
+/// A newly registered runner invocation and its event stream.
+///
+/// The invocation identity is available before the stream is polled, so hosts
+/// can durably correlate failures that happen before the first agent event.
+pub struct RunnerInvocation {
+    invocation_id: InvocationId,
+    events: EventStream,
+}
+
+impl RunnerInvocation {
+    /// Returns the identity assigned to this invocation.
+    pub fn invocation_id(&self) -> &InvocationId {
+        &self.invocation_id
+    }
+
+    /// Consumes the invocation and returns its event stream.
+    pub fn into_events(self) -> EventStream {
+        self.events
+    }
+}
+
+impl std::fmt::Debug for RunnerInvocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunnerInvocation")
+            .field("invocation_id", &self.invocation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ActiveRunCleanup {
+    fn drop(&mut self) {
+        let mut runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
+        runs.remove(&self.run_id);
+    }
+}
 use tracing::Instrument;
 
 /// Configuration for constructing a [`Runner`].
@@ -58,6 +132,9 @@ pub struct RunnerConfig {
     /// `user_scopes()` and `user_id()` reflect the authenticated identity.
     pub request_context: Option<adk_core::RequestContext>,
     /// Optional cooperative cancellation token for externally managed runs.
+    ///
+    /// Each run derives a child of this token, so cancelling it stops every in-flight
+    /// run, while [`Runner::interrupt`] cancels only the targeted run's child.
     pub cancellation_token: Option<CancellationToken>,
     /// Optional intra-invocation compaction configuration.
     /// When set, the runner estimates token count before each agent run
@@ -106,7 +183,15 @@ pub struct Runner {
     context_compaction: Option<Arc<crate::compaction::CompactionConfig>>,
     /// Per-session cancellation tokens for the interrupt API.
     /// Each `run()` call registers a token here; `interrupt()` cancels it.
-    active_sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    active_runs: ActiveRuns,
+    next_run_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes externally triggered invocations per session. The weak values prevent the
+    /// per-trigger session policy from retaining one lock forever for every completed event.
+    pub(crate) external_session_locks: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
+    >,
 }
 
 impl Runner {
@@ -179,8 +264,17 @@ impl Runner {
             intra_compactor,
             #[cfg(feature = "context-compaction")]
             context_compaction: config.context_compaction.map(Arc::new),
-            active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            next_run_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            external_session_locks: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
+    }
+
+    /// The executable root owned by this runner.
+    pub(crate) fn root_agent(&self) -> Arc<dyn Agent> {
+        Arc::clone(&self.root_agent)
     }
 
     /// Enable skill injection using a pre-built injector.
@@ -222,14 +316,76 @@ impl Runner {
 
     /// Execute the root agent for the given user and session, returning an event stream.
     ///
-    /// Retrieves (or creates) the session, resolves the target agent, runs
-    /// plugins/skills, and streams events as the agent executes.
+    /// Retrieves the existing session, resolves the target agent, runs plugins and skills, and
+    /// streams events as the agent executes.
     pub async fn run(
         &self,
         user_id: UserId,
         session_id: SessionId,
         user_content: Content,
     ) -> Result<EventStream> {
+        self.run_with_config(user_id, session_id, user_content, None).await
+    }
+
+    /// Returns the runner's application name.
+    pub fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    /// Returns the runner's session service.
+    pub fn session_service(&self) -> &Arc<dyn adk_session::SessionService> {
+        &self.session_service
+    }
+
+    /// Returns the runner's configured [`RunConfig`].
+    ///
+    /// Useful as a base to clone and adjust for [`Self::run_with_config`].
+    pub fn run_config(&self) -> &RunConfig {
+        &self.run_config
+    }
+
+    /// Runs the agent with a per-invocation [`RunConfig`] override.
+    ///
+    /// Passing `None` uses the runner's configured `RunConfig`. Supply one to vary a single
+    /// invocation — injecting `runtime_toolsets` for tools that only exist for the duration of
+    /// that run, for example, as `SandboxRunner` does with tools bound to a live sandbox session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if invocation setup fails before the stream is created. Session lookup
+    /// and agent execution failures are yielded by the returned stream.
+    pub async fn run_with_config(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        user_content: Content,
+        run_config: Option<RunConfig>,
+    ) -> Result<EventStream> {
+        Ok(self
+            .start_with_config(user_id, session_id, user_content, run_config)
+            .await?
+            .into_events())
+    }
+
+    /// Registers one invocation and returns its identity with the event stream.
+    ///
+    /// Prefer this method when a host must durably associate its own turn or
+    /// operation record before the first agent event can be produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if invocation setup fails before the stream is created.
+    /// Session lookup and agent execution failures are yielded by the returned
+    /// stream.
+    pub async fn start_with_config(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        user_content: Content,
+        run_config: Option<RunConfig>,
+    ) -> Result<RunnerInvocation> {
+        let invocation_id = InvocationId::try_from(format!("inv-{}", uuid::Uuid::new_v4()))?;
+        let stream_invocation_id = invocation_id.to_string();
         let app_name = self.app_name.clone();
         let typed_app_name = AppName::try_from(app_name.clone())?;
         let session_service = self.session_service.clone();
@@ -241,71 +397,56 @@ impl Runner {
         let plugin_manager = self.plugin_manager.clone();
         #[cfg(feature = "skills")]
         let skill_injector = self.skill_injector.clone();
-        let mut run_config = self.run_config.clone();
+        let mut run_config = run_config.unwrap_or_else(|| self.run_config.clone());
         let compaction_config = self.compaction_config.clone();
         let context_cache_config = self.context_cache_config.clone();
         let cache_capable = self.cache_capable.clone();
         let cache_manager_ref = self.cache_manager.clone();
         let request_context = self.request_context.clone();
-        let cancellation_token = self.cancellation_token.clone();
         let intra_compactor = self.intra_compactor.clone();
         #[cfg(feature = "context-compaction")]
         let context_compaction = self.context_compaction.clone();
 
-        // Register a per-session cancellation token for the interrupt API.
-        // If a global token is configured, create a child token so that
-        // either global cancellation OR per-session interrupt stops this run.
-        let session_token = CancellationToken::new();
-        let session_id_str = session_id.as_str().to_string();
-        {
-            let mut sessions = self.active_sessions.lock().unwrap_or_else(|e| e.into_inner());
-            sessions.insert(session_id_str.clone(), session_token.clone());
-        }
-        let active_sessions = self.active_sessions.clone();
+        // Built once and used for every persistence write, so a backend with a
+        // composite natural key can bind each event to its tenant.
+        let identity =
+            adk_core::AdkIdentity::new(typed_app_name.clone(), user_id.clone(), session_id.clone());
 
-        // Effective token: cancelled if either the global token or the session token fires
-        let effective_token = if let Some(ref global) = cancellation_token {
-            let combined = CancellationToken::new();
-            let combined_clone = combined.clone();
-            let global_clone = global.clone();
-            let session_clone = session_token.clone();
-            // Watch both tokens — cancel the combined token when either fires
-            let combined_for_global = combined_clone.clone();
-            tokio::spawn(async move {
-                global_clone.cancelled().await;
-                combined_for_global.cancel();
-            });
-            let combined_for_session = combined_clone;
-            tokio::spawn(async move {
-                session_clone.cancelled().await;
-                combined_for_session.cancel();
-            });
-            Some(combined)
-        } else {
-            Some(session_token.clone())
+        // Register this run for the interrupt API. The registration is keyed by a
+        // unique run ID rather than the raw session ID: two identities can share a
+        // session ID, and one identity can have two runs in flight, and both cases
+        // previously overwrote each other's token.
+        //
+        // A child of the global token fires when either the global token or this run's
+        // interrupt does, with no watcher task to outlive the run; dropping the run's
+        // last handle detaches the child from the global token.
+        let session_token = match self.cancellation_token.as_ref() {
+            Some(global) => global.child_token(),
+            None => CancellationToken::new(),
         };
+        let run_id = self.next_run_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
+            runs.insert(
+                run_id,
+                ActiveRun { identity: identity.clone(), token: session_token.clone() },
+            );
+        }
+        let active_runs = self.active_runs.clone();
+        let effective_token = Some(session_token);
+
+        // Built here rather than inside the generator: registration happens as soon
+        // as `run` is called, so deregistration must also survive a stream that is
+        // dropped before it is ever polled. Moving the guard into the generator
+        // keeps it alive exactly as long as the stream.
+        let cleanup = ActiveRunCleanup { active_runs: active_runs.clone(), run_id };
 
         let s = stream! {
-            // Clean up session tracking when the stream ends.
-            // We use a simple struct with Drop to ensure cleanup even on early return.
-            struct SessionCleanup {
-                active_sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>>,
-                session_id: String,
-            }
-            impl Drop for SessionCleanup {
-                fn drop(&mut self) {
-                    let mut sessions = self.active_sessions.lock().unwrap_or_else(|e| e.into_inner());
-                    sessions.remove(&self.session_id);
-                }
-            }
-            let _cleanup = SessionCleanup {
-                active_sessions: active_sessions.clone(),
-                session_id: session_id_str,
-            };
+            let _cleanup = cleanup;
 
             // Use the effective token (combines global + per-session)
             let cancellation_token = effective_token;
-            // Get or create session
+            // Resolve the existing session.
             let session = match session_service
                 .get(adk_session::GetRequest {
                     app_name: app_name.clone(),
@@ -326,13 +467,21 @@ impl Runner {
             // Find which agent should handle this request
             let agent_to_run = Self::find_agent_to_run(&root_agent, session.as_ref());
 
+            // Let validated composite roots apply policy for the concrete agent
+            // selected for this turn. Ordinary agents keep the default no-op.
+            root_agent.configure_run(agent_to_run.name(), &mut run_config);
+            if let Some(targets) = root_agent.transfer_targets_for(agent_to_run.name()) {
+                run_config.transfer_targets = targets;
+                run_config.parent_agent = None;
+            }
+
             // Clone services for potential reuse in transfer
             #[cfg(feature = "artifacts")]
             let artifact_service_clone = artifact_service.clone();
             let memory_service_clone = memory_service.clone();
 
             // Create invocation context with MutableSession
-            let invocation_id = format!("inv-{}", uuid::Uuid::new_v4());
+            let invocation_id = stream_invocation_id;
             #[cfg(any(feature = "skills", feature = "plugins"))]
             let mut effective_user_content = user_content.clone();
             #[cfg(not(any(feature = "skills", feature = "plugins")))]
@@ -398,6 +547,11 @@ impl Runner {
                 invocation_ctx = invocation_ctx.with_request_context(rc);
             }
 
+            // Expose cooperative cancellation to the agent/tools.
+            if let Some(token) = cancellation_token.as_ref() {
+                invocation_ctx = invocation_ctx.with_cancellation_token(token.clone());
+            }
+
             let mut ctx = Arc::new(invocation_ctx);
 
             #[cfg(feature = "plugins")]
@@ -412,7 +566,12 @@ impl Runner {
                         early_event.llm_response.content = Some(content);
 
                         ctx.mutable_session().append_event(early_event.clone());
-                        if let Err(e) = session_service.append_event(ctx.session_id(), early_event.clone()).await {
+                        if let Err(e) = session_service
+                            .append_event_for_identity(adk_session::AppendEventRequest {
+                                identity: identity.clone(),
+                                event: early_event.clone(),
+                            })
+                            .await {
                             yield Err(e);
                             return;
                         }
@@ -454,6 +613,12 @@ impl Runner {
                                 return;
                             }
                         };
+                        refreshed_ctx = refreshed_ctx.with_orchestration_root_invocation_id(
+                            adk_core::InvocationContext::orchestration_root_invocation_id(
+                                ctx.as_ref(),
+                            )
+                            .to_string(),
+                        );
 
                         #[cfg(feature = "artifacts")]
                         if let Some(service) = artifact_service_clone.clone() {
@@ -471,6 +636,9 @@ impl Runner {
                         refreshed_ctx = refreshed_ctx.with_run_config(run_config.clone());
                         if let Some(rc) = request_context.clone() {
                             refreshed_ctx = refreshed_ctx.with_request_context(rc);
+                        }
+                        if let Some(token) = cancellation_token.as_ref() {
+                            refreshed_ctx = refreshed_ctx.with_cancellation_token(token.clone());
                         }
                         ctx = Arc::new(refreshed_ctx);
                     }
@@ -494,7 +662,12 @@ impl Runner {
             // Note: adk_session::Event is a re-export of adk_core::Event, so we can use it directly
             ctx.mutable_session().append_event(user_event.clone());
 
-            if let Err(e) = session_service.append_event(ctx.session_id(), user_event).await {
+            if let Err(e) = session_service
+                .append_event_for_identity(adk_session::AppendEventRequest {
+                    identity: identity.clone(),
+                    event: user_event,
+                })
+                .await {
                 #[cfg(feature = "plugins")]
                 if let Some(manager) = plugin_manager.as_ref() {
                     manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
@@ -576,6 +749,10 @@ impl Runner {
                             return;
                         }
                     };
+                    refreshed_ctx = refreshed_ctx.with_orchestration_root_invocation_id(
+                        adk_core::InvocationContext::orchestration_root_invocation_id(ctx.as_ref())
+                            .to_string(),
+                    );
                     #[cfg(feature = "artifacts")]
                     if let Some(service) = artifact_service_clone.clone() {
                         let scoped = adk_artifact::ScopedArtifacts::new(
@@ -592,6 +769,9 @@ impl Runner {
                     refreshed_ctx = refreshed_ctx.with_run_config(run_config.clone());
                     if let Some(rc) = request_context.clone() {
                         refreshed_ctx = refreshed_ctx.with_request_context(rc);
+                    }
+                    if let Some(token) = cancellation_token.as_ref() {
+                        refreshed_ctx = refreshed_ctx.with_cancellation_token(token.clone());
                     }
                     ctx = Arc::new(refreshed_ctx);
                 }
@@ -673,7 +853,7 @@ impl Runner {
                             ctx.mutable_session().replace_events(compacted);
                             tracing::info!("context compaction succeeded after token limit error, retrying agent");
                             // Retry the agent call with compacted context
-                            match agent_to_run.run(ctx.clone()).instrument(agent_span).await {
+                            match agent_to_run.run(ctx.clone()).instrument(agent_span.clone()).await {
                                 Ok(s) => s,
                                 Err(retry_err) => {
                                     #[cfg(feature = "plugins")]
@@ -707,24 +887,39 @@ impl Runner {
 
             // Stream events and check for transfers
             use futures::StreamExt;
-            let mut transfer_target: Option<String> = None;
+            let mut transfer_target: Option<(String, String)> = None;
+            let mut streamed_content = HashMap::new();
 
             while let Some(result) = {
-                if let Some(token) = cancellation_token.as_ref()
-                    && token.is_cancelled() {
-                        #[cfg(feature = "plugins")]
-                        if let Some(manager) = plugin_manager.as_ref() {
-                            manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
+                // Race the next event against cancellation so an in-flight
+                // await (LLM streaming, tool I/O) is interrupted promptly
+                // rather than only at poll boundaries. Dropping the stream on
+                // cancellation releases the underlying provider connection.
+                match cancellation_token.as_ref() {
+                    Some(token) => {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {
+                                tracing::info!("cancellation fired during agent stream await");
+                                #[cfg(feature = "plugins")]
+                                if let Some(manager) = plugin_manager.as_ref() {
+                                    manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
+                                }
+                                return;
+                            }
+                            // Instrument the poll, not just the construction of the
+                            // stream: `agent_to_run.run(..)` merely builds the
+                            // stream, so without this every span created while the
+                            // stream is drained — i.e. the whole agent execution —
+                            // is created outside `agent_span`.
+                            result = agent_stream.next().instrument(agent_span.clone()) => result,
                         }
-                        return;
                     }
-                agent_stream.next().await
+                    None => agent_stream.next().instrument(agent_span.clone()).await,
+                }
             } {
                 match result {
-                    Ok(event) => {
-                        #[cfg(feature = "plugins")]
-                        let mut event = event;
-
+                    Ok(mut event) => {
                         #[cfg(feature = "plugins")]
                         if let Some(manager) = plugin_manager.as_ref() {
                             match manager
@@ -746,9 +941,34 @@ impl Runner {
                             }
                         }
 
+                        preserve_streamed_content(&mut streamed_content, &mut event);
+
                         // Check for transfer action
                         if let Some(target) = &event.actions.transfer_to_agent {
-                            transfer_target = Some(target.clone());
+                            let source = if event.author.is_empty() {
+                                agent_to_run.name()
+                            } else {
+                                &event.author
+                            };
+                            if let Some(allowed) = root_agent.transfer_targets_for(source)
+                                && !allowed.contains(target)
+                            {
+                                if root_agent.strict_transfer_policy() {
+                                    yield Err(adk_core::AdkError::new(
+                                        adk_core::ErrorComponent::Agent,
+                                        adk_core::ErrorCategory::Forbidden,
+                                        "agent.transfer.target_forbidden",
+                                        format!(
+                                            "agent '{source}' cannot hand off to '{target}'; allowed targets: {}",
+                                            allowed.join(", ")
+                                        ),
+                                    ));
+                                    return;
+                                }
+                                tracing::warn!(source, target, "handoff target rejected by root policy");
+                            } else {
+                                transfer_target = Some((source.to_string(), target.clone()));
+                            }
                         }
 
                         // CRITICAL: Apply state_delta to the mutable session immediately.
@@ -770,7 +990,12 @@ impl Runner {
                         // constraint. The final chunk (partial=false) carries the
                         // complete accumulated content.
                         if !event.llm_response.partial
-                            && let Err(e) = session_service.append_event(ctx.session_id(), event.clone()).await {
+                            && let Err(e) = session_service
+                                .append_event_for_identity(adk_session::AppendEventRequest {
+                                    identity: identity.clone(),
+                                    event: event.clone(),
+                                })
+                                .await {
                                 #[cfg(feature = "plugins")]
                                 if let Some(manager) = plugin_manager.as_ref() {
                                     manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
@@ -802,7 +1027,7 @@ impl Runner {
             let mut transfer_depth: u32 = 0;
             let mut current_transfer_target = transfer_target;
 
-            while let Some(target_name) = current_transfer_target.take() {
+            while let Some((transfer_source, target_name)) = current_transfer_target.take() {
                 transfer_depth += 1;
                 if transfer_depth > max_depth {
                     tracing::warn!(
@@ -810,13 +1035,60 @@ impl Runner {
                         target = %target_name,
                         "max transfer depth exceeded, stopping transfer chain"
                     );
+                    if root_agent.strict_transfer_policy() {
+                        yield Err(adk_core::AdkError::new(
+                            adk_core::ErrorComponent::Agent,
+                            adk_core::ErrorCategory::InvalidInput,
+                            "agent.transfer.depth_exceeded",
+                            format!(
+                                "maximum handoff depth {max_depth} exceeded while transferring to '{target_name}'"
+                            ),
+                        ));
+                        return;
+                    }
                     break;
+                }
+
+                let governance = adk_core::AgentTransferRequest {
+                    invocation_id: invocation_id.clone(),
+                    from: transfer_source.clone(),
+                    to: target_name.clone(),
+                    depth: transfer_depth,
+                };
+                match root_agent.govern_transfer(&governance).await {
+                    Ok(adk_core::AgentTransferDecision::Allow) => {}
+                    Ok(adk_core::AgentTransferDecision::Deny { reason }) => {
+                        yield Err(adk_core::AdkError::new(
+                            adk_core::ErrorComponent::Agent,
+                            adk_core::ErrorCategory::Forbidden,
+                            "agent.transfer.denied",
+                            format!(
+                                "handoff from '{transfer_source}' to '{target_name}' was denied: {reason}"
+                            ),
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
                 }
 
                 let target_agent = match Self::find_agent(&root_agent, &target_name) {
                     Some(a) => a,
                     None => {
                         tracing::warn!(target = %target_name, "transfer target not found in agent tree");
+                        if root_agent.strict_transfer_policy() {
+                            yield Err(adk_core::AdkError::new(
+                                adk_core::ErrorComponent::Agent,
+                                adk_core::ErrorCategory::NotFound,
+                                "agent.transfer.target_not_found",
+                                format!(
+                                    "handoff target '{target_name}' was not found in the agent tree"
+                                ),
+                            ));
+                            return;
+                        }
                         break;
                     }
                 };
@@ -825,16 +1097,22 @@ impl Runner {
                 // - parent: the agent that transferred to it (or root if applicable)
                 // - peers: siblings in the agent tree
                 // - children: handled by the agent itself via sub_agents()
-                let (parent_name, peer_names) = Self::compute_transfer_context(&root_agent, &target_name);
-
                 let mut transfer_run_config = run_config.clone();
-                let mut targets = Vec::new();
-                if let Some(ref parent) = parent_name {
-                    targets.push(parent.clone());
+                if let Some(targets) = root_agent.transfer_targets_for(&target_name) {
+                    transfer_run_config.transfer_targets = targets;
+                    transfer_run_config.parent_agent = None;
+                } else {
+                    let (parent_name, peer_names) =
+                        Self::compute_transfer_context(&root_agent, &target_name);
+                    let mut targets = Vec::new();
+                    if let Some(ref parent) = parent_name {
+                        targets.push(parent.clone());
+                    }
+                    targets.extend(peer_names);
+                    transfer_run_config.transfer_targets = targets;
+                    transfer_run_config.parent_agent = parent_name;
                 }
-                targets.extend(peer_names);
-                transfer_run_config.transfer_targets = targets;
-                transfer_run_config.parent_agent = parent_name;
+                root_agent.configure_run(&target_name, &mut transfer_run_config);
 
                 // For transfers, we reuse the same mutable session to preserve state
                 let transfer_invocation_id = format!("inv-{}", uuid::Uuid::new_v4());
@@ -853,6 +1131,10 @@ impl Runner {
                         return;
                     }
                 };
+                transfer_ctx = transfer_ctx.with_orchestration_root_invocation_id(
+                    adk_core::InvocationContext::orchestration_root_invocation_id(ctx.as_ref())
+                        .to_string(),
+                );
 
                 #[cfg(feature = "artifacts")]
                 if let Some(ref service) = artifact_service_clone {
@@ -870,6 +1152,12 @@ impl Runner {
                 transfer_ctx = transfer_ctx.with_run_config(transfer_run_config);
                 if let Some(rc) = request_context.clone() {
                     transfer_ctx = transfer_ctx.with_request_context(rc);
+                }
+                if let Some(token) = cancellation_token.as_ref() {
+                    transfer_ctx = transfer_ctx.with_cancellation_token(token.clone());
+                }
+                if let Some(shared_state) = adk_core::CallbackContext::shared_state(ctx.as_ref()) {
+                    transfer_ctx = transfer_ctx.with_shared_state(shared_state);
                 }
 
                 let transfer_ctx = Arc::new(transfer_ctx);
@@ -889,20 +1177,28 @@ impl Runner {
 
                 // Stream events from the transferred agent, capturing any further transfer
                 while let Some(result) = {
-                    if let Some(token) = cancellation_token.as_ref()
-                        && token.is_cancelled() {
-                            #[cfg(feature = "plugins")]
-                            if let Some(manager) = plugin_manager.as_ref() {
-                                manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
+                    // Race the next event against cancellation for prompt
+                    // mid-await interruption of the transferred agent.
+                    match cancellation_token.as_ref() {
+                        Some(token) => {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => {
+                                    tracing::info!("cancellation fired during transferred agent stream await");
+                                    #[cfg(feature = "plugins")]
+                                    if let Some(manager) = plugin_manager.as_ref() {
+                                        manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
+                                    }
+                                    return;
+                                }
+                                result = transfer_stream.next() => result,
                             }
-                            return;
                         }
-                    transfer_stream.next().await
+                        None => transfer_stream.next().await,
+                    }
                 } {
                     match result {
-                        Ok(event) => {
-                            #[cfg(feature = "plugins")]
-                            let mut event = event;
+                        Ok(mut event) => {
                             #[cfg(feature = "plugins")]
                             if let Some(manager) = plugin_manager.as_ref() {
                                 match manager
@@ -924,9 +1220,35 @@ impl Runner {
                                 }
                             }
 
+                            preserve_streamed_content(&mut streamed_content, &mut event);
+
                             // Capture further transfer requests
                             if let Some(target) = &event.actions.transfer_to_agent {
-                                current_transfer_target = Some(target.clone());
+                                let source = if event.author.is_empty() {
+                                    target_agent.name()
+                                } else {
+                                    &event.author
+                                };
+                                if let Some(allowed) = root_agent.transfer_targets_for(source)
+                                    && !allowed.contains(target)
+                                {
+                                    if root_agent.strict_transfer_policy() {
+                                        yield Err(adk_core::AdkError::new(
+                                            adk_core::ErrorComponent::Agent,
+                                            adk_core::ErrorCategory::Forbidden,
+                                            "agent.transfer.target_forbidden",
+                                            format!(
+                                                "agent '{source}' cannot hand off to '{target}'; allowed targets: {}",
+                                                allowed.join(", ")
+                                            ),
+                                        ));
+                                        return;
+                                    }
+                                    tracing::warn!(source, target, "handoff target rejected by root policy");
+                                } else {
+                                    current_transfer_target =
+                                        Some((source.to_string(), target.clone()));
+                                }
                             }
 
                             // Apply state delta for transferred agent too
@@ -938,7 +1260,12 @@ impl Runner {
                             transfer_ctx.mutable_session().append_event(event.clone());
 
                             if !event.llm_response.partial
-                                && let Err(e) = session_service.append_event(ctx.session_id(), event.clone()).await {
+                                && let Err(e) = session_service
+                                    .append_event_for_identity(adk_session::AppendEventRequest {
+                                        identity: identity.clone(),
+                                        event: event.clone(),
+                                    })
+                                    .await {
                                     #[cfg(feature = "plugins")]
                                     if let Some(manager) = plugin_manager.as_ref() {
                                         manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
@@ -1003,10 +1330,12 @@ impl Runner {
                             match compaction_cfg.summarizer.summarize_events(events_to_compact).await {
                                 Ok(Some(compaction_event)) => {
                                     // Persist the compaction event
-                                    if let Err(e) = session_service.append_event(
-                                        ctx.session_id(),
-                                        compaction_event.clone(),
-                                    ).await {
+                                    if let Err(e) = session_service
+                                        .append_event_for_identity(adk_session::AppendEventRequest {
+                                            identity: identity.clone(),
+                                            event: compaction_event.clone(),
+                                        })
+                                        .await {
                                         tracing::warn!(error = %e, "Failed to persist compaction event");
                                     } else {
                                         tracing::info!(
@@ -1034,7 +1363,7 @@ impl Runner {
             }
         };
 
-        Ok(Box::pin(s))
+        Ok(RunnerInvocation { invocation_id, events: Box::pin(s) })
     }
 
     /// Convenience method that accepts string arguments.
@@ -1082,21 +1411,78 @@ impl Runner {
     /// let mut stream = runner.run(user_id, session_id, new_content).await?;
     /// ```
     pub fn interrupt(&self, session_id: &str) -> bool {
-        let sessions = self.active_sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(token) = sessions.get(session_id) {
-            tracing::info!(session.id = session_id, "interrupting running agent");
-            token.cancel();
-            true
-        } else {
+        let runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
+        let matching: Vec<&ActiveRun> =
+            runs.values().filter(|run| run.identity.session_id.as_ref() == session_id).collect();
+        if matching.is_empty() {
             tracing::debug!(session.id = session_id, "no active run to interrupt");
-            false
+            return false;
         }
+        tracing::info!(
+            session.id = session_id,
+            run.count = matching.len(),
+            "interrupting running agent"
+        );
+        for run in matching {
+            run.token.cancel();
+        }
+        true
+    }
+
+    /// Interrupts runs for one exact identity.
+    ///
+    /// A session ID is only unique within an app and user, so this is the precise
+    /// form of [`Runner::interrupt`] for a `Runner` shared across tenants.
+    /// Returns `true` when at least one run was cancelled.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let cancelled = runner.interrupt_identity("my-app", "user-1", "session-1");
+    /// ```
+    pub fn interrupt_identity(&self, app_name: &str, user_id: &str, session_id: &str) -> bool {
+        let runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cancelled = false;
+        for run in runs.values() {
+            if run.identity.app_name.as_ref() == app_name
+                && run.identity.user_id.as_ref() == user_id
+                && run.identity.session_id.as_ref() == session_id
+            {
+                run.token.cancel();
+                cancelled = true;
+            }
+        }
+        if !cancelled {
+            tracing::debug!(
+                app.name = app_name,
+                user.id = user_id,
+                session.id = session_id,
+                "no active run to interrupt"
+            );
+        }
+        cancelled
+    }
+
+    /// Returns the identity of every run currently in flight.
+    ///
+    /// One identity appears once per in-flight run, so a repeated entry means that
+    /// identity has concurrent runs.
+    pub fn active_runs(&self) -> Vec<adk_core::AdkIdentity> {
+        let runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
+        runs.values().map(|run| run.identity.clone()).collect()
     }
 
     /// Returns the session IDs of all currently running agent executions.
+    ///
+    /// Session IDs are deduplicated. Use [`Runner::active_runs`] when the app and
+    /// user dimensions matter.
     pub fn active_session_ids(&self) -> Vec<String> {
-        let sessions = self.active_sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.keys().cloned().collect()
+        let runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids: Vec<String> =
+            runs.values().map(|run| run.identity.session_id.as_ref().to_string()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// Returns a reference to the context compaction configuration, if set.
@@ -1142,17 +1528,40 @@ impl Runner {
         root_agent.clone()
     }
 
-    /// Check if an agent found in session history can be resumed for the next
-    /// user message.
+    /// Check if an agent found in session history can be resumed directly for
+    /// the next user message.
     ///
-    /// This always returns `true` because the transfer-policy enforcement
-    /// (`disallow_transfer_to_parent` / `disallow_transfer_to_peers`) is
+    /// An agent is a valid direct-resumption target only if it *and* every
+    /// ancestor up to the root permit agent transfer
+    /// ([`Agent::supports_agent_transfer`]). A deterministic workflow agent
+    /// (sequential, parallel, loop, conditional) anywhere on that path returns
+    /// `false`, which forces resumption to restart from the workflow root
+    /// rather than a single sub-agent that happened to respond last. This
+    /// mirrors Google ADK's `_is_transferable_across_agent_tree`.
+    ///
+    /// LLM-driven transfer-policy enforcement
+    /// (`disallow_transfer_to_parent` / `disallow_transfer_to_peers`) is still
     /// handled inside `LlmAgent::run()` when it builds the `transfer_to_agent`
-    /// tool's valid-target list. The runner does not need to duplicate that
-    /// check here — it only needs to know whether the agent is a valid
-    /// resumption target, which it always is if it exists in the tree.
-    fn is_transferable(_root_agent: &Arc<dyn Agent>, _agent: &Arc<dyn Agent>) -> bool {
-        true
+    /// tool's valid-target list; this check only governs cross-turn resumption.
+    fn is_transferable(root_agent: &Arc<dyn Agent>, agent: &Arc<dyn Agent>) -> bool {
+        // Walk the tree from the root down to the target. Every agent on that
+        // path (root through target, inclusive) must support transfer for the
+        // target to be a valid direct-resumption point. `Some(true)` = found
+        // and fully transferable, `Some(false)` = found but a workflow agent
+        // sits on the path, `None` = target not present in this subtree.
+        fn path_supports_transfer(current: &Arc<dyn Agent>, target: &str) -> Option<bool> {
+            if current.name() == target {
+                return Some(current.supports_agent_transfer());
+            }
+            for sub in current.sub_agents() {
+                if let Some(sub_ok) = path_supports_transfer(sub, target) {
+                    return Some(current.supports_agent_transfer() && sub_ok);
+                }
+            }
+            None
+        }
+
+        path_supports_transfer(root_agent, agent.name()).unwrap_or(true)
     }
 
     /// Recursively search agent tree for agent with given name
@@ -1210,5 +1619,40 @@ impl Runner {
             }
             None => (None, Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod streamed_content_tests {
+    use super::preserve_streamed_content;
+    use adk_core::{Content, Event, Part};
+    use std::collections::HashMap;
+
+    fn text(event: &Event) -> String {
+        event
+            .content()
+            .map(|content| content.parts.iter().filter_map(Part::text).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn final_empty_event_preserves_streamed_text_for_persistence() {
+        let mut accumulated = HashMap::new();
+        let mut first = Event::with_id("response-1", "inv-1");
+        first.llm_response.partial = true;
+        first.llm_response.content = Some(Content::new("model").with_text("Verify "));
+        preserve_streamed_content(&mut accumulated, &mut first);
+
+        let mut second = Event::with_id("response-1", "inv-1");
+        second.llm_response.partial = true;
+        second.llm_response.content = Some(Content::new("model").with_text("the invoice."));
+        preserve_streamed_content(&mut accumulated, &mut second);
+
+        let mut final_event = Event::with_id("response-1", "inv-1");
+        final_event.llm_response.turn_complete = true;
+        preserve_streamed_content(&mut accumulated, &mut final_event);
+
+        assert_eq!(text(&final_event), "Verify the invoice.");
+        assert!(accumulated.is_empty());
     }
 }

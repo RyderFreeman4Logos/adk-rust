@@ -26,7 +26,12 @@ pub struct AwpEvent {
 }
 
 /// A webhook subscription for AWP events.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The HMAC secret never leaves this process: it is skipped on serialization and redacted in
+/// `Debug`. Listing subscriptions previously returned every subscriber's signing secret in the
+/// response body, which let anyone who could read the list forge signed deliveries to that
+/// endpoint.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventSubscription {
     /// Unique subscription identifier.
@@ -38,7 +43,81 @@ pub struct EventSubscription {
     /// Event types this subscription listens for.
     pub event_types: Vec<String>,
     /// Shared secret for HMAC-SHA256 signing.
+    ///
+    /// Skipped on serialization so it cannot reach an HTTP response. Deserialization still
+    /// accepts it, defaulting to empty, so a stored subscription can be loaded.
+    #[serde(skip_serializing, default)]
     pub secret: String,
+}
+
+impl std::fmt::Debug for EventSubscription {
+    /// Redacts the signing secret.
+    ///
+    /// The derived implementation printed it, so any `tracing` call that captured a
+    /// subscription would have written a live credential to the logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventSubscription")
+            .field("id", &self.id)
+            .field("subscriber", &self.subscriber)
+            .field("callback_url", &self.callback_url)
+            .field("event_types", &self.event_types)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl EventSubscription {
+    /// Validates the bounded subscription fields accepted by the built-in service.
+    ///
+    /// Callback URLs require HTTPS. The in-memory implementation does not
+    /// perform HTTP delivery, but enforcing the boundary here prevents an
+    /// invalid or insecure destination from becoming durable configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AwpError::InvalidRequest`] when a field is missing, oversized,
+    /// insecure, or malformed.
+    pub fn validate(&self) -> Result<(), AwpError> {
+        if self.subscriber.trim().is_empty() || self.subscriber.len() > 256 {
+            return Err(AwpError::InvalidRequest(
+                "subscriber must contain 1 to 256 bytes".to_string(),
+            ));
+        }
+        if self.callback_url.len() > 2_048 {
+            return Err(AwpError::InvalidRequest(
+                "callbackUrl must not exceed 2048 bytes".to_string(),
+            ));
+        }
+        let callback = self.callback_url.parse::<http::Uri>().map_err(|_| {
+            AwpError::InvalidRequest("callbackUrl must be a valid absolute HTTPS URL".to_string())
+        })?;
+        if callback.scheme_str() != Some("https") || callback.authority().is_none() {
+            return Err(AwpError::InvalidRequest(
+                "callbackUrl must be a valid absolute HTTPS URL".to_string(),
+            ));
+        }
+        if self.event_types.len() > 64 {
+            return Err(AwpError::InvalidRequest(
+                "eventTypes must not contain more than 64 entries".to_string(),
+            ));
+        }
+        if self
+            .event_types
+            .iter()
+            .any(|event_type| event_type.trim().is_empty() || event_type.len() > 128)
+        {
+            return Err(AwpError::InvalidRequest(
+                "each eventTypes entry must contain 1 to 128 bytes".to_string(),
+            ));
+        }
+        if self.secret.len() < 32 || self.secret.len() > 4_096 {
+            return Err(AwpError::InvalidRequest(
+                "secret must contain 32 to 4096 bytes".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Trait for managing event subscriptions and delivering events.
@@ -62,8 +141,9 @@ pub trait EventSubscriptionService: Send + Sync {
 
 /// In-memory event subscription service backed by [`DashMap`].
 ///
-/// Webhook delivery is logged but not actually performed (no HTTP client).
-/// Enable the `webhook-delivery` feature for real HTTP delivery.
+/// Delivery is logged but not sent over the network. Production applications
+/// implement [`EventSubscriptionService`] with their HTTP client, destination
+/// policy, retry queue, and durable subscription store.
 pub struct InMemoryEventSubscriptionService {
     subscriptions: DashMap<Uuid, EventSubscription>,
 }
@@ -84,6 +164,7 @@ impl Default for InMemoryEventSubscriptionService {
 #[async_trait]
 impl EventSubscriptionService for InMemoryEventSubscriptionService {
     async fn create(&self, subscription: EventSubscription) -> Result<Uuid, AwpError> {
+        subscription.validate()?;
         let id = subscription.id;
         self.subscriptions.insert(id, subscription);
         Ok(id)
@@ -167,7 +248,7 @@ mod tests {
             subscriber: "test-subscriber".to_string(),
             callback_url: "https://example.com/webhook".to_string(),
             event_types,
-            secret: "test-secret-key".to_string(),
+            secret: "test-secret-key-32-bytes-minimum!!".to_string(),
         }
     }
 
@@ -178,6 +259,25 @@ mod tests {
             timestamp: Utc::now(),
             payload: serde_json::json!({"state": "degrading"}),
         }
+    }
+
+    #[test]
+    fn test_subscription_validation_accepts_bounded_https_destination() {
+        assert!(sample_subscription(vec!["health.changed".to_string()]).validate().is_ok());
+    }
+
+    #[test]
+    fn test_subscription_validation_rejects_insecure_destination() {
+        let mut subscription = sample_subscription(vec![]);
+        subscription.callback_url = "http://example.com/webhook".to_string();
+        assert!(subscription.validate().is_err());
+    }
+
+    #[test]
+    fn test_subscription_validation_rejects_short_signing_secret() {
+        let mut subscription = sample_subscription(vec![]);
+        subscription.secret = "short".to_string();
+        assert!(subscription.validate().is_err());
     }
 
     #[tokio::test]

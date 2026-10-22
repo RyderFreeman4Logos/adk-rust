@@ -5,9 +5,8 @@
 //! | Model | Description | Thinking |
 //! |-------|-------------|----------|
 //! | `deepseek-v4-pro` | Strongest reasoning, thinking enabled by default | Yes |
-//! | `deepseek-v4-flash` | Fast, cost-efficient | Optional |
-//! | `deepseek-chat` | Legacy general-purpose chat | No |
-//! | `deepseek-reasoner` | Legacy reasoning with thinking | Yes |
+//! | `deepseek-flash` | Fast, cost-efficient, vision-capable | Optional |
+//! | `deepseek-v4-pro` | Strongest reasoning | Yes |
 //!
 //! # Features
 //!
@@ -17,7 +16,10 @@
 //! - **Strict Tool Mode** (beta): Model strictly follows JSON schema for tool args
 //! - **Streaming**: Real-time streaming responses with reasoning chunks
 //! - **Prefix Caching**: Automatic disk-based KV cache (server-side, zero config)
-//! - **JSON Output**: Structured JSON responses via `response_format`
+//! - **JSON Output**: `GenerateContentConfig::response_schema` turns on DeepSeek's
+//!   JSON Output (`response_format: {"type": "json_object"}`), which guarantees
+//!   syntactically valid JSON. DeepSeek has no `json_schema` mode, so the schema
+//!   itself is enforced by the agent's validation rather than by the provider
 //! - **Anthropic API**: Compatible endpoint at `https://api.deepseek.com/anthropic`
 //!
 //! # V4 Quick Start

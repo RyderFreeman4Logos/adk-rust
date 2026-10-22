@@ -41,8 +41,8 @@ pub async fn run(
     task: String,
     max_rounds: i64,
 ) -> Result<()> {
-    let (model, model_id) =
-        crate::resolve_model(cli_provider, cli_model, cli_api_key, thinking_budget)?;
+    let (provider, model_id) = crate::resolve_model_id(cli_provider, cli_model);
+    let model = crate::build_model(provider, &model_id, cli_api_key, thinking_budget)?;
     let root = PathBuf::from(&dir);
 
     println!("ultracode ({model_id}) on {dir}");
@@ -166,7 +166,11 @@ fn build_graph(
                 .with_update("decision", json!(decision))
                 .with_update("notes", json!(notes.join("\n"))))
         },
-        DeferredNodeConfig { merge_strategy: MergeStrategy::Collect, fan_in_timeout: None },
+        DeferredNodeConfig {
+            merge_strategy: MergeStrategy::Collect,
+            fan_in_timeout: None,
+            ..Default::default()
+        },
     );
 
     graph = graph.add_node_fn("revise", {
@@ -266,8 +270,10 @@ async fn run_agent(
         )
         .await?;
     let mut text = String::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     while let Some(event) = stream.next().await {
         let event = event?;
+        let event = text_deltas.push(&event);
         if let Some(content) = &event.llm_response.content {
             for part in &content.parts {
                 match part {

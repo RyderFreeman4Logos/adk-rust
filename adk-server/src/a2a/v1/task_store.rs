@@ -12,6 +12,13 @@ use tokio::sync::RwLock;
 
 use super::error::A2aError;
 
+/// [`TaskStoreEntry::metadata`] key holding the authenticated user that created a task.
+///
+/// The request handler writes it when a caller is authenticated and only serves
+/// the task to that caller. It is never sent on the wire: task and status-event
+/// conversions drop it. A custom [`TaskStore`] persists it like any other metadata.
+pub const OWNER_METADATA_KEY: &str = "adk.owner";
+
 /// An entry in the task store representing a persisted A2A task.
 #[derive(Debug, Clone)]
 pub struct TaskStoreEntry {
@@ -33,6 +40,14 @@ pub struct TaskStoreEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Timestamp when the task was last updated.
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl TaskStoreEntry {
+    /// The authenticated user that created the task, or `None` for a task created
+    /// without authentication. Read from [`OWNER_METADATA_KEY`].
+    pub fn owner(&self) -> Option<&str> {
+        self.metadata.get(OWNER_METADATA_KEY).and_then(serde_json::Value::as_str)
+    }
 }
 
 /// Parameters for listing tasks with optional filtering and pagination.
@@ -227,15 +242,15 @@ impl TaskStore for InMemoryTaskStore {
         let mut results: Vec<TaskStoreEntry> = tasks
             .values()
             .filter(|entry| {
-                if let Some(ref ctx) = params.context_id {
-                    if entry.context_id != *ctx {
-                        return false;
-                    }
+                if let Some(ref ctx) = params.context_id
+                    && entry.context_id != *ctx
+                {
+                    return false;
                 }
-                if let Some(ref state) = params.state {
-                    if entry.status.state != *state {
-                        return false;
-                    }
+                if let Some(ref state) = params.state
+                    && entry.status.state != *state
+                {
+                    return false;
                 }
                 true
             })
@@ -243,7 +258,7 @@ impl TaskStore for InMemoryTaskStore {
             .collect();
 
         // Sort by created_at for deterministic pagination
-        results.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        results.sort_by_key(|a| a.created_at);
 
         if let Some(page_size) = params.page_size {
             results.truncate(page_size as usize);

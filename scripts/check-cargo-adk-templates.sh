@@ -2,9 +2,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMPDIR="$(mktemp -d)"
-CHECK_TARGET_DIR="$TMPDIR/target"
-trap 'rm -rf "$TMPDIR"' EXIT
+ADK_GATE_ROOT="$ROOT"
+source "$ROOT/scripts/local-env.sh"
+TEMPLATE_ROOT="$(mktemp -d "$TMPDIR/adk-templates.XXXXXX")"
+trap 'rm -rf "$TEMPLATE_ROOT"' EXIT
+
+# Project generation runs outside the repository; retain its pinned toolchain.
+if command -v rustup >/dev/null 2>&1; then
+  RUST_TOOLCHAIN="$(awk -F'"' '/^channel = / { print $2; exit }' "$ROOT/rust-toolchain.toml")"
+  export RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}"
+fi
 
 # Entries are "template:provider[:addon1,addon2]".
 # An empty provider means "omit --provider" (exercises the template's
@@ -17,6 +24,7 @@ templates=(
   "tools:anthropic"
   "rag:gemini"
   "api:gemini"
+  "api:openai"
   "openai:"
   "a2a:gemini"
   "tools:gemini:telemetry,sessions"
@@ -42,8 +50,8 @@ for entry in "${templates[@]}"; do
   fi
 
   (
-    cd "$TMPDIR"
-    cargo run --manifest-path "$ROOT/Cargo.toml" -p cargo-adk -- "${args[@]}"
+    cd "$TEMPLATE_ROOT"
+    just --justfile "$ROOT/justfile" --working-directory "$TEMPLATE_ROOT" cargo run --manifest-path "$ROOT/Cargo.toml" -p cargo-adk -- "${args[@]}"
 
     cat >> "$name/Cargo.toml" <<PATCH
 
@@ -62,6 +70,6 @@ adk-anthropic = { path = "$ROOT/adk-anthropic" }
 adk-rust-macros = { path = "$ROOT/adk-rust-macros" }
 PATCH
 
-    CARGO_TARGET_DIR="$CHECK_TARGET_DIR" cargo check --manifest-path "$name/Cargo.toml"
+    just --justfile "$ROOT/justfile" --working-directory "$ROOT" template-cargo check "$TEMPLATE_ROOT/$name/Cargo.toml"
   )
 done

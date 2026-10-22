@@ -652,11 +652,13 @@ impl OpenAITransportLink for OpenAIWebRTCSession {
             return Err(RealtimeError::NotConnected);
         }
 
+        // `to_i16_samples` borrows directly from the chunk when the buffer is
+        // aligned, so the encoder sees the samples without an intermediate copy.
         let pcm_samples = audio
             .to_i16_samples()
             .map_err(|e| RealtimeError::opus(format!("Invalid PCM16 audio data: {e}")))?;
 
-        self.write_audio_to_track(&pcm_samples).await
+        self.write_audio_to_track(pcm_samples.as_ref()).await
     }
 
     /// Send base64-encoded PCM16 audio over the WebRTC audio track.

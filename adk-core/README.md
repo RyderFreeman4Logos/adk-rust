@@ -26,14 +26,14 @@ This crate is model-agnostic and contains no LLM-specific code.
 
 ```toml
 [dependencies]
-adk-core = "2.0.0"
+adk-core = "2.3.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = "2.0.0"
+adk-rust = "2.3.0"
 ```
 
 ## Core Traits
@@ -61,11 +61,14 @@ pub trait Tool: Send + Sync {
     fn is_long_running(&self) -> bool;
     fn is_read_only(&self) -> bool;           // default: false
     fn is_concurrency_safe(&self) -> bool;    // default: false
+    fn is_agent_delegation(&self) -> bool;    // default: false
     async fn execute(&self, ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value>;
 }
 ```
 
-`is_read_only()` and `is_concurrency_safe()` are used by the `ToolExecutionStrategy::Auto` dispatch mode to run read-only tools concurrently. Both default to `false` so existing implementations are unaffected.
+`ToolExecutionStrategy::Auto` includes a call in its concurrent subset only when the selected tool returns `true` from both `is_read_only()` and `is_concurrency_safe()`. It runs that safe subset first, then executes the remaining calls sequentially. Both methods default to `false`, so existing implementations remain sequential.
+
+Agent implementations may use `is_agent_delegation()` to identify consecutive delegation calls that can overlap without parallelizing ordinary tools.
 
 ### Toolset
 
@@ -114,10 +117,10 @@ let content = Content::new("user")
 // Part variants
 enum Part {
     Text { text: String },
-    InlineData { mime_type: String, data: Vec<u8> },  // Max 10MB (MAX_INLINE_DATA_SIZE)
-    FileData { mime_type: String, file_uri: String },
+    InlineData { mime_type: String, data: Vec<u8>, uri: Option<String>, annotations: Option<Value> },
+    FileData { mime_type: String, file_uri: String, annotations: Option<Value> },
     FunctionCall { name: String, args: Value, id: Option<String> },
-    FunctionResponse { function_response: FunctionResponseData, id: Option<String> },
+    FunctionResponse { function_response: FunctionResponseData, id: Option<String>, annotations: Option<Value> },
 }
 ```
 
@@ -136,14 +139,23 @@ Ok(json!({
 let frd = FunctionResponseData::with_inline_data(
     "chart_tool",
     json!({"title": "Q4 Chart"}),
-    vec![InlineDataPart { mime_type: "image/png".into(), data: png_bytes }],
+    vec![InlineDataPart {
+        mime_type: "image/png".into(),
+        data: png_bytes,
+        uri: None,
+        annotations: None,
+    }],
 );
 
 // File references (URIs to external files)
 let frd = FunctionResponseData::with_file_data(
     "doc_tool",
     json!({"status": "ok"}),
-    vec![FileDataPart { mime_type: "application/pdf".into(), file_uri: "gs://bucket/report.pdf".into() }],
+    vec![FileDataPart {
+        mime_type: "application/pdf".into(),
+        file_uri: "gs://bucket/report.pdf".into(),
+        annotations: None,
+    }],
 );
 ```
 
@@ -158,6 +170,26 @@ event.actions    // State changes, transfers, escalation
 // Provider-specific metadata (replaces GCP-specific fields)
 event.provider_metadata  // HashMap<String, String>
 ```
+
+#### Complete response snapshots
+
+Terminal events marked with `llm_response.provider_metadata.content_complete`
+contain the complete response for their event ID, including earlier streamed
+text. Preserve the original event for persistence and replacement-aware UIs.
+Append-only output can use one `EventTextDeltas` adapter per live stream:
+
+```rust
+let mut deltas = adk_core::EventTextDeltas::default();
+while let Some(event) = stream.next().await {
+    let event = event?;
+    let output = deltas.push(&event);
+    // Render output.content(); persist the original event.
+}
+```
+
+The adapter preserves tool parts, thinking signatures, actions and usage. A
+non-prefix correction is returned in full because append-only output cannot
+retract text already rendered.
 
 #### First-class tool events
 
@@ -347,12 +379,12 @@ Controls how multiple tool calls from a single LLM response are dispatched:
 ```rust
 pub enum ToolExecutionStrategy {
     Sequential,  // One at a time, in order (default)
-    Parallel,    // All concurrently via join_all
-    Auto,        // Read-only tools concurrently, then mutable sequentially
+    Parallel,    // All concurrently; caller owns safety
+    Auto,        // Safe read-only subset concurrently, then the rest sequentially
 }
 ```
 
-Set per-agent via `LlmAgentBuilder::tool_execution_strategy()`.
+Set per-agent via `LlmAgentBuilder::tool_execution_strategy()`. `Parallel` is an explicit override that does not inspect tool metadata.
 
 ## Related Crates
 

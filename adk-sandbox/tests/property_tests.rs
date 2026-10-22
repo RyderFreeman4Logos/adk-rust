@@ -3,17 +3,21 @@
 //! Uses `proptest` with 100+ iterations per property.
 
 use proptest::prelude::*;
+#[cfg(not(windows))]
 use proptest::test_runner::TestCaseError;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use adk_sandbox::{ExecRequest, Language, ProcessBackend, SandboxBackend, SandboxError};
+use adk_sandbox::{ExecRequest, Language};
+#[cfg(not(windows))]
+use adk_sandbox::{ProcessBackend, SandboxBackend, SandboxError};
 
 // ---------------------------------------------------------------------------
 // Generators
 // ---------------------------------------------------------------------------
 
 /// Generates arbitrary environment variable names (alphanumeric + underscore).
+#[cfg(not(windows))]
 fn arb_env_key() -> impl Strategy<Value = String> {
     "[A-Z][A-Z0-9_]{1,15}".prop_filter("avoid PATH and system vars", |k| {
         !matches!(k.as_str(), "PATH" | "HOME" | "USER" | "SHELL" | "TERM" | "LANG" | "PWD")
@@ -21,11 +25,13 @@ fn arb_env_key() -> impl Strategy<Value = String> {
 }
 
 /// Generates arbitrary environment variable values.
+#[cfg(not(windows))]
 fn arb_env_value() -> impl Strategy<Value = String> {
     "[a-zA-Z0-9_]{1,30}"
 }
 
 /// Generates a small set of environment variables (0 to 5 entries).
+#[cfg(not(windows))]
 fn arb_env_map() -> impl Strategy<Value = HashMap<String, String>> {
     prop::collection::hash_map(arb_env_key(), arb_env_value(), 0..=5)
 }
@@ -58,6 +64,8 @@ proptest! {
         let result: Result<(), TestCaseError> = rt.block_on(async {
             let backend = ProcessBackend::default();
             let timeout = Duration::from_millis(timeout_ms);
+            // The sandbox clears the environment; sleep still needs an explicit PATH.
+            let path = std::env::var("PATH").expect("the test environment must provide PATH");
 
             let request = ExecRequest {
                 language: Language::Command,
@@ -65,7 +73,7 @@ proptest! {
                 stdin: None,
                 timeout,
                 memory_limit_mb: None,
-                env: HashMap::new(),
+                env: HashMap::from([("PATH".to_string(), path)]),
             };
 
             let start = std::time::Instant::now();

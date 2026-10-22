@@ -12,19 +12,20 @@ A flexible framework for developing AI agents with simplicity and power. Model-a
 
 | Provider | Feature Flag | Default Model |
 |----------|-------------|---------------|
-| Gemini | `gemini` (default) | `gemini-2.5-flash` |
-| OpenAI | `openai` | `gpt-5-mini` |
-| Anthropic | `anthropic` | `claude-sonnet-4-6` |
-| DeepSeek | `deepseek` | `deepseek-chat` |
-| Groq | `groq` | `llama-3.3-70b-versatile` |
-| Ollama | `ollama` | `llama3.2` |
-| Fireworks AI | `fireworks` | `accounts/fireworks/models/llama-v3p1-8b-instruct` |
-| Together AI | `together` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
-| Mistral AI | `mistral` | `mistral-small-latest` |
-| Perplexity | `perplexity` | `sonar` |
-| Cerebras | `cerebras` | `llama-3.3-70b` |
-| SambaNova | `sambanova` | `Meta-Llama-3.3-70B-Instruct` |
-| Amazon Bedrock | `bedrock` | `us.anthropic.claude-sonnet-4-6` |
+| Gemini | `gemini` (default) | `gemini-3.7-flash` |
+| OpenAI | `openai` | `gpt-5.6-terra` |
+| Anthropic | `anthropic` | `claude-sonnet-5` |
+| DeepSeek | `deepseek` | `deepseek-v4-flash` |
+| Groq | `groq` | `openai/gpt-oss-120b` |
+| Ollama | `ollama` | `qwen3.5` |
+| Fireworks AI | `openai` preset | `accounts/fireworks/models/kimi-k2p6` |
+| Together AI | `openai` preset | `MiniMaxAI/MiniMax-M2.7` |
+| Mistral AI | `openai` preset | `mistral-medium-latest` |
+| Perplexity | `openai` preset | `sonar-pro` |
+| Cerebras | `cerebras` | `gpt-oss-120b` |
+| SambaNova | `sambanova` | `gpt-oss-120b` |
+| OrcaRouter | `openai` preset | `openai/gpt-5.6-terra` |
+| Amazon Bedrock | `bedrock` | (account/region-specific) |
 | Azure AI Inference | `azure-ai` | (endpoint-specific) |
 
 ## Quick Start
@@ -39,7 +40,7 @@ cargo new my_agent && cd my_agent
 
 ```toml
 [dependencies]
-adk-rust = "2.0.0"
+adk-rust = "2.3.0"
 tokio = { version = "1.40", features = ["full"] }
 dotenvy = "0.15"
 ```
@@ -61,7 +62,7 @@ use std::sync::Arc;
 async fn main() -> AnyhowResult<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
 
     let agent = LlmAgentBuilder::new("assistant")
         .instruction("You are a helpful assistant.")
@@ -96,7 +97,10 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`provider_from_env()` checks `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GOOGLE_API_KEY` in order.
+`provider_from_env()` first honors the Vertex opt-in flags
+`GOOGLE_GENAI_USE_ENTERPRISE` / `GOOGLE_GENAI_USE_VERTEXAI`, then checks
+`ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GOOGLE_API_KEY`. It uses the shared
+catalog defaults for the selected provider.
 
 ## Adding Tools
 
@@ -141,7 +145,7 @@ Build voice-enabled AI assistants with bidirectional audio streaming:
 use adk_realtime::{RealtimeAgent, openai::OpenAIRealtimeModel, RealtimeModel};
 
 let model: Arc<dyn RealtimeModel> = Arc::new(
-    OpenAIRealtimeModel::new(&api_key, "gpt-realtime")
+    OpenAIRealtimeModel::new(&api_key, "gpt-realtime-2.1")
 );
 
 let agent = RealtimeAgent::builder("voice_assistant")
@@ -175,20 +179,35 @@ let agent = GraphAgent::builder("processor")
     .edge(START, "fetch")
     .edge("fetch", "transform")
     .edge("transform", END)
-    .checkpointer(SqliteCheckpointer::new("state.db").await?)
+    .checkpointer(SqliteCheckpointer::new("sqlite:state.db?mode=rwc").await?)
     .build()?;
 ```
 
 Features:
 - Cyclic graphs for ReAct patterns
-- Conditional routing
+- Conditional routing, and `with_goto` for a node that picks its own successor
 - State management with reducers
-- Checkpointing (memory, SQLite)
-- Human-in-the-loop interrupts
+- Checkpointing (memory, SQLite), delta checkpoints, and retention policies
+- Human-in-the-loop interrupts, before or after a node
+- Subgraphs — a compiled graph as a node, nested, with its own checkpoint thread
+- Per-node retry with capped backoff, node timeouts, and a concurrency bound
+- Time travel — step, fork, and state history
+
+The `SqliteCheckpointer` above needs the `graph-sqlite` feature. `adk-graph` has no
+default features, so each capability is forwarded from this crate:
+
+| Feature | Enables | In `full` |
+|---------|---------|-----------|
+| `graph-functional` | `#[entrypoint]`/`#[task]` functional API | yes |
+| `graph-node-cache` | node result caching with content keys | yes |
+| `graph-delta` | delta checkpoints | yes |
+| `graph-time-travel` | step, fork, and state history | yes |
+| `graph-sqlite` | the SQLite checkpointer | no — needs a database |
+| `graph-redis-cache` | Redis-backed node cache | no — needs a server |
 
 ## Browser Automation
 
-Give agents web browsing capabilities with 46 tools:
+Give agents web browsing capabilities with 46 tools (`browser_evaluate_js` is opt-in, and navigation accepts only `http`/`https` by default):
 
 ```rust
 use adk_browser::{BrowserSession, BrowserToolset, BrowserConfig};
@@ -197,7 +216,7 @@ use std::sync::Arc;
 let config = BrowserConfig::new().webdriver_url("http://localhost:4444");
 let session = Arc::new(BrowserSession::new(config));
 let toolset = BrowserToolset::new(session);
-let tools = toolset.all_tools();  // 46 browser tools
+let tools = toolset.all_tools();  // 45 browser tools; .with_evaluate_js(true) adds the 46th
 
 let mut builder = LlmAgentBuilder::new("web_agent")
     .model(model);
@@ -290,23 +309,32 @@ cargo run -- serve --port 8080
 
 ```toml
 # Minimal (default) — agents, Gemini, runner, sessions (fastest build)
-adk-rust = "2.0.0"
+adk-rust = "2.3.0"
 
 # Standard — minimal + tools, memory, OpenAI, Anthropic, server, auth,
 # graph, eval, guardrails, skills, plugins, artifacts, telemetry
-adk-rust = { version = "2.0.0", features = ["standard"] }
+adk-rust = { version = "2.3.0", features = ["standard"] }
 
 # Enterprise — standard + realtime, browser, rag, payments, awp
-adk-rust = { version = "2.0.0", features = ["enterprise"] }
+adk-rust = { version = "2.3.0", features = ["enterprise"] }
 
-# Full — enterprise + experimental crates (audio, code, sandbox)
-adk-rust = { version = "2.0.0", features = ["full"] }
+# Full — enterprise + experimental crates (audio, code, sandbox, code-tools)
+adk-rust = { version = "2.3.0", features = ["full"] }
+
+# Gemini Enterprise Agent Platform — every Vertex/EAP integration except
+# realtime transports; composable with any tier. The right default for
+# ReasoningEngine BYOC deployments. Deploy-time tooling is host-side and
+# not included.
+adk-rust = { version = "2.3.0", features = ["standard", "gemini-agent-platform"] }
+
+# gemini-agent-platform + Vertex AI Live API (pulls in the realtime WebSocket/audio stack)
+adk-rust = { version = "2.3.0", features = ["standard", "gemini-agent-platform-full"] }
 
 # Custom
-adk-rust = { version = "2.0.0", default-features = false, features = ["agents", "gemini", "tools"] }
+adk-rust = { version = "2.3.0", default-features = false, features = ["agents", "gemini", "tools"] }
 
 # With new providers (forwarded to adk-model)
-adk-model = { version = "2.0.0", features = ["fireworks", "together", "mistral", "perplexity", "cerebras", "sambanova", "bedrock", "azure-ai"] }
+adk-model = { version = "2.3.0", features = ["fireworks", "together", "mistral", "perplexity", "cerebras", "sambanova", "bedrock", "azure-ai"] }
 ```
 
 ## Documentation

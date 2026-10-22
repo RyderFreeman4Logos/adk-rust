@@ -10,7 +10,7 @@ use crate::{
         handle::FileHandle,
         model::{File, ListFilesResponse},
     },
-    generation::{ContentBuilder, GenerateContentRequest, GenerationResponse},
+    generation::{ContentBuilder, GenerateContentRequest, GenerationConfig, GenerationResponse},
 };
 use eventsource_stream::EventStreamError;
 use futures::Stream;
@@ -19,7 +19,10 @@ use google_cloud_aiplatform_v1::client::PredictionService;
 #[cfg(feature = "vertex")]
 use google_cloud_auth::credentials::{self, Credentials};
 use mime::Mime;
-use reqwest::{ClientBuilder, header::InvalidHeaderValue};
+use reqwest::{
+    ClientBuilder,
+    header::{HeaderMap, HeaderValue, InvalidHeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::{
@@ -49,10 +52,10 @@ static V1_BASE_URL: LazyLock<Url> = LazyLock::new(|| {
 ///
 /// Each variant maps to a specific model version on the Gemini API.
 /// Use [`Model::Custom`] for model IDs not yet represented as variants.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum Model {
-    // ── Gemini 3.5 (latest generation) ──────────────────────────
-    /// Gemini 3.5 Flash — latest stable model.
+    // ── Gemini 3.5 ──────────────────────────────────────────────
+    /// Gemini 3.5 Flash.
     #[serde(rename = "models/gemini-3.5-flash")]
     Gemini35Flash,
 
@@ -68,7 +71,8 @@ pub enum Model {
     Gemini31FlashImage,
 
     // ── Gemini 3 ─────────────────────────────────────────────────
-    /// Gemini 3 Pro preview.
+    /// Gemini 3 Pro preview (retired).
+    #[deprecated(note = "Retired. Use Model::Gemini31ProPreview instead.")]
     #[serde(rename = "models/gemini-3-pro-preview")]
     Gemini3ProPreview,
     /// Gemini 3 Pro Image (Nano Banana Pro) — GA multimodal output.
@@ -89,8 +93,7 @@ pub enum Model {
     /// Gemini 2.5 Pro preview with TTS support.
     #[serde(rename = "models/gemini-2.5-pro-preview-tts")]
     Gemini25ProPreviewTts,
-    /// Gemini 2.5 Flash — default model.
-    #[default]
+    /// Gemini 2.5 Flash.
     #[serde(rename = "models/gemini-2.5-flash")]
     Gemini25Flash,
     /// Gemini 2.5 Flash preview (September 2025).
@@ -133,7 +136,31 @@ pub enum Model {
     Custom(String),
 }
 
+impl Default for Model {
+    fn default() -> Self {
+        Self::gemini_3_7_flash()
+    }
+}
+
 impl Model {
+    /// Return the current balanced Gemini default.
+    ///
+    /// This factory avoids adding a new enum variant whenever Google releases a
+    /// model while preserving exhaustive matches for existing callers.
+    pub fn gemini_3_7_flash() -> Self {
+        Self::Custom("models/gemini-3.7-flash".to_string())
+    }
+
+    /// Return Gemini 3.6 Flash.
+    pub fn gemini_3_6_flash() -> Self {
+        Self::Custom("models/gemini-3.6-flash".to_string())
+    }
+
+    /// Return Gemini 3.5 Flash-Lite, the most cost-efficient GA model.
+    pub fn gemini_3_5_flash_lite() -> Self {
+        Self::Custom("models/gemini-3.5-flash-lite".to_string())
+    }
+
     /// Returns the model identifier as a string slice.
     pub fn as_str(&self) -> &str {
         #[allow(deprecated)]
@@ -439,7 +466,7 @@ pub enum Error {
 
     /// The requested operation is not supported by the Vertex AI backend.
     #[snafu(display(
-        "operation '{operation}' is not supported with the google cloud sdk backend (PredictionService currently exposes generateContent/embedContent only)"
+        "operation '{operation}' is not supported with the google cloud vertex backend (files, batch, and interactions APIs are Studio-only)"
     ))]
     GoogleCloudUnsupported {
         /// The unsupported operation name.
@@ -493,6 +520,66 @@ pub struct GeminiClient {
     backend: Box<dyn backend::GeminiBackend>,
 }
 
+pub(crate) fn validate_generation_config_for_model(
+    model: &Model,
+    config: &GenerationConfig,
+) -> Result<(), Error> {
+    config.validate().map_err(|message| Error::InvalidGenerationConfig { message })?;
+
+    let model = model.to_string();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    if !matches!(model, "gemini-3.6-flash" | "gemini-3.7-flash") {
+        return Ok(());
+    }
+
+    if config.temperature.is_some() || config.top_p.is_some() || config.top_k.is_some() {
+        return Err(Error::InvalidGenerationConfig {
+            message: format!(
+                "{model} does not accept temperature, top_p, or top_k; remove explicit sampling parameters"
+            ),
+        });
+    }
+    if config.candidate_count.is_some() {
+        return Err(Error::InvalidGenerationConfig {
+            message: format!(
+                "{model} does not accept candidate_count; remove it and request one candidate"
+            ),
+        });
+    }
+    if config.thinking_config.as_ref().is_some_and(|thinking| thinking.thinking_budget.is_some()) {
+        return Err(Error::InvalidGenerationConfig {
+            message: format!(
+                "{model} uses thinking levels instead of token budgets; set thinking_level and clear thinking_budget"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "interactions")]
+pub(crate) fn validate_interaction_generation_config_for_model(
+    model: Option<&str>,
+    config: &crate::interactions::GenerationConfig,
+) -> Result<(), Error> {
+    config.validate().map_err(|message| Error::InvalidGenerationConfig { message })?;
+
+    let Some(model) = model.map(|model| model.rsplit('/').next().unwrap_or(model)) else {
+        return Ok(());
+    };
+    if matches!(model, "gemini-3.6-flash" | "gemini-3.7-flash")
+        && (config.temperature.is_some() || config.top_p.is_some())
+    {
+        return Err(Error::InvalidGenerationConfig {
+            message: format!(
+                "{model} does not accept temperature or top_p; remove explicit sampling parameters"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 impl std::fmt::Debug for GeminiClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("GeminiClient")
@@ -514,6 +601,10 @@ impl GeminiClient {
         Self { model, backend: Box::new(vertex) }
     }
 
+    fn validate_generation_config(&self, config: &GenerationConfig) -> Result<(), Error> {
+        validate_generation_config_for_model(&self.model, config)
+    }
+
     // ── Delegating methods ──────────────────────────────────────────────
 
     #[instrument(skip_all, fields(
@@ -522,6 +613,7 @@ impl GeminiClient {
         tools.present = request.tools.is_some(),
         system.instruction.present = request.system_instruction.is_some(),
         cached.content.present = request.cached_content.is_some(),
+        vertex.rag_store.present = vertex_rag_store.is_some(),
         usage.prompt_tokens,
         usage.candidates_tokens,
         usage.thoughts_tokens,
@@ -531,12 +623,16 @@ impl GeminiClient {
     pub(crate) async fn generate_content_raw(
         &self,
         request: GenerateContentRequest,
+        vertex_rag_store: Option<crate::tools::model::VertexRagStore>,
     ) -> Result<GenerationResponse, Error> {
         if let Some(ref gc) = request.generation_config {
-            gc.validate().map_err(|message| Error::InvalidGenerationConfig { message })?;
+            self.validate_generation_config(gc)?;
         }
 
-        let response = self.backend.generate_content(request).await?;
+        let response = match vertex_rag_store {
+            Some(store) => self.backend.generate_content_with_vertex_rag(request, store).await?,
+            None => self.backend.generate_content(request).await?,
+        };
 
         if let Some(usage) = &response.usage_metadata {
             #[rustfmt::skip]
@@ -558,16 +654,23 @@ impl GeminiClient {
         tools.present = request.tools.is_some(),
         system.instruction.present = request.system_instruction.is_some(),
         cached.content.present = request.cached_content.is_some(),
+        vertex.rag_store.present = vertex_rag_store.is_some(),
     ), err)]
     pub(crate) async fn generate_content_stream(
         &self,
         request: GenerateContentRequest,
+        vertex_rag_store: Option<crate::tools::model::VertexRagStore>,
     ) -> Result<backend::BackendStream<GenerationResponse>, Error> {
         if let Some(ref gc) = request.generation_config {
-            gc.validate().map_err(|message| Error::InvalidGenerationConfig { message })?;
+            self.validate_generation_config(gc)?;
         }
 
-        self.backend.generate_content_stream(request).await
+        match vertex_rag_store {
+            Some(store) => {
+                self.backend.generate_content_stream_with_vertex_rag(request, store).await
+            }
+            None => self.backend.generate_content_stream(request).await,
+        }
     }
 
     #[instrument(skip_all, fields(
@@ -733,7 +836,7 @@ impl GeminiClient {
         request: crate::interactions::CreateInteractionRequest,
     ) -> Result<crate::interactions::Interaction, Error> {
         if let Some(ref gc) = request.generation_config {
-            gc.validate().map_err(|message| Error::InvalidGenerationConfig { message })?;
+            validate_interaction_generation_config_for_model(request.model.as_deref(), gc)?;
         }
         self.backend.create_interaction(request).await
     }
@@ -748,7 +851,7 @@ impl GeminiClient {
         request: crate::interactions::CreateInteractionRequest,
     ) -> Result<backend::BackendStream<crate::interactions::InteractionSseEvent>, Error> {
         if let Some(ref gc) = request.generation_config {
-            gc.validate().map_err(|message| Error::InvalidGenerationConfig { message })?;
+            validate_interaction_generation_config_for_model(request.model.as_deref(), gc)?;
         }
         self.backend.create_interaction_stream(request).await
     }
@@ -856,6 +959,7 @@ fn build_vertex_prediction_service(
                 .block_on(
                     PredictionService::builder()
                         .with_endpoint(endpoint)
+                        .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry)
                         .with_credentials(credentials)
                         .build(),
                 )
@@ -900,6 +1004,8 @@ pub struct GeminiBuilder {
     base_url: Url,
     #[cfg(feature = "vertex")]
     google_cloud: Option<GoogleCloudConfig>,
+    #[cfg(feature = "vertex")]
+    google_cloud_endpoint: Option<String>,
     api_key: Option<String>,
     #[cfg(feature = "vertex")]
     google_cloud_auth: Option<GoogleCloudAuth>,
@@ -914,6 +1020,8 @@ impl GeminiBuilder {
             base_url: DEFAULT_BASE_URL.clone(),
             #[cfg(feature = "vertex")]
             google_cloud: None,
+            #[cfg(feature = "vertex")]
+            google_cloud_endpoint: None,
             api_key: Some(key.into()),
             #[cfg(feature = "vertex")]
             google_cloud_auth: None,
@@ -926,7 +1034,11 @@ impl GeminiBuilder {
         self
     }
 
-    /// Set a custom HTTP client builder.
+    /// Set a custom HTTP client builder for the AI Studio backend.
+    ///
+    /// Settings such as proxies, timeouts and default headers apply to every Studio
+    /// request. The redirect policy is always replaced with
+    /// [`reqwest::redirect::Policy::none`] so the API key is never re-sent to another host.
     pub fn with_http_client(mut self, client_builder: ClientBuilder) -> Self {
         self.client_builder = client_builder;
         self
@@ -964,6 +1076,23 @@ impl GeminiBuilder {
     ) -> Self {
         self.google_cloud =
             Some(GoogleCloudConfig { project_id: project_id.into(), location: location.into() });
+        self
+    }
+
+    /// Override the Vertex API endpoint without switching to the Studio backend.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_gemini::GeminiBuilder;
+    ///
+    /// let builder = GeminiBuilder::new("api-key")
+    ///     .with_google_cloud("my-project", "us-central1")
+    ///     .with_google_cloud_endpoint("https://us-central1-aiplatform.googleapis.com");
+    /// ```
+    #[cfg(feature = "vertex")]
+    pub fn with_google_cloud_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.google_cloud_endpoint = Some(endpoint.into());
         self
     }
 
@@ -1009,7 +1138,7 @@ impl GeminiBuilder {
                     },
                 };
                 let credentials = google_cloud_auth.credentials()?;
-                let endpoint = config.endpoint();
+                let endpoint = self.google_cloud_endpoint.unwrap_or_else(|| config.endpoint());
                 let prediction =
                     build_vertex_prediction_service(endpoint.clone(), credentials.clone())?;
 
@@ -1030,8 +1159,20 @@ impl GeminiBuilder {
             return MissingApiKeySnafu.fail();
         }
 
+        let mut key = HeaderValue::from_str(&api_key).context(InvalidApiKeySnafu)?;
+        key.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-goog-api-key", key);
+        // A redirect would re-send `x-goog-api-key` to the target host, so the Studio
+        // client never follows one, whatever the configured builder says.
+        let client = self
+            .client_builder
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context(PerformRequestNewSnafu)?;
         let studio =
-            backend::studio::StudioBackend::new(&api_key, self.model.clone(), self.base_url)?;
+            backend::studio::StudioBackend::with_client(client, self.model.clone(), self.base_url);
 
         Ok(Gemini { client: Arc::new(GeminiClient::with_studio(self.model, studio)) })
     }
@@ -1694,5 +1835,37 @@ mod client_tests {
             location: "europe-west4".to_string(),
         };
         assert_eq!(config.endpoint(), "https://europe-west4-aiplatform.googleapis.com");
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::GeminiBuilder;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn studio_builder_does_not_follow_redirects() {
+        let target = MockServer::start().await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(200)).expect(0).mount(&target).await;
+        let origin = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/landing", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let client = GeminiBuilder::new("test-key")
+            .with_base_url(format!("{}/v1beta/", origin.uri()).parse().unwrap())
+            .with_http_client(reqwest::ClientBuilder::new())
+            .build()
+            .unwrap();
+
+        let result = client.generate_content().with_user_message("hello").execute().await;
+
+        assert!(result.is_err());
+        assert_eq!(target.received_requests().await.unwrap().len(), 0);
     }
 }

@@ -131,7 +131,7 @@ impl SensitivePaymentDataGuardrail {
                         thought_signature: thought_signature.clone(),
                     });
                 }
-                Part::FunctionResponse { function_response, id } => {
+                Part::FunctionResponse { function_response, id, annotations } => {
                     let redacted_response = self.redact_json(&function_response.response);
                     if redacted_response != function_response.response {
                         changed = true;
@@ -142,6 +142,7 @@ impl SensitivePaymentDataGuardrail {
                             redacted_response,
                         ),
                         id: id.clone(),
+                        annotations: annotations.clone(),
                     });
                 }
                 _ => new_parts.push(part.clone()),
@@ -473,6 +474,7 @@ mod tests {
                         }),
                     ),
                     id: None,
+                    annotations: None,
                 },
             ],
         };

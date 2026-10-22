@@ -2,7 +2,9 @@
 //!
 //! The Gemini Interactions API (Beta) only supports a fixed set of model and
 //! agent targets. This module defines the [`InteractionTarget`] type together
-//! with the documented allowlists ([`MODEL_TARGETS`] and [`AGENT_TARGETS`]).
+//! with the documented allowlists
+//! ([`MODEL_TARGETS`](crate::gemini::interactions_target::MODEL_TARGETS) and
+//! [`AGENT_TARGETS`](crate::gemini::interactions_target::AGENT_TARGETS)).
 //!
 //! A [`InteractionTarget::Model`] sets the request `model` field, while a
 //! [`InteractionTarget::Agent`] sets the request `agent` field (e.g. Deep
@@ -20,7 +22,10 @@ use adk_core::{AdkError, ErrorCategory, ErrorComponent};
 /// identifiers, the request's `model` field is set. Any identifier outside
 /// this list (and [`AGENT_TARGETS`]) is rejected with an `InvalidInput` error.
 pub const MODEL_TARGETS: &[&str] = &[
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",

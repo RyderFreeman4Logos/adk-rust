@@ -8,9 +8,9 @@ OpenTelemetry integration for Rust Agent Development Kit (ADK-Rust) agent observ
 
 ## Overview
 
-`adk-telemetry` provides observability infrastructure for the Rust Agent Development Kit ([ADK-Rust](https://github.com/zavora-ai/adk-rust)), built on OpenTelemetry 0.31 and tracing-opentelemetry 0.32:
+`adk-telemetry` provides observability infrastructure for the Rust Agent Development Kit ([ADK-Rust](https://github.com/zavora-ai/adk-rust)), built on OpenTelemetry 0.32 and tracing-opentelemetry 0.33:
 
-- **Tracing** - Distributed tracing with OpenTelemetry 0.31
+- **Tracing** - Distributed tracing with OpenTelemetry 0.32
 - **Logging** - Structured logging with tracing-subscriber
 - **Metrics** - Performance metrics export via OTLP (tonic 0.12 / gRPC)
 - **Span Context** - Propagation across agent boundaries
@@ -26,14 +26,14 @@ OpenTelemetry integration for Rust Agent Development Kit (ADK-Rust) agent observ
 
 ```toml
 [dependencies]
-adk-telemetry = "2.0.0"
+adk-telemetry = "2.3.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.0.0", features = ["telemetry"] }
+adk-rust = { version = "2.3.0", features = ["telemetry"] }
 ```
 
 ## Quick Start
@@ -62,6 +62,10 @@ RUST_LOG=adk=debug cargo run
 RUST_LOG=adk_agent=trace,adk_model=debug cargo run
 ```
 
+`RUST_LOG` controls console verbosity. Runtime span collection configured by
+`init_with_adk_exporter` is independent, so production settings such as
+`RUST_LOG=warn` do not disable the server's session telemetry.
+
 ## OpenTelemetry Export
 
 Configure OTLP export for distributed tracing:
@@ -84,7 +88,7 @@ deploy. Enable the `sqlite` feature (`adk-rust` forwards it as
 `telemetry-sqlite`):
 
 ```toml
-adk-telemetry = { version = "2.0.0", features = ["sqlite"] }
+adk-telemetry = { version = "2.3.0", features = ["sqlite"] }
 ```
 
 ```rust
@@ -101,10 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Spans are written by a background thread (batched transactions, WAL mode), so
-the traced code path never blocks on I/O. By default only agent-loop spans are
-stored (`agent.execute`, `call_llm`, `send_data`, `execute_tool*`);
+the traced code path never blocks on I/O. By default agent-loop and portable
+team spans are stored (`agent.execute`, `call_llm`, `send_data`,
+`execute_tool*`, and `team.*`);
 `SqliteSpanExporter::new(path)?.record_all_spans(true)` keeps everything the
-`RUST_LOG` filter lets through.
+subscriber's telemetry-layer filter lets through.
 
 Read traces back with `SqliteTraceReader` (or any SQLite client — the schema
 is one `spans` table with an `attributes` JSON column):
@@ -121,6 +126,41 @@ for session in reader.sessions()? {
 }
 ```
 
+## Telemetry to Google Cloud (`gcp` feature)
+
+Export traces straight to Google Cloud Observability and emit Cloud
+Logging-parseable JSON logs. `adk-rust` forwards it as `gcp-telemetry`,
+and the `gemini-agent-platform` meta-feature includes it:
+
+```toml
+adk-telemetry = { version = "2.3.0", features = ["gcp"] }
+```
+
+```rust
+use adk_telemetry::init_with_gcp;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Requires GOOGLE_CLOUD_PROJECT and Application Default Credentials.
+    init_with_gcp("my-agent").await?;
+
+    // Your agent code here...
+
+    adk_telemetry::shutdown_telemetry();
+    Ok(())
+}
+```
+
+Spans go to `https://telemetry.googleapis.com` with per-request
+`Authorization: Bearer` headers minted from ADC (refreshed in the
+background), plus `x-goog-user-project`. Resource attributes
+(`service.name`, `gcp.project_id`, `cloud.platform = gcp.agent_engine`) are
+detected from `K_SERVICE`, `GOOGLE_CLOUD_PROJECT`, and
+`GOOGLE_CLOUD_AGENT_ENGINE_ID`. `init_json_logging()` installs the Cloud
+Logging JSON format standalone. See
+[docs/official_docs/observability/gcp.md](../docs/official_docs/observability/gcp.md)
+for the collector-sidecar fallback.
+
 ## Available Functions
 
 | Function | Description |
@@ -129,6 +169,8 @@ for session in reader.sessions()? {
 | `init_with_otlp(service_name, endpoint)` | OTLP export to collectors |
 | `init_with_adk_exporter(service_name)` | ADK-style span exporter |
 | `init_with_sqlite(service_name, db_path)` | Direct SQLite span export (`sqlite` feature) |
+| `init_with_gcp(service_name)` | OTLP trace export to Google Cloud with ADC auth (`gcp` feature) |
+| `init_json_logging()` | Cloud Logging structured JSON on stdout (`gcp` feature) |
 | `shutdown_telemetry()` | Flush and shutdown |
 
 ## Span Helpers
@@ -177,7 +219,7 @@ use adk_telemetry::{info, debug, warn, error, trace, instrument, Span};
 ## Features
 
 - Zero-config defaults with sensible logging
-- OpenTelemetry 0.31 compatible span export
+- OpenTelemetry 0.32 compatible span export
 - OTLP export via `tonic 0.12` (gRPC), aligned with `adk-server`'s `hyper 1.x` / `http 1.x` stack
 - Direct SQLite span export with query API (`sqlite` feature) — no collector needed
 - Automatic context propagation

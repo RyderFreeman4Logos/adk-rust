@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use proptest::prelude::*;
 
-use adk_sandbox::sandbox::linux::LinuxEnforcer;
+use adk_sandbox::sandbox::linux::{LinuxEnforcer, SECCOMP_FD};
 use adk_sandbox::sandbox::{AccessMode, AllowedPath, SandboxPolicy};
 
 // ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ proptest! {
     /// - Start with `--die-with-parent`
     /// - Contain `--unshare-pid`
     /// - Contain `--unshare-net` iff `allow_network` is false
-    /// - Contain `--new-session` iff `allow_process_spawn` is false
+    /// - Contain `--new-session` and `--seccomp <SECCOMP_FD>` iff `allow_process_spawn` is false
     /// - Have one `--ro-bind path path` per read-only path
     /// - Have one `--bind path path` per read-write path
     /// - Contain no empty strings
@@ -135,6 +135,17 @@ proptest! {
             );
         }
 
+        // Process spawn: the seccomp program is referenced iff allow_process_spawn is false
+        let seccomp_fd = args
+            .windows(2)
+            .find(|pair| pair[0] == "--seccomp")
+            .map(|pair| pair[1].clone());
+        if policy.allow_process_spawn {
+            prop_assert_eq!(seccomp_fd, None);
+        } else {
+            prop_assert_eq!(seccomp_fd, Some(SECCOMP_FD.to_string()));
+        }
+
         // Count read-only bind mounts
         let expected_ro = policy
             .allowed_paths
@@ -182,14 +193,22 @@ proptest! {
         prop_assert_eq!(
             count_flag(&args, "--die-with-parent"),
             1,
-            "--die-with-parent should appear exactly once: {args:?}"
+            // `prop_assert_eq!` expands through `concat!`, which cannot capture an inline
+            // `{args:?}`; the argument has to be positional. This file is both Linux-only
+            // and behind `sandbox-linux`, so nothing ever compiled it.
+            "--die-with-parent should appear exactly once: {:?}",
+            args
         );
 
         // --unshare-pid should appear exactly once
         prop_assert_eq!(
             count_flag(&args, "--unshare-pid"),
             1,
-            "--unshare-pid should appear exactly once: {args:?}"
+            // `prop_assert_eq!` expands through `concat!`, which cannot capture an inline
+            // `{args:?}`; the argument has to be positional. This file is both Linux-only
+            // and behind `sandbox-linux`, so nothing ever compiled it.
+            "--unshare-pid should appear exactly once: {:?}",
+            args
         );
     }
 }

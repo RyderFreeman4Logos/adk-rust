@@ -54,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
 
     let api_key = std::env::var("OPENAI_API_KEY")?;
     let model_id =
-        std::env::var("OPENAI_REALTIME_MODEL").unwrap_or_else(|_| "gpt-realtime-2".to_string());
+        std::env::var("OPENAI_REALTIME_MODEL")
+            .unwrap_or_else(|_| "gpt-realtime-2.1".to_string());
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  Realtime Tools — Function Calling via IntegratedRunner      ║");
@@ -189,7 +190,10 @@ async fn main() -> anyhow::Result<()> {
 
     println!("📡 Connecting to OpenAI Realtime ({model_id})...");
     runner.connect().await?;
-    println!("✅ Connected — session {session_id}\n");
+    // Print only a short prefix — a live realtime session id is a handle to an
+    // active, billable connection and does not belong in console output in full.
+    let session_ref: String = session_id.chars().take(8).collect();
+    println!("✅ Connected — session {session_ref}…\n");
     println!("Tools registered: get_weather, calculate, get_time");
     println!("Integration: SessionService ✓  MemoryService ✓\n");
 

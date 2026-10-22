@@ -264,63 +264,140 @@ async fn authenticated_alternate_constructor_and_deserialized_missing_key_reject
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
+fn assert_userinfo_rejected(error: &AdkError, endpoint: &str) {
+    assert_eq!(error.category, ErrorCategory::InvalidInput);
+    assert_eq!(error.code, "model.openai_compat.url_userinfo_forbidden");
+    assert_eq!(error.message, "compatible endpoint URLs must not contain userinfo");
+    assert!(!error.retry.should_retry);
+    assert!(!error.to_string().contains(endpoint));
+    assert!(!error.to_string().contains("synthetic-user"));
+    assert!(!error.to_string().contains("synthetic-password"));
+    assert!(!error.to_string().contains("synthetic-configured"));
+}
+
+const USERINFO: [&str; 7] = [
+    "synthetic-user",
+    "synthetic-user:synthetic-password",
+    ":synthetic-password",
+    "synthetic-user:",
+    "synthetic%2Duser:synthetic%40password",
+    "%FF:synthetic-password",
+    "%00",
+];
+
 #[tokio::test]
-async fn no_auth_rejects_url_userinfo_authorization() {
+async fn compatible_url_userinfo_is_rejected_before_egress() {
     for stream in [false, true] {
-        let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(response(stream)).mount(&server).await;
-        let config = config(&server, "").with_base_url(server.uri().replacen(
-            "http://",
-            "http://synthetic-injected:synthetic-injected@",
-            1,
-        ));
-        let model = OpenAICompatible::new_no_auth(config).unwrap();
-        let result = collect(&model, stream).await;
-        assert!(result.is_err(), "URL userinfo must not introduce Basic Authorization");
-        assert_forbidden(&result.unwrap_err());
-        assert!(server.received_requests().await.unwrap().is_empty());
+        for userinfo in USERINFO {
+            for anonymous in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST")).respond_with(response(stream)).mount(&server).await;
+                let endpoint = server.uri().replacen("http://", &format!("http://{userinfo}@"), 1);
+                let parsed = reqwest::Url::parse(&endpoint).unwrap();
+                assert!(!parsed.username().is_empty() || parsed.password().is_some());
+                let config =
+                    config(&server, "synthetic-configured").with_base_url(endpoint.clone());
+                let model = if anonymous {
+                    OpenAICompatible::new_no_auth(config)
+                } else {
+                    OpenAICompatible::new(config)
+                }
+                .unwrap()
+                .with_retry_config(fast_retry());
+                let adapter_calls = Arc::new(AtomicUsize::new(0));
+                let observed_calls = adapter_calls.clone();
+                let model = model.with_request_adapter(Arc::new(move |_, _| {
+                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }));
+                let result = collect(&model, stream).await;
+                assert!(result.is_err(), "URL userinfo must fail before sending");
+                assert_userinfo_rejected(&result.unwrap_err(), &endpoint);
+                assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+                assert!(server.received_requests().await.unwrap().is_empty());
+            }
+        }
     }
 }
 
 #[tokio::test]
-async fn authenticated_url_userinfo_preserves_existing_headers() {
+async fn azure_url_userinfo_is_rejected_before_egress() {
     for stream in [false, true] {
-        let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(response(stream)).expect(2).mount(&server).await;
-        let base_url =
-            server.uri().replacen("http://", "http://synthetic-user:synthetic-password@", 1);
-        // Exact prior reqwest dispatch boundary: URL Basic and bearer_auth append.
-        reqwest::Client::new()
-            .post(format!("{base_url}/chat/completions"))
-            .bearer_auth("synthetic-configured")
-            .json(&json!({"model":"synthetic-model"}))
-            .send()
-            .await
+        for userinfo in USERINFO {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(response(stream)).mount(&server).await;
+            let endpoint = server.uri().replacen("http://", &format!("http://{userinfo}@"), 1);
+            let model = AzureOpenAIClient::new(AzureConfig::new(
+                "synthetic-configured",
+                endpoint.clone(),
+                "2024-12-01-preview",
+                "deployment",
+            ))
             .unwrap()
-            .text()
-            .await
-            .unwrap();
-        let config = config(&server, "synthetic-configured").with_base_url(base_url);
-        let model = OpenAICompatible::new(config).unwrap();
-        assert!(collect(&model, stream).await.unwrap().iter().any(|item| item.turn_complete));
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2);
-        let baseline: Vec<_> = requests[0]
-            .headers
-            .get_all("authorization")
-            .iter()
-            .map(|value| value.to_str().unwrap())
-            .collect();
-        let actual: Vec<_> = requests[1]
-            .headers
-            .get_all("authorization")
-            .iter()
-            .map(|value| value.to_str().unwrap())
-            .collect();
-        assert_eq!(baseline.len(), 2);
-        assert!(baseline[0].starts_with("Basic "));
-        assert_eq!(baseline[1], "Bearer synthetic-configured");
-        assert_eq!(actual, baseline);
+            .with_retry_config(fast_retry());
+            let result = collect(&model, stream).await;
+            assert!(result.is_err(), "Azure completion URL userinfo must fail before sending");
+            assert_userinfo_rejected(&result.unwrap_err(), &endpoint);
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn empty_url_userinfo_retains_existing_authentication() {
+    for stream in [false, true] {
+        for userinfo in ["", ":"] {
+            for mode in ["bearer", "anonymous", "azure"] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(response(stream))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let endpoint = server.uri().replacen("http://", &format!("http://{userinfo}@"), 1);
+                let parsed = reqwest::Url::parse(&endpoint).unwrap();
+                assert!(parsed.username().is_empty());
+                assert!(parsed.password().is_none());
+                let config =
+                    config(&server, "synthetic-configured").with_base_url(endpoint.clone());
+                let model: Box<dyn Llm> = match mode {
+                    "bearer" => Box::new(OpenAICompatible::new(config).unwrap()),
+                    "anonymous" => Box::new(OpenAICompatible::new_no_auth(config).unwrap()),
+                    _ => Box::new(
+                        AzureOpenAIClient::new(AzureConfig::new(
+                            "synthetic-configured",
+                            endpoint,
+                            "2024-12-01-preview",
+                            "deployment",
+                        ))
+                        .unwrap(),
+                    ),
+                };
+                assert!(
+                    collect(model.as_ref(), stream)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|item| item.turn_complete)
+                );
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1);
+                match mode {
+                    "bearer" => assert_eq!(
+                        requests[0].headers.get("authorization").unwrap(),
+                        "Bearer synthetic-configured"
+                    ),
+                    "anonymous" => assert!(requests[0].headers.get("authorization").is_none()),
+                    _ => {
+                        assert!(requests[0].headers.get("authorization").is_none());
+                        assert_eq!(
+                            requests[0].headers.get("api-key").unwrap(),
+                            "synthetic-configured"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

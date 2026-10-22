@@ -353,6 +353,8 @@ impl OpenAICompatible {
     ///
     /// Empty, blank or invalid bearer credentials return `InvalidInput` before HTTP.
     /// Use [`Self::new_no_auth`] explicitly for a server that needs no Authorization.
+    /// Endpoint URL userinfo is rejected before HTTP in every authentication mode
+    /// with `InvalidInput` code `model.openai_compat.url_userinfo_forbidden`.
     pub fn new(config: OpenAICompatibleConfig) -> Result<Self, AdkError> {
         let reasoning_effort = config.reasoning_effort.clone().map(compatible_reasoning_effort);
         Self::new_with_reasoning_effort(config, reasoning_effort)
@@ -988,6 +990,19 @@ async fn send_request(
         error_codes,
         response_schema,
     } = target;
+    // Inspect before reqwest extracts userinfo into Basic Authorization and removes it.
+    // Invalid URLs retain the existing reqwest build-error path below.
+    if reqwest::Url::parse(url)
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
+    {
+        return Err(AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::InvalidInput,
+            "model.openai_compat.url_userinfo_forbidden",
+            "compatible endpoint URLs must not contain userinfo",
+        )
+        .with_provider(provider_name));
+    }
     let mut http_req = http.post(url);
     if let Some(api_key) = api_key {
         http_req = http_req.bearer_auth(api_key);

@@ -332,15 +332,18 @@ let model = OpenAICompatible::new_no_auth(config)?;
 
 This policy forbids the `Authorization` header, not all credentials: Azure still
 sends its `api-key` through its existing dedicated client. No-auth ignores any
-configured bearer key and rejects Authorization from default headers, adapters
-or URL userinfo before HTTP, on every retry and in both response modes. Other
+configured bearer key and rejects Authorization from default headers or adapters
+before HTTP, on every retry and in both response modes. Other
 headers and request customization remain available. Policy conflicts return
 `InvalidInput` code `model.openai_compat.authorization_forbidden` without credentials.
 
 Clients built with authenticated `new`, `new_with_reasoning_effort`, `OpenAIClient`
 or provider presets retain valid bearer behavior. They now reject empty/blank/invalid header credentials
 with `model.openai_compat.invalid_api_key` before HTTP; missing deserialized keys
-do not silently select no-auth. Migrate former empty-key callers explicitly to
+do not silently select no-auth. All modes reject actual URL userinfo before HTTP
+with `model.openai_compat.url_userinfo_forbidden`; callers that relied on implicit
+Basic plus Bearer must remove URL credentials and configure their intended header.
+Migrate former empty-key callers explicitly to
 `new_no_auth`; a dummy key is unnecessary. The configuration fields and serde shape
 are unchanged. `compatible_auth_contract_tests` exercises this example configuration
 against a synthetic server over HTTP and SSE; live endpoint authorization and model

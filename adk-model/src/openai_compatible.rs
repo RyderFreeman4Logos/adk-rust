@@ -342,6 +342,7 @@ pub struct OpenAICompatible {
     reasoning_effort: Option<OpenAIReasoningEffort>,
     organization_id: Option<String>,
     parallel_tool_calls: bool,
+    response_schema_strict: bool,
     reasoning_replay_field: Option<ReasoningReplayField>,
     error_codes: ErrorCodes,
 }
@@ -387,6 +388,7 @@ impl OpenAICompatible {
             reasoning_effort,
             organization_id: config.organization_id,
             parallel_tool_calls: config.parallel_tool_calls,
+            response_schema_strict: true,
             reasoning_replay_field: None,
             error_codes: ErrorCodes::COMPATIBLE,
         })
@@ -438,6 +440,24 @@ impl OpenAICompatible {
     #[must_use]
     pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
+        self
+    }
+
+    /// Select strict admission for response schemas (enabled by default).
+    ///
+    /// Strict schemas require an explicit object root, closed objects with every
+    /// property required, arrays with one item schema, primitive types, descendant
+    /// nullable type pairs, matching scalar enums, and string title/description.
+    /// Other keywords are rejected; schemas are never normalized. Unsupported or
+    /// malformed schemas return `InvalidInput` before HTTP with code
+    /// `model.openai_compat.response_schema_unsupported` and a JSON Pointer location.
+    /// Setting this to `false` sends the caller's schema unchanged with `strict: false`;
+    /// the provider must support that schema. Neither mode rewrites schemas, and this
+    /// setting has no effect on requests without a response schema or on tool schemas.
+    /// Extensions and request adapters cannot replace a configured response format.
+    #[must_use]
+    pub fn with_response_schema_strict(mut self, strict: bool) -> Self {
+        self.response_schema_strict = strict;
         self
     }
 
@@ -564,6 +584,8 @@ pub(crate) struct ChatCapabilities {
     /// Send inline PDFs as `file` parts. Only OpenAI and Azure OpenAI accept them,
     /// so every other compatible provider keeps the text fallback.
     pub(crate) native_pdf: bool,
+    /// Admit response schemas only in the conservative strict subset.
+    pub(crate) response_schema_strict: bool,
 }
 
 /// Build the serialized JSON request body from an `LlmRequest`.
@@ -627,15 +649,26 @@ pub(crate) fn build_request_json(
         }
 
         if let Some(schema) = &config.response_schema {
-            let mut schema_with_strict = schema.clone();
-            if let Some(obj) = schema_with_strict.as_object_mut() {
-                obj.insert("additionalProperties".to_string(), serde_json::json!(false));
+            if config
+                .extensions
+                .get("openai")
+                .and_then(|value| value.get("response_format"))
+                .is_some()
+            {
+                return Err(response_schema_error(
+                    "model.openai_compat.response_schema_conflict",
+                    "/extensions/openai/response_format",
+                    "response_schema owns response_format",
+                ));
+            }
+            if capabilities.response_schema_strict {
+                validate_strict_response_schema(schema)?;
             }
             let json_schema = ResponseFormatJsonSchema {
                 name: request.model.replace(['-', '.', '/'], "_"),
                 description: None,
-                schema: schema_with_strict,
-                strict: Some(true),
+                schema: schema.clone(),
+                strict: Some(capabilities.response_schema_strict),
             };
             request_builder.response_format(ResponseFormat::JsonSchema { json_schema });
         }
@@ -670,6 +703,177 @@ pub(crate) fn build_request_json(
     Ok(body)
 }
 
+fn response_schema_error(code: &'static str, path: &str, reason: &str) -> AdkError {
+    AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::InvalidInput,
+        code,
+        format!("{path}: {reason}"),
+    )
+}
+
+/// Comparison key and mathematical integrality, never replacements for wire data.
+/// Number's serialized decimal coefficient/exponent preserves large integers exactly;
+/// trimming decimal zeroes makes numeric aliases equal without converting to f64.
+fn scalar_enum_identity(value: &serde_json::Value) -> Option<(String, bool)> {
+    let serde_json::Value::Number(number) = value else {
+        return match value {
+            serde_json::Value::String(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+                Some((value.to_string(), false))
+            }
+            _ => None,
+        };
+    };
+    let decimal = number.to_string();
+    let (coefficient, exponent) = decimal.split_once(['e', 'E']).unwrap_or((&decimal, "0"));
+    let (negative, coefficient) = coefficient
+        .strip_prefix('-')
+        .map_or((false, coefficient), |coefficient| (true, coefficient));
+    let fraction_digits = coefficient.split_once('.').map_or(0, |(_, fraction)| fraction.len());
+    let digits: String = coefficient.chars().filter(|&character| character != '.').collect();
+    let significant = digits.trim_start_matches('0').trim_end_matches('0');
+    if significant.is_empty() {
+        return Some(("0".to_string(), true));
+    }
+    let trailing_zeroes = digits.len() - digits.trim_end_matches('0').len();
+    // These lengths/exponents come only from Number's valid serialized form, not
+    // caller-provided numeric strings. Fail closed if an extended Number cannot fit.
+    let exponent = exponent
+        .parse::<i64>()
+        .ok()?
+        .checked_sub(i64::try_from(fraction_digits).ok()?)?
+        .checked_add(i64::try_from(trailing_zeroes).ok()?)?;
+    Some((format!("{}{significant}e{exponent}", if negative { "-" } else { "" }), exponent >= 0))
+}
+
+/// Validate only the response-schema subset we promise, without normalizing caller data.
+/// The worklist follows schema positions, never property names or enum values as keywords.
+fn validate_strict_response_schema(schema: &serde_json::Value) -> Result<(), AdkError> {
+    const CODE: &str = "model.openai_compat.response_schema_unsupported";
+    let mut pending = vec![(schema, "/response_schema".to_string(), true)];
+    while let Some((schema, path, root)) = pending.pop() {
+        let error = |suffix: &str, reason: &str| {
+            response_schema_error(CODE, &format!("{path}{suffix}"), reason)
+        };
+        let object = schema.as_object().ok_or_else(|| error("", "schema must be an object"))?;
+        let (kind, nullable) = match object.get("type") {
+            Some(serde_json::Value::String(kind)) => (kind.as_str(), false),
+            Some(serde_json::Value::Array(types)) if !root && types.len() == 2 => {
+                match (types[0].as_str(), types[1].as_str()) {
+                    (Some("null"), Some(kind)) | (Some(kind), Some("null")) if kind != "null" => {
+                        (kind, true)
+                    }
+                    _ => {
+                        return Err(error("/type", "nullable type must contain one type and null"));
+                    }
+                }
+            }
+            _ => {
+                return Err(error(
+                    "/type",
+                    "explicit type is required; only descendants may be nullable",
+                ));
+            }
+        };
+        if !matches!(
+            kind,
+            "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+        ) || (root && kind != "object")
+        {
+            return Err(error("/type", "strict root must be an object; unsupported type"));
+        }
+        for (keyword, value) in object {
+            let supported = match keyword.as_str() {
+                "type" => true,
+                "title" | "description" => value.is_string(),
+                "properties" | "required" | "additionalProperties" => kind == "object",
+                "items" => kind == "array",
+                "enum" => !matches!(kind, "object" | "array"),
+                _ => false,
+            };
+            if !supported {
+                let escaped = keyword.replace('~', "~0").replace('/', "~1");
+                return Err(error(
+                    &format!("/{escaped}"),
+                    "unsupported or malformed strict keyword",
+                ));
+            }
+        }
+        if kind == "object" {
+            if object.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+                return Err(error(
+                    "/additionalProperties",
+                    "strict objects must be explicitly closed",
+                ));
+            }
+            let properties = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| error("/properties", "properties must be an object"))?;
+            let required = object
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| error("/required", "every property must be required"))?;
+            let mut names = std::collections::HashSet::new();
+            for name in required {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| error("/required", "required entries must be strings"))?;
+                if !properties.contains_key(name) || !names.insert(name) {
+                    return Err(error(
+                        "/required",
+                        "required must name each property exactly once",
+                    ));
+                }
+            }
+            if names.len() != properties.len() {
+                return Err(error("/required", "every property must be required"));
+            }
+            for (name, child) in properties {
+                let escaped = name.replace('~', "~0").replace('/', "~1");
+                pending.push((child, format!("{path}/properties/{escaped}"), false));
+            }
+        } else if kind == "array" {
+            let items = object
+                .get("items")
+                .ok_or_else(|| error("/items", "arrays require one item schema"))?;
+            pending.push((items, format!("{path}/items"), false));
+        }
+        if let Some(values) = object.get("enum") {
+            let values = values
+                .as_array()
+                .filter(|values| !values.is_empty())
+                .ok_or_else(|| error("/enum", "enum must be a nonempty scalar array"))?;
+            let mut identities = std::collections::BTreeSet::new();
+            for value in values {
+                let (identity, integral) = scalar_enum_identity(value)
+                    .ok_or_else(|| error("/enum", "unsupported scalar enum representation"))?;
+                let matches = match kind {
+                    "string" => value.is_string(),
+                    "number" => value.is_number(),
+                    "integer" => value.is_number() && integral,
+                    "boolean" => value.is_boolean(),
+                    "null" => value.is_null(),
+                    _ => false,
+                } || (nullable && value.is_null());
+                if !matches {
+                    return Err(error(
+                        "/enum",
+                        "enum values must be distinct scalars matching type",
+                    ));
+                }
+                if !identities.insert(identity) {
+                    return Err(error(
+                        "/enum",
+                        "enum values must be distinct scalars matching type",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn to_oai_reasoning_effort(effort: OpenAIReasoningEffort) -> Option<OaiReasoningEffort> {
     match effort {
         OpenAIReasoningEffort::None => Some(OaiReasoningEffort::None),
@@ -691,6 +895,7 @@ struct RequestTarget {
     provider_name: String,
     adapter: Option<crate::openai::RequestAdapter>,
     error_codes: ErrorCodes,
+    response_schema: bool,
 }
 
 /// Send an HTTP POST and handle error status codes.
@@ -703,17 +908,31 @@ async fn send_request(
     target: &RequestTarget,
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, AdkError> {
-    let RequestTarget { url, api_key, organization_id, provider_name, adapter, error_codes } =
-        target;
+    let RequestTarget {
+        url,
+        api_key,
+        organization_id,
+        provider_name,
+        adapter,
+        error_codes,
+        response_schema,
+    } = target;
     let mut http_req = http.post(url);
     if !api_key.is_empty() {
         http_req = http_req.bearer_auth(api_key);
     }
     if let Some(adapter) = adapter {
-        let mut body = body.clone();
+        let mut adapted_body = body.clone();
         let mut headers = reqwest::header::HeaderMap::new();
-        adapter(&mut body, &mut headers)?;
-        http_req = http_req.headers(headers).json(&body);
+        adapter(&mut adapted_body, &mut headers)?;
+        if *response_schema && adapted_body.get("response_format") != body.get("response_format") {
+            return Err(response_schema_error(
+                "model.openai_compat.response_schema_conflict",
+                "/response_format",
+                "request adapter changed the configured response format",
+            ));
+        }
+        http_req = http_req.headers(headers).json(&adapted_body);
     } else {
         http_req = http_req.json(body);
     }
@@ -839,6 +1058,10 @@ impl Llm for OpenAICompatible {
             organization_id: self.organization_id.clone(),
             provider_name: provider_name.clone(),
             adapter: self.request_adapter.clone(),
+            response_schema: request
+                .config
+                .as_ref()
+                .is_some_and(|config| config.response_schema.is_some()),
             error_codes,
         };
         // Text-encoded tool calls are honoured only for tools this request declared.
@@ -856,6 +1079,7 @@ impl Llm for OpenAICompatible {
             &reasoning_effort,
             ChatCapabilities {
                 parallel_tool_calls: self.parallel_tool_calls,
+                response_schema_strict: self.response_schema_strict,
                 native_pdf: matches!(provider_name.as_str(), "openai" | "azure-openai"),
             },
             reasoning_replay_field,
@@ -1422,7 +1646,11 @@ mod tests {
                 crate::catalog::OPENAI_DEFAULT,
                 &request,
                 &configured_effort,
-                ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+                ChatCapabilities {
+                    parallel_tool_calls: true,
+                    native_pdf: false,
+                    response_schema_strict: true,
+                },
                 None,
                 &adapter,
                 &cache,
@@ -1449,7 +1677,11 @@ mod tests {
             crate::catalog::OPENAI_DEFAULT,
             &request,
             &None,
-            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+            ChatCapabilities {
+                parallel_tool_calls: true,
+                native_pdf: false,
+                response_schema_strict: true,
+            },
             None,
             &adapter,
             &cache,
@@ -1475,7 +1707,11 @@ mod tests {
             crate::catalog::OPENAI_DEFAULT,
             &request,
             &Some(OpenAIReasoningEffort::Max),
-            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+            ChatCapabilities {
+                parallel_tool_calls: true,
+                native_pdf: false,
+                response_schema_strict: true,
+            },
             None,
             &adapter,
             &cache,
@@ -1496,7 +1732,11 @@ mod tests {
             "gemini-3.7-flash",
             &request,
             &None,
-            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+            ChatCapabilities {
+                parallel_tool_calls: true,
+                native_pdf: false,
+                response_schema_strict: true,
+            },
             None,
             &GenericSchemaAdapter,
             &cache,

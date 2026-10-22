@@ -1,9 +1,7 @@
-//! Bug condition exploration tests for OpenAI SSE streaming + reasoning content.
+//! Public SSE regression contracts for OpenAI-compatible Chat Completions.
 //!
-//! These tests encode the EXPECTED (correct) behavior for streaming. They are
-//! designed to FAIL on the unfixed code, confirming the bug exists.
-//!
-//! **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6**
+//! Verify incremental content/tools, final usage and allowlisted observations,
+//! including byte-fragmented and interrupted response boundaries.
 
 #[cfg(feature = "openai")]
 mod streaming_exploration {
@@ -554,5 +552,486 @@ mod streaming_exploration {
             combined_thinking.contains("Let me think"),
             "thinking content should contain the reasoning text"
         );
+    }
+
+    #[tokio::test]
+    async fn response_observations_stream_keeps_first_id_and_final_trailer_once() {
+        use serde_json::json;
+        for tool in [false, true] {
+            let server = MockServer::start().await;
+            let delta = if tool {
+                json!({"tool_calls": [{"index": 0, "id": "call-observed", "type": "function",
+                "function": {"name": "synthetic_tool", "arguments": "{}"}}]})
+            } else {
+                json!({"content": "Hello"})
+            };
+            let frames = [
+                json!({"id": "stream-observed", "prompt_token_ids": [0, 11], "prompt_text": "DO_NOT_RETAIN",
+                    "choices": [{"index": 0, "delta": delta, "token_ids": [20], "finish_reason": null}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "token_ids": [21, 22],
+                    "finish_reason": if tool {"tool_calls"} else {"stop"}}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5,
+                    "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 1}},
+                    "metrics": {"time_to_first_token_ms": 0, "generation_time_ms": 3.5,
+                        "queue_time_ms": null, "mean_itl_ms": 1.75, "tokens_per_second": 9,
+                        "private_control": "DO_NOT_RETAIN"}, "continue_turn": true}),
+            ];
+            let sse = frames.iter().map(|v| format!("data: {v}\n\n")).collect::<String>()
+                + "data: [DONE]\n\n";
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(sse)
+                        .insert_header("content-type", "text/event-stream"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut request = make_request();
+            request.config = Some(adk_core::GenerateContentConfig {
+                extensions: [(
+                    "openai".to_owned(),
+                    json!({"cache_salt": "synthetic-salt", "return_token_ids": true}),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            });
+            let responses = make_client(&server.uri())
+                .generate_content(request, true)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let finals: Vec<_> = responses.iter().filter(|r| r.finish_reason.is_some()).collect();
+            assert_eq!(finals.len(), 1);
+            let final_response = finals[0];
+            assert!(!final_response.partial);
+            assert_eq!(final_response.turn_complete, !tool);
+            assert_eq!(
+                final_response.provider_metadata,
+                Some(json!({"openai": {
+                    "id": "stream-observed", "prompt_token_ids": [0, 11],
+                    "choices": [{"index": 0, "token_ids": [20]}, {"index": 0, "token_ids": [21, 22]}],
+                    "metrics": {"time_to_first_token_ms": 0, "generation_time_ms": 3.5,
+                        "queue_time_ms": null, "mean_itl_ms": 1.75, "tokens_per_second": 9}
+                }}))
+            );
+            assert_eq!(
+                final_response.usage_metadata.as_ref().unwrap().provider_usage,
+                Some(frames[2]["usage"].clone())
+            );
+            assert!(responses.iter().filter(|r| r.partial).all(|r| r.provider_metadata.is_none()));
+            if tool {
+                assert!(
+                    matches!(&final_response.content.as_ref().unwrap().parts[0], Part::FunctionCall { name, .. } if name == "synthetic_tool")
+                );
+            } else {
+                assert_eq!(responses.len(), 2);
+                assert!(
+                    matches!(&responses[0].content.as_ref().unwrap().parts[0], Part::Text { text } if text == "Hello")
+                );
+            }
+            let decoded: adk_core::LlmResponse =
+                serde_json::from_value(serde_json::to_value(final_response).unwrap()).unwrap();
+            assert_eq!(decoded.provider_metadata, final_response.provider_metadata);
+            let requests = server.received_requests().await.unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(wire["cache_salt"], "synthetic-salt");
+            assert_eq!(wire["return_token_ids"], true);
+            assert_eq!(wire["stream_options"]["include_usage"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_observations_stream_presence_is_not_observed_zero() {
+        use serde_json::json;
+        let cases = [
+            (json!({}), None),
+            (
+                json!({"id": null, "metrics": null, "prompt_token_ids": null}),
+                Some(json!({"openai": {"id": null, "metrics": null, "prompt_token_ids": null}})),
+            ),
+            (
+                json!({"id": false, "metrics": [], "prompt_token_ids": "invalid"}),
+                Some(
+                    json!({"openai": {"id": false, "metrics": [], "prompt_token_ids": "invalid"}}),
+                ),
+            ),
+            (
+                json!({"id": "", "metrics": {}, "prompt_token_ids": []}),
+                Some(json!({"openai": {"id": "", "metrics": {}, "prompt_token_ids": []}})),
+            ),
+            (
+                json!({"metrics": {"queue_time_ms": 0, "private_control": true}}),
+                Some(json!({"openai": {"metrics": {"queue_time_ms": 0}}})),
+            ),
+        ];
+        for (fields, expected) in cases {
+            let server = MockServer::start().await;
+            let finish = json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+            let mut trailer =
+                json!({"choices": [], "prompt_text": "DO_NOT_RETAIN", "content_complete": true});
+            trailer.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            let body = format!("data: {finish}\n\ndata: {trailer}\n\ndata: [DONE]\n\n");
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(body)
+                        .insert_header("content-type", "text/event-stream"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let responses = make_client(&server.uri())
+                .generate_content(make_request(), true)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(responses.len(), 1);
+            let response = responses[0].as_ref().unwrap();
+            assert!(response.turn_complete && !response.partial);
+            assert!(response.usage_metadata.is_none());
+            assert_eq!(response.provider_metadata, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_observations_stream_token_record_presence() {
+        use serde_json::json;
+        for tokens in [json!(null), json!("invalid"), json!([]), json!([0])] {
+            let server = MockServer::start().await;
+            let finish = json!({"choices": [{"index": 7, "delta": {}, "finish_reason": "stop",
+                "token_ids": tokens, "prompt_text": "DO_NOT_RETAIN"}]});
+            let body = format!("data: {finish}\n\ndata: [DONE]\n\n");
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(body)
+                        .insert_header("content-type", "text/event-stream"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let responses = make_client(&server.uri())
+                .generate_content(make_request(), true)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].as_ref().unwrap().provider_metadata,
+                Some(json!({"openai": {"choices": [{"index": 7, "token_ids": tokens}]}}))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_observations_retry_discards_failed_attempt_body() {
+        use serde_json::json;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            Mock::given(method("POST")).respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503).set_body_json(json!({"id": "failed-attempt",
+                        "metrics": {"queue_time_ms": 999}, "prompt_token_ids": [999],
+                        "choices": [{"index": 0, "token_ids": [999]}]}))
+                } else if streaming {
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"id\":\"accepted-attempt\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"id": "accepted-attempt",
+                        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}))
+                }
+            }).expect(2).mount(&server).await;
+            let client = make_client(&server.uri()).with_retry_config(
+                adk_model::retry::RetryConfig::default()
+                    .with_max_retries(1)
+                    .with_initial_delay(std::time::Duration::ZERO),
+            );
+            let responses = client
+                .generate_content(make_request(), streaming)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].as_ref().unwrap().provider_metadata,
+                Some(json!({"openai": {"id": "accepted-attempt"}}))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_observations_delivery_inline_text() {
+        assert_observations_delivered_before_body_end(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_observations_delivery_inline_tool() {
+        assert_observations_delivered_before_body_end(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_observations_delivery_trailer_text() {
+        assert_observations_delivered_before_body_end(false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_observations_delivery_trailer_tool() {
+        assert_observations_delivered_before_body_end(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_observations_delivery_before_read_error_text() {
+        assert_observations_delivered_before_body_end(false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_observations_delivery_before_read_error_tool() {
+        assert_observations_delivered_before_body_end(true, false, true).await;
+    }
+
+    async fn assert_observations_delivered_before_body_end(
+        tool: bool,
+        usage_trailer: bool,
+        body_error: bool,
+    ) {
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (written, wait_written) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        let usage = json!({"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3});
+        let server = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("POST /chat/completions "));
+            let mut content_length = None;
+            loop {
+                line.clear();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let content_length = content_length.unwrap();
+            assert!(content_length < 8192);
+            socket.read_exact(&mut vec![0; content_length]).await.unwrap();
+            let socket = socket.get_mut();
+            let first = json!({"id": "delivery", "prompt_token_ids": [0], "choices": [
+                {"index": 0, "delta": {"content": "prefix"}, "token_ids": [20]}]});
+            let delta = if tool {
+                json!({"tool_calls": [{"index": 0, "id": "call-delivery", "type": "function",
+                    "function": {"name": "synthetic_tool", "arguments": "{}"}}]})
+            } else {
+                json!({"content": "done"})
+            };
+            let mut finish = json!({"choices": [{"index": 0, "delta": delta, "token_ids": [21],
+                "finish_reason": if tool {"tool_calls"} else {"stop"}}]});
+            let trailer = json!({"choices": [], "usage": usage, "metrics": {"queue_time_ms": 0}});
+            if !usage_trailer {
+                finish["usage"] = usage.clone();
+                finish["metrics"] = trailer["metrics"].clone();
+            }
+            let mut body = format!("data: {first}\n\ndata: {finish}\n\n");
+            if usage_trailer {
+                body.push_str(&format!("data: {trailer}\n\n"));
+            }
+            let header = if body_error {
+                format!("Content-Length: {}\r\n", body.len() + 100)
+            } else {
+                "Transfer-Encoding: chunked\r\n".to_owned()
+            };
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{header}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+            if !body_error {
+                socket.write_all(format!("{:x}\r\n", body.len()).as_bytes()).await.unwrap();
+            }
+            socket.write_all(body.as_bytes()).await.unwrap();
+            if !body_error {
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.flush().await.unwrap();
+            written.send(()).unwrap();
+            wait_release.await.unwrap();
+            if !body_error {
+                let tail = "data: {\"id\":\"after-final\",\"choices\":[],\"usage\":{\"total_tokens\":99},\"metrics\":{\"queue_time_ms\":99}}\n\ndata: [DONE]\n\n";
+                socket
+                    .write_all(format!("{:x}\r\n{tail}\r\n0\r\n\r\n", tail.len()).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            socket.shutdown().await.unwrap();
+        };
+        let client = async {
+            let mut stream = make_client(&format!("http://{address}"))
+                .generate_content(make_request(), true)
+                .await
+                .unwrap();
+            let first = stream.next().await.unwrap().unwrap();
+            assert!(first.partial && first.provider_metadata.is_none());
+            wait_written.await.unwrap();
+            let final_response =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await;
+            // Release and drain before asserting, including the expected RED path.
+            release.send(()).unwrap();
+            let tail: Vec<_> = stream.collect().await;
+            let final_response = final_response
+                .expect("final must arrive before the server releases the response body")
+                .unwrap()
+                .unwrap();
+            assert!(!final_response.partial);
+            assert_eq!(final_response.turn_complete, !tool);
+            assert!(final_response.finish_reason.is_some());
+            assert_eq!(final_response.content.as_ref().unwrap().has_function_calls(), tool);
+            assert_eq!(final_response.usage_metadata.unwrap().provider_usage, Some(usage.clone()));
+            assert_eq!(
+                final_response.provider_metadata,
+                Some(json!({"openai": {
+                    "id": "delivery", "prompt_token_ids": [0], "metrics": {"queue_time_ms": 0},
+                    "choices": [{"index": 0, "token_ids": [20]}, {"index": 0, "token_ids": [21]}]
+                }}))
+            );
+            if body_error {
+                assert_eq!(tail.len(), 1);
+                assert!(tail[0].as_ref().unwrap_err().to_string().contains("stream read error"));
+            } else {
+                assert!(tail.is_empty(), "later metadata must not emit another final");
+            }
+        };
+        // Both futures own their sockets; timeout or panic drops them without detached tasks.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("bounded delivery fixture completes");
+    }
+
+    #[tokio::test]
+    async fn response_observations_fragmented_and_interrupted_sse() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // 0: complete; 1: truncated trailer; 2: no finish; 3: HTTP body read error.
+        for case in 0..4 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let read = socket.read(&mut request).await.unwrap();
+                assert!(request[..read].starts_with(b"POST /chat/completions "));
+                let mut body = String::from(
+                    "data: {\"id\":\"fragmented\",\"choices\":[{\"delta\":{\"content\":\"hi 🌍\"},\"token_ids\":[20]}]}\n\n",
+                );
+                if case != 2 {
+                    body.push_str(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    );
+                }
+                if case == 0 {
+                    body.push_str("data: {\"choices\":[],\"usage\":{\"total_tokens\":1},\"metrics\":{\"queue_time_ms\":0}}\n\ndata: [DONE]\n\n");
+                } else {
+                    body.push_str(
+                        "data: {\"choices\":[],\"usage\":{\"total_tokens\":1},\"metrics\":",
+                    );
+                }
+                let header = if case == 3 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len() + 100
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_owned()
+                };
+                socket.write_all(header.as_bytes()).await.unwrap();
+                for bytes in body.as_bytes().chunks(3) {
+                    if case != 3 {
+                        socket
+                            .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    socket.write_all(bytes).await.unwrap();
+                    if case != 3 {
+                        socket.write_all(b"\r\n").await.unwrap();
+                    }
+                    tokio::task::yield_now().await;
+                }
+                if case != 3 {
+                    socket.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                socket.shutdown().await.unwrap();
+            };
+            let client = async {
+                make_client(&format!("http://{address}"))
+                    .generate_content(make_request(), true)
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            };
+            let (_, responses) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .expect("bounded loopback fixture completes");
+            assert!(matches!(&responses[0].as_ref().unwrap().content.as_ref().unwrap().parts[0],
+                Part::Text { text } if text == "hi 🌍"));
+            let finals: Vec<_> = responses
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .filter(|r| r.finish_reason.is_some())
+                .collect();
+            if case >= 2 {
+                assert!(finals.is_empty());
+                assert!(
+                    responses
+                        .iter()
+                        .filter_map(|r| r.as_ref().ok())
+                        .all(|r| r.provider_metadata.is_none() && r.usage_metadata.is_none())
+                );
+                assert_eq!(responses.iter().filter(|r| r.is_err()).count(), usize::from(case == 3));
+            } else {
+                assert_eq!(finals.len(), 1);
+                let metadata = finals[0].provider_metadata.as_ref().unwrap();
+                assert_eq!(metadata["openai"]["id"], "fragmented");
+                assert_eq!(
+                    metadata["openai"]["choices"],
+                    serde_json::json!([{ "token_ids": [20] }])
+                );
+                if case == 0 {
+                    assert_eq!(metadata["openai"]["metrics"]["queue_time_ms"], 0);
+                    assert_eq!(
+                        finals[0].usage_metadata.as_ref().unwrap().provider_usage,
+                        Some(serde_json::json!({"total_tokens": 1}))
+                    );
+                } else {
+                    assert!(metadata["openai"].get("metrics").is_none());
+                    assert!(finals[0].usage_metadata.is_none());
+                }
+            }
+        }
     }
 }

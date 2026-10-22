@@ -355,6 +355,54 @@ acceptance remain the caller's responsibility.
 Normalized counters retain compatibility defaults: zero alone does not establish observed usage. Validate each raw field's presence and nonnegative integer type; do not infer missing totals.
 For SSE, consume the complete stream: a supplied usage-only trailer attaches one final snapshot, without adding cumulative counts. A missing or incomplete trailer does not supply final usage.
 
+### OpenAI-compatible response observations
+
+The raw Chat Completions path (`OpenAICompatible`, including `OpenAIClient`,
+Azure OpenAI and OpenCode delegates) retains supplied observations in
+`LlmResponse.provider_metadata["openai"]`:
+
+| Field | Retained value |
+|---|---|
+| `id` | Last supplied response ID |
+| `prompt_token_ids` | Last supplied prompt-token value |
+| `metrics` | Last supplied metrics snapshot, restricted to `time_to_first_token_ms`, `generation_time_ms`, `queue_time_ms`, `mean_itl_ms`, `tokens_per_second` when it is an object |
+| `choices` | Ordered records containing only supplied `index` and `token_ids`, one per choice that supplies `token_ids` |
+
+Values are raw observations: omitted fields stay absent; explicit null, empty
+values and malformed types stay distinguishable. A malformed non-object metrics
+value is retained as supplied. Validate types before treating any value as a
+measurement. The SDK does not calculate units or missing counts. The installed
+vLLM metric contract uses milliseconds for the four `_ms` fields and tokens per
+second for `tokens_per_second`; retention does not prove a server enabled or
+supplied these metrics.
+
+For SSE, choice records retain fragment order and boundaries, including repeated
+indices; they are not concatenated or deduplicated because providers may send
+incremental or cumulative token lists. The non-partial response with a finish
+reason carries observations parsed through its existing delivery point: a finish
+with inline usage is delivered immediately; otherwise the first usage-only
+`choices: []` trailer completes the pending finish, or `[DONE]`/normal EOF releases
+it without a usage trailer. Metrics on that usage trailer are retained with its
+raw usage snapshot; cumulative counts are never added. Later observations do not
+delay delivery or produce another final. Partial responses have no observation
+snapshot and retain their existing content/control semantics.
+
+A normal EOF after a finish retains only fields actually parsed; it does not
+certify that a trailer arrived. Without a finish, or on a read error before final
+delivery, no final observation snapshot is emitted. Consumers that keep reading
+after an already delivered final still receive subsequent read errors. Incomplete
+JSON cannot supply usage or metrics. Data sent after the delivery point, including
+any later trailer after an inline-usage finish, is outside that final snapshot.
+
+No request API is added: `GenerateContentConfig.extensions["openai"]` already
+passes `cache_salt`, `return_token_ids` and `return_prompt_text`; streams request
+`stream_options.include_usage: true`. Response retention excludes `prompt_text`,
+arbitrary response/metric keys and agent control fields, even if the provider
+returns them. Token IDs may identify input text; request and persist them only
+when appropriate for that caller's data policy. Each request/retry keeps its own
+observations; an HTTP error body never supplies successful response metadata.
+Live provider availability and consumer adoption require separate acceptance.
+
 ### OpenAI-Compatible Reasoning History
 
 Reasoning replay is disabled by default. `Part::Thinking` stays separate from

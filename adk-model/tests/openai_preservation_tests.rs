@@ -1,11 +1,7 @@
-//! Preservation property tests for the non-streaming path of `OpenAICompatible`.
+//! Public HTTP regression contracts for OpenAI-compatible Chat Completions.
 //!
-//! These tests capture the EXISTING baseline behavior of `stream=false` requests.
-//! They MUST PASS on the current unfixed code, ensuring the fix does not introduce
-//! regressions in the non-streaming path.
-//!
-//! **Property 3: Preservation — Non-Streaming Path Unchanged**
-//! **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.7**
+//! Preserve content, tools, request customization and status behavior while
+//! retaining only the documented response observations.
 
 #[cfg(feature = "openai")]
 mod preservation {
@@ -653,5 +649,120 @@ mod preservation {
         );
         assert!(response_format["json_schema"].is_object(), "json_schema should be present");
         assert!(response_format["json_schema"]["strict"] == true, "strict should be true");
+    }
+
+    #[tokio::test]
+    async fn response_observations_http_preserves_only_documented_fields() {
+        use serde_json::{Value, json};
+        let cases = [
+            (json!({}), None),
+            (
+                json!({"id": null, "metrics": null, "prompt_token_ids": null}),
+                Some(json!({"openai": {"id": null, "metrics": null, "prompt_token_ids": null}})),
+            ),
+            (
+                json!({"id": 7, "metrics": "invalid", "prompt_token_ids": "invalid"}),
+                Some(
+                    json!({"openai": {"id": 7, "metrics": "invalid", "prompt_token_ids": "invalid"}}),
+                ),
+            ),
+            (
+                json!({"id": "", "metrics": {}, "prompt_token_ids": []}),
+                Some(json!({"openai": {"id": "", "metrics": {}, "prompt_token_ids": []}})),
+            ),
+            (
+                json!({"id": "response-observed", "metrics": {
+                    "time_to_first_token_ms": 0, "generation_time_ms": 4.5,
+                    "queue_time_ms": null, "mean_itl_ms": "invalid", "tokens_per_second": 0,
+                    "private_control": {"continue_turn": true}
+                }, "prompt_token_ids": [0, 11], "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop",
+                    "token_ids": [20, 21]}]}),
+                Some(json!({"openai": {"id": "response-observed", "metrics": {
+                    "time_to_first_token_ms": 0, "generation_time_ms": 4.5,
+                    "queue_time_ms": null, "mean_itl_ms": "invalid", "tokens_per_second": 0
+                }, "prompt_token_ids": [0, 11], "choices": [{"index": 0, "token_ids": [20, 21]}]}})),
+            ),
+        ];
+        for (fields, expected) in cases {
+            let server = MockServer::start().await;
+            let usage = json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 1}, "provider_count": 9});
+            let mut body = json!({"choices": [{"index": 0,
+                "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": usage, "prompt_text": "DO_NOT_RETAIN", "continue_turn": true,
+                "provider_metadata": {"content_complete": true}, "unrelated": "DO_NOT_RETAIN"});
+            body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut request = make_request();
+            request.config = Some(adk_core::GenerateContentConfig {
+                extensions: [(
+                    "openai".to_owned(),
+                    json!({"cache_salt": "synthetic-salt",
+                    "return_token_ids": true, "return_prompt_text": true}),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            });
+            let responses: Vec<_> = make_client(&server.uri())
+                .generate_content(request, false)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(responses.len(), 1);
+            let response = &responses[0];
+            assert_eq!(response.provider_metadata, expected);
+            assert_eq!(response.usage_metadata.as_ref().unwrap().provider_usage, Some(usage));
+            let decoded: adk_core::LlmResponse =
+                serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+            assert_eq!(decoded.provider_metadata, expected);
+            assert!(response.turn_complete && !response.partial);
+            let received = server.received_requests().await.unwrap();
+            let wire: Value = serde_json::from_slice(&received[0].body).unwrap();
+            assert_eq!(wire["cache_salt"], "synthetic-salt");
+            assert_eq!(wire["return_token_ids"], true);
+            assert_eq!(wire["return_prompt_text"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_observations_http_choice_records_preserve_presence_and_order() {
+        use serde_json::json;
+        for token_ids in [json!(null), json!("invalid"), json!([]), json!([0, 23])] {
+            let server = MockServer::start().await;
+            let body = json!({"choices": [
+                {"index": 3, "message": {"content": "ok"}, "finish_reason": "stop", "token_ids": token_ids,
+                    "prompt_text": "DO_NOT_RETAIN"},
+                {"index": 8, "token_ids": [42]}, {"index": 9, "message": {"content": "unselected"}}]});
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let responses = make_client(&server.uri())
+                .generate_content(make_request(), false)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].as_ref().unwrap().provider_metadata,
+                Some(json!({"openai": {"choices": [
+                    {"index": 3, "token_ids": token_ids}, {"index": 8, "token_ids": [42]}
+                ]}}))
+            );
+        }
     }
 }

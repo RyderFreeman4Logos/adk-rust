@@ -1211,6 +1211,7 @@ impl Llm for OpenAICompatible {
                 let mut text_tool_buffer =
                     crate::tool_call_parser::ToolCallBuffer::for_declared_tools(declared_tools);
                 let mut pending_final_response: Option<LlmResponse> = None;
+                let mut observations = convert::ResponseObservations::default();
 
                 while let Some(chunk_result) = byte_stream.next().await {
                     let chunk = chunk_result.map_err(|e| {
@@ -1227,7 +1228,8 @@ impl Llm for OpenAICompatible {
                         }
 
                         if line == "data: [DONE]" {
-                            if let Some(response) = pending_final_response.take() {
+                            if let Some(mut response) = pending_final_response.take() {
+                                response.provider_metadata = std::mem::take(&mut observations).into_metadata();
                                 yield response;
                             }
                             continue;
@@ -1243,6 +1245,7 @@ impl Llm for OpenAICompatible {
                                     continue;
                                 }
                             };
+                            observations.observe(&chunk_json);
                             let usage_metadata = parse_usage_from_chunk(&chunk_json);
 
                             let choice = match chunk_json.get("choices").and_then(|c| c.get(0)) {
@@ -1252,6 +1255,7 @@ impl Llm for OpenAICompatible {
                                         && let Some(mut response) = pending_final_response.take()
                                     {
                                         response.usage_metadata = Some(usage_metadata);
+                                        response.provider_metadata = std::mem::take(&mut observations).into_metadata();
                                         yield response;
                                     }
                                     continue;
@@ -1326,7 +1330,7 @@ impl Llm for OpenAICompatible {
                                         })
                                         .collect::<Result<Vec<_>, AdkError>>()?;
 
-                                    let response = LlmResponse {
+                                    let mut response = LlmResponse {
                                         content: Some(Content {
                                             role: "model".to_string(),
                                             parts,
@@ -1345,6 +1349,7 @@ impl Llm for OpenAICompatible {
                                         interaction_id: None,
                                     };
                                     if response.usage_metadata.is_some() {
+                                        response.provider_metadata = std::mem::take(&mut observations).into_metadata();
                                         yield response;
                                     } else {
                                         pending_final_response = Some(response);
@@ -1359,7 +1364,7 @@ impl Llm for OpenAICompatible {
                                         parts.push(Part::Text { text: text.to_string() });
                                     }
 
-                                let response = LlmResponse {
+                                let mut response = LlmResponse {
                                     content: if parts.is_empty() { None } else {
                                         Some(Content {
                                             role: "model".to_string(),
@@ -1378,6 +1383,7 @@ impl Llm for OpenAICompatible {
                                     interaction_id: None,
                                 };
                                 if response.usage_metadata.is_some() {
+                                    response.provider_metadata = std::mem::take(&mut observations).into_metadata();
                                     yield response;
                                 } else {
                                     pending_final_response = Some(response);
@@ -1449,7 +1455,8 @@ impl Llm for OpenAICompatible {
                     }
                 }
 
-                if let Some(response) = pending_final_response.take() {
+                if let Some(mut response) = pending_final_response.take() {
+                    response.provider_metadata = observations.into_metadata();
                     yield response;
                 }
 

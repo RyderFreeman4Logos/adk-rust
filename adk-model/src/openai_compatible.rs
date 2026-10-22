@@ -46,7 +46,8 @@ pub enum ReasoningReplayField {
 pub struct OpenAICompatibleConfig {
     /// Provider display name used in error messages.
     pub provider_name: String,
-    /// API key. Never serialized; deserializing a config without it yields an empty key.
+    /// API key. Never serialized; a missing key deserializes as empty. Authenticated
+    /// constructors reject blank keys; [`OpenAICompatible::new_no_auth`] ignores it.
     #[serde(skip_serializing, default)]
     pub api_key: String,
     /// Model name.
@@ -334,7 +335,7 @@ pub struct OpenAICompatible {
     /// Headers added to every request, kept so later calls extend rather than replace them.
     default_headers: http::HeaderMap,
     request_adapter: Option<crate::openai::RequestAdapter>,
-    api_key: String,
+    api_key: Option<String>,
     base_url: String,
     model: String,
     provider_name: String,
@@ -348,16 +349,12 @@ pub struct OpenAICompatible {
 }
 
 impl OpenAICompatible {
-    /// Create a new OpenAI-compatible client.
+    /// Create an authenticated OpenAI-compatible client.
+    ///
+    /// Empty, blank or invalid bearer credentials return `InvalidInput` before HTTP.
+    /// Use [`Self::new_no_auth`] explicitly for a server that needs no Authorization.
     pub fn new(config: OpenAICompatibleConfig) -> Result<Self, AdkError> {
-        let reasoning_effort = config.reasoning_effort.clone().map(|effort| match effort {
-            OaiReasoningEffort::None => OpenAIReasoningEffort::None,
-            OaiReasoningEffort::Minimal => OpenAIReasoningEffort::Minimal,
-            OaiReasoningEffort::Low => OpenAIReasoningEffort::Low,
-            OaiReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
-            OaiReasoningEffort::High => OpenAIReasoningEffort::High,
-            OaiReasoningEffort::Xhigh => OpenAIReasoningEffort::XHigh,
-        });
+        let reasoning_effort = config.reasoning_effort.clone().map(compatible_reasoning_effort);
         Self::new_with_reasoning_effort(config, reasoning_effort)
     }
 
@@ -368,6 +365,53 @@ impl OpenAICompatible {
     pub fn new_with_reasoning_effort(
         config: OpenAICompatibleConfig,
         reasoning_effort: Option<OpenAIReasoningEffort>,
+    ) -> Result<Self, AdkError> {
+        if config.api_key.trim().is_empty()
+            || reqwest::header::HeaderValue::from_str(&format!("Bearer {}", config.api_key))
+                .is_err()
+        {
+            return Err(AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::InvalidInput,
+                "model.openai_compat.invalid_api_key",
+                "authenticated compatible clients require a nonblank, valid bearer credential",
+            )
+            .with_provider(&config.provider_name));
+        }
+        let api_key = Some(config.api_key.clone());
+        Self::new_inner(config, reasoning_effort, api_key)
+    }
+
+    /// Explicitly construct a client that never sends an `Authorization` header.
+    ///
+    /// `config.api_key` is ignored, not resolved or used as a mode selector. The
+    /// existing config shape is retained; a deserialized config may omit its key.
+    /// Default headers or request adapters that add Authorization fail with
+    /// `InvalidInput` code `model.openai_compat.authorization_forbidden` before HTTP,
+    /// including on retries. Other credentials such as Azure's `api-key` are allowed:
+    /// this policy forbids Authorization, not all possible authentication headers.
+    /// Configured reasoning, schemas and retry behavior are unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+    /// let config: OpenAICompatibleConfig = serde_json::from_value(serde_json::json!({
+    ///     "provider_name": "local", "model": "local-model",
+    ///     "base_url": "http://127.0.0.1:8000/v1", "parallel_tool_calls": true
+    /// }))?;
+    /// let model = OpenAICompatible::new_no_auth(config)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new_no_auth(config: OpenAICompatibleConfig) -> Result<Self, AdkError> {
+        let reasoning_effort = config.reasoning_effort.clone().map(compatible_reasoning_effort);
+        Self::new_inner(config, reasoning_effort, None)
+    }
+
+    fn new_inner(
+        config: OpenAICompatibleConfig,
+        reasoning_effort: Option<OpenAIReasoningEffort>,
+        api_key: Option<String>,
     ) -> Result<Self, AdkError> {
         crate::catalog::warn_if_obsolete(&config.provider_name, &config.model);
         let base_url = config.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -380,7 +424,7 @@ impl OpenAICompatible {
                 .map_err(|_| AdkError::model("failed to initialize compatible HTTP transport"))?,
             default_headers: http::HeaderMap::new(),
             request_adapter: None,
-            api_key: config.api_key,
+            api_key,
             base_url,
             model: config.model,
             provider_name: config.provider_name,
@@ -397,7 +441,8 @@ impl OpenAICompatible {
     /// Adds default HTTP headers to every request, replacing earlier defaults with the same name.
     ///
     /// The bearer token and organization headers set per request take precedence, and
-    /// redirects stay disabled. Unlike builder methods that only store a value, this
+    /// redirects stay disabled. No-auth clients reject Authorization defaults.
+    /// Unlike builder methods that only store a value, this
     /// method rebuilds the underlying `reqwest` client, so it returns `Result`.
     ///
     /// # Example
@@ -416,8 +461,12 @@ impl OpenAICompatible {
     /// # Errors
     ///
     /// Returns an `Internal` error with code `model.openai.http_client_init` when the
-    /// HTTP client cannot be built.
+    /// HTTP client cannot be built, or `InvalidInput` with code
+    /// `model.openai_compat.authorization_forbidden` for no-auth Authorization.
     pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Result<Self, AdkError> {
+        if self.api_key.is_none() && headers.contains_key(http::header::AUTHORIZATION) {
+            return Err(authorization_forbidden(&self.provider_name));
+        }
         self.default_headers.extend(headers);
         self.http = reqwest::Client::builder()
             .default_headers(self.default_headers.clone())
@@ -465,6 +514,7 @@ impl OpenAICompatible {
     ///
     /// The adapter runs under this client's [`RetryConfig`]; see
     /// [`RequestAdapter`](crate::openai::RequestAdapter) for an example.
+    /// No-auth clients reject an adapter's Authorization header before sending.
     #[must_use]
     pub fn with_request_adapter(mut self, adapter: crate::openai::RequestAdapter) -> Self {
         self.request_adapter = Some(adapter);
@@ -886,16 +936,37 @@ fn to_oai_reasoning_effort(effort: OpenAIReasoningEffort) -> Option<OaiReasoning
     }
 }
 
+fn compatible_reasoning_effort(effort: OaiReasoningEffort) -> OpenAIReasoningEffort {
+    match effort {
+        OaiReasoningEffort::None => OpenAIReasoningEffort::None,
+        OaiReasoningEffort::Minimal => OpenAIReasoningEffort::Minimal,
+        OaiReasoningEffort::Low => OpenAIReasoningEffort::Low,
+        OaiReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
+        OaiReasoningEffort::High => OpenAIReasoningEffort::High,
+        OaiReasoningEffort::Xhigh => OpenAIReasoningEffort::XHigh,
+    }
+}
+
 /// Destination, credentials and error codes of one generation request.
 #[derive(Clone)]
 struct RequestTarget {
     url: String,
-    api_key: String,
+    api_key: Option<String>,
     organization_id: Option<String>,
     provider_name: String,
     adapter: Option<crate::openai::RequestAdapter>,
     error_codes: ErrorCodes,
     response_schema: bool,
+}
+
+fn authorization_forbidden(provider: &str) -> AdkError {
+    AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::InvalidInput,
+        "model.openai_compat.authorization_forbidden",
+        "explicit no-auth clients forbid Authorization headers",
+    )
+    .with_provider(provider)
 }
 
 /// Send an HTTP POST and handle error status codes.
@@ -918,7 +989,7 @@ async fn send_request(
         response_schema,
     } = target;
     let mut http_req = http.post(url);
-    if !api_key.is_empty() {
+    if let Some(api_key) = api_key {
         http_req = http_req.bearer_auth(api_key);
     }
     if let Some(adapter) = adapter {
@@ -941,7 +1012,7 @@ async fn send_request(
         http_req = http_req.header("OpenAI-Organization", org_id);
     }
 
-    let http_resp = http_req.send().await.map_err(|e| {
+    let request_error = |e| {
         AdkError::new(
             ErrorComponent::Model,
             ErrorCategory::Unavailable,
@@ -949,7 +1020,13 @@ async fn send_request(
             format!("{provider_name} request error: {e}"),
         )
         .with_provider(provider_name)
-    })?;
+    };
+    let request = http_req.build().map_err(request_error)?;
+    // reqwest can derive Basic Authorization from URL userinfo independently of adapters.
+    if api_key.is_none() && request.headers().contains_key(reqwest::header::AUTHORIZATION) {
+        return Err(authorization_forbidden(provider_name));
+    }
+    let http_resp = http.execute(request).await.map_err(request_error)?;
 
     if !http_resp.status().is_success() {
         let status = http_resp.status();

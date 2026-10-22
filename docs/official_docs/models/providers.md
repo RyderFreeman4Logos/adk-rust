@@ -317,17 +317,34 @@ three-value `ReasoningEffort` API remains available for backward compatibility.
 
 ### OpenAI-Compatible Local APIs
 
-Use `OpenAIConfig::compatible()` to connect to local servers (Ollama, vLLM, LM Studio):
+For an explicitly authorized server that does not require Authorization, select
+`OpenAICompatible::new_no_auth`. No key lookup is needed; the existing serialized
+configuration can omit `api_key`:
 
 ```rust
-// Ollama exposes OpenAI-compatible API at /v1
-let config = OpenAIConfig::compatible(
-    "not-needed",                      // API key (ignored by Ollama)
-    "http://localhost:11434/v1",       // Base URL
-    "llama3.2"                         // Model name
-);
-let model = OpenAIClient::new(config)?;
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+let config: OpenAICompatibleConfig = serde_json::from_value(serde_json::json!({
+    "provider_name": "local", "model": "local-model",
+    "base_url": "http://127.0.0.1:8000/v1", "parallel_tool_calls": true
+}))?;
+let model = OpenAICompatible::new_no_auth(config)?;
 ```
+
+This policy forbids the `Authorization` header, not all credentials: Azure still
+sends its `api-key` through its existing dedicated client. No-auth ignores any
+configured bearer key and rejects Authorization from default headers, adapters
+or URL userinfo before HTTP, on every retry and in both response modes. Other
+headers and request customization remain available. Policy conflicts return
+`InvalidInput` code `model.openai_compat.authorization_forbidden` without credentials.
+
+Clients built with authenticated `new`, `new_with_reasoning_effort`, `OpenAIClient`
+or provider presets retain valid bearer behavior. They now reject empty/blank/invalid header credentials
+with `model.openai_compat.invalid_api_key` before HTTP; missing deserialized keys
+do not silently select no-auth. Migrate former empty-key callers explicitly to
+`new_no_auth`; a dummy key is unnecessary. The configuration fields and serde shape
+are unchanged. `compatible_auth_contract_tests` exercises this example configuration
+against a synthetic server over HTTP and SSE; live endpoint authorization and model
+acceptance remain the caller's responsibility.
 
 > **Note**: Structured output (`output_schema`) requires backend support. Native OpenAI fully supports it; local servers may have limited support.
 

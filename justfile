@@ -6,7 +6,7 @@ root := justfile_directory()
 
 default: pre-commit-fast
 
-# Every Cargo subprocess, including those launched by validation scripts, enters here.
+# Ordinary Cargo commands preserve each manifest's canonical target.
 cargo +args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -25,6 +25,14 @@ cargo +args:
     done
     adk_prepare_target "$workspace"
     exec ionice -c 3 bash "$ADK_GATE_ROOT/scripts/cargo-pinned.sh" "$@"
+
+# Generated template sources belong to this SDK's existing build destination.
+template-cargo operation manifest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ADK_GATE_ROOT='{{root}}'
+    source "$ADK_GATE_ROOT/scripts/local-env.sh"
+    adk_template_cargo "$@"
 
 fmt:
     just cargo fmt --all

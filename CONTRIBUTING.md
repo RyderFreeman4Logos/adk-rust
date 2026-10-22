@@ -75,7 +75,7 @@ cargo nextest run --workspace                            # Test (parallel, ~10x 
 
 ### Linux fork gates
 
-This fork uses `just pre-commit-fast`, then `just quality-gates` on a clean feature branch, followed by independent review of `origin/main...HEAD` before pushing. `just pre-push` validates the exact outgoing commit against quality and review receipts under `$HOME/tmp/adk-rust-local-gates/`; hosted Actions remain disabled. Cargo commands enter through `just cargo`, which preserves the pinned compiler, idle I/O priority, canonical SSD target links and verified temporary directory.
+This fork uses `just pre-commit-fast`, then `just quality-gates` on a clean feature branch, followed by independent review of `origin/main...HEAD` before pushing. `just pre-push` validates the exact outgoing commit against quality and review receipts under `$HOME/tmp/adk-rust-local-gates/`; hosted Actions remain disabled. Cargo commands enter through the local Just recipes: ordinary commands use `just cargo`, while generated-template checks use `template-cargo` and the SDK's existing canonical target. Both preserve the pinned compiler, idle I/O priority and verified temporary directory.
 
 ## Getting Started
 

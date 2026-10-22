@@ -7,9 +7,7 @@ source "$ROOT/scripts/local-env.sh"
 TEMPLATE_ROOT="$(mktemp -d "$TMPDIR/adk-templates.XXXXXX")"
 trap 'rm -rf "$TEMPLATE_ROOT"' EXIT
 
-# The generated projects are checked from TEMPLATE_ROOT, outside the repository where
-# rustup would otherwise stop seeing rust-toolchain.toml and use a global
-# default. Keep this gate on the same pinned compiler as the workspace.
+# Project generation runs outside the repository; retain its pinned toolchain.
 if command -v rustup >/dev/null 2>&1; then
   RUST_TOOLCHAIN="$(awk -F'"' '/^channel = / { print $2; exit }' "$ROOT/rust-toolchain.toml")"
   export RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}"
@@ -72,6 +70,6 @@ adk-anthropic = { path = "$ROOT/adk-anthropic" }
 adk-rust-macros = { path = "$ROOT/adk-rust-macros" }
 PATCH
 
-    just --justfile "$ROOT/justfile" --working-directory "$TEMPLATE_ROOT" cargo check --manifest-path "$name/Cargo.toml"
+    just --justfile "$ROOT/justfile" --working-directory "$ROOT" template-cargo check "$TEMPLATE_ROOT/$name/Cargo.toml"
   )
 done

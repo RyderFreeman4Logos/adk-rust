@@ -77,10 +77,106 @@ class LocalGatesTests(unittest.TestCase):
         binary = self.repo / "bin"
         binary.mkdir()
         (binary / "rustup").write_text("#!/bin/bash\nexit 1\n")
-        (binary / "cargo").write_text('#!/bin/bash\nif [[ "$1" == --version ]]; then echo "cargo 1.95.0"; else printf "args=%s\\n" "$*"; printf "io=%s\\n" "$(ionice -p $$)"; printf "tmp=%s\\n" "$TMPDIR"; printf "rustdocflags=%s\\n" "${RUSTDOCFLAGS-}"; fi\n')
+        (binary / "cargo").write_text("""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+if sys.argv[1:] == ["--version"]:
+    print("cargo " + os.environ.get("ADK_SPY_VERSION", "1.95.0"))
+    sys.exit(0)
+print("args=" + " ".join(sys.argv[1:]))
+print("io=" + subprocess.check_output(["ionice", "-p", str(os.getpid())], text=True).strip())
+print("tmp=" + os.environ["TMPDIR"])
+print("rustdocflags=" + os.environ.get("RUSTDOCFLAGS", ""))
+if "ADK_SPY_LOG" in os.environ:
+    with open(os.environ["ADK_SPY_LOG"], "a") as output:
+        output.write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd(),
+                                 "target_env": os.environ.get("CARGO_TARGET_DIR")}) + "\\n")
+if "adk" in sys.argv and "new" in sys.argv:
+    project = Path(sys.argv[sys.argv.index("new") + 1])
+    project.mkdir()
+    (project / "Cargo.toml").write_text('[package]\\nname = "fixture"\\nversion = "0.1.0"\\nedition = "2024"\\n')
+""")
         for path in binary.iterdir():
             path.chmod(0o700)
         return {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}
+
+    def test_generated_templates_use_existing_sdk_target(self) -> None:
+        env = {**self.cargo_spy(), "ADK_SPY_LOG": str(self.repo / "calls.jsonl")}
+        before = (os.readlink(ROOT / "target"), (ROOT / "target").lstat().st_ino,
+                  (ROOT / "target").stat().st_ino)
+        result = _run("bash", "scripts/check-cargo-adk-templates.sh", ok=False, extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        records = [json.loads(line) for line in (self.repo / "calls.jsonl").read_text().splitlines()]
+        checks = [call for call in records if "check" in call["args"]]
+        self.assertEqual(len(checks), 12)
+        for call in checks:
+            self.assertEqual(call["cwd"], str(ROOT))
+            self.assertIsNone(call["target_env"])
+            self.assertIn("build.target-dir=" + json.dumps(before[0]), call["args"])
+            self.assertIn("build.build-dir=" + json.dumps(before[0]), call["args"])
+            manifest = Path(call["args"][call["args"].index("--manifest-path") + 1])
+            self.assertTrue(manifest.is_absolute())
+            self.assertTrue(manifest.is_relative_to(Path(os.environ["TMPDIR"])))
+            self.assertFalse(manifest.parent.exists(), "template cleanup must remove only its source")
+        self.assertEqual(before, (os.readlink(ROOT / "target"), (ROOT / "target").lstat().st_ino,
+                                  (ROOT / "target").stat().st_ino))
+
+    def test_template_entry_rejects_caller_overrides(self) -> None:
+        env = {**self.cargo_spy(), "ADK_SPY_LOG": str(self.repo / "calls.jsonl")}
+        manifest = self.repo / "Cargo.toml"
+        manifest.write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2024"\n')
+        result = _run("just", "template-cargo", "metadata", str(manifest), extra_env=env)
+        self.assertIn("io=idle", result.stdout)
+        self.assertIn("tmp=" + os.environ["TMPDIR"], result.stdout)
+        records = (self.repo / "calls.jsonl").read_bytes()
+        for flag in ("--target-dir=forbidden", "--jobs=8", "-j8", "--config=build.jobs=8", "+stable", "build", "--manifest-path=forbidden"):
+            self.assertNotEqual(_run("just", "template-cargo", flag, str(manifest), ok=False, extra_env=env).returncode, 0)
+            self.assertNotEqual(_run("just", "template-cargo", "metadata", str(manifest), flag, ok=False, extra_env=env).returncode, 0)
+        for key in ("CARGO_TARGET_DIR", "CARGO_HOME", "CARGO_BUILD_JOBS", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
+            self.assertNotEqual(_run("just", "template-cargo", "metadata", str(manifest), ok=False,
+                                     extra_env={**env, key: "forbidden"}).returncode, 0)
+        for bad in (str(ROOT / "Cargo.toml"), "Cargo.toml", str(self.repo / "absent.toml")):
+            self.assertNotEqual(_run("just", "template-cargo", "metadata", bad, ok=False, extra_env=env).returncode, 0)
+        self.assertNotEqual(_run("just", "template-cargo", "metadata", str(manifest), ok=False,
+                                 extra_env={**env, "ADK_SPY_VERSION": "1.96.0"}).returncode, 0)
+        self.assertEqual(records, (self.repo / "calls.jsonl").read_bytes())
+
+    def test_real_template_entry_uses_same_canonical_target(self) -> None:
+        manifest = self.repo / "Cargo.toml"
+        package = "adk_gate_target_probe_" + self.repo.name.replace("-", "_")
+        manifest.write_text(f'[package]\nname = "{package}"\nversion = "0.1.0"\nedition = "2024"\n')
+        (self.repo / "src").mkdir()
+        (self.repo / "src/lib.rs").write_text("pub fn target_probe() -> bool { true }\n")
+        before = (os.readlink(ROOT / "target"), (ROOT / "target").lstat().st_ino,
+                  (ROOT / "target").stat().st_ino)
+        metadata = json.loads(_run("just", "template-cargo", "metadata", str(manifest)).stdout)
+        self.assertEqual(metadata["workspace_root"], str(self.repo))
+        destination = (ROOT / "target").stat()
+        for field in ("target_directory", "build_directory"):
+            if field in metadata:
+                reported = Path(metadata[field]).stat()
+                self.assertEqual((reported.st_dev, reported.st_ino), (destination.st_dev, destination.st_ino))
+        self.assertIn("target_directory", metadata)
+        _run("just", "template-cargo", "check", str(manifest))
+        artifacts = list((ROOT / "target/debug/deps").glob(f"lib{package}-*.rmeta"))
+        intermediates = list((ROOT / "target/debug/deps").glob(f"{package}-*.d"))
+        self.assertTrue(artifacts)
+        self.assertTrue(intermediates)
+        self.assertFalse(os.path.lexists(self.repo / "target"))
+        print("template Cargo ownership: " + json.dumps({
+            "pin": "1.95.0", "root_link": before[0], "root_link_inode": before[1],
+            "destination_inode": before[2], "manifest": str(manifest),
+            "target_directory": metadata["target_directory"],
+            "build_directory": metadata.get("build_directory"),
+            "artifacts": [str(path) for path in artifacts],
+            "intermediates": [str(path) for path in intermediates], "source_target_exists": False,
+        }, sort_keys=True))
+        self.assertFalse(Path("/ssd/mirror-rootfs/mnt").exists())
+        self.assertEqual(before, (os.readlink(ROOT / "target"), (ROOT / "target").lstat().st_ino,
+                                  (ROOT / "target").stat().st_ino))
 
     def test_nested_launcher_target_remains_ignored(self) -> None:
         manifest = sorted(ROOT.glob("examples/*/Cargo.toml"))[0]

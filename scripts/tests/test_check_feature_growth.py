@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import unittest
+import warnings
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -19,6 +22,53 @@ class ResolverTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.workspace = CHECK.Workspace(CHECK.REPO_ROOT)
+
+    def test_manifest_emits_no_resource_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always", ResourceWarning)
+            self.workspace.manifest(CHECK.UMBRELLA)
+            gc.collect()
+        self.assertEqual(
+            [str(warning.message) for warning in recorded if warning.category is ResourceWarning],
+            [],
+        )
+
+    def test_manifest_closes_its_file_on_success_and_parse_error(self) -> None:
+        original_open = open
+        try:
+            CHECK.tomllib.loads("broken = [")
+        except CHECK.tomllib.TOMLDecodeError as error:
+            parse_error = error
+        for fail in (False, True):
+            with self.subTest(parse_error=fail):
+                workspace = CHECK.Workspace(CHECK.REPO_ROOT)
+                opened = []
+
+                def record_open(*args, **kwargs):
+                    handle = original_open(*args, **kwargs)
+                    opened.append(handle)
+                    return handle
+
+                try:
+                    with patch("builtins.open", side_effect=record_open) as opener:
+                        if fail:
+                            with patch.object(CHECK.tomllib, "load", side_effect=parse_error):
+                                with self.assertRaises(CHECK.tomllib.TOMLDecodeError) as raised:
+                                    workspace.manifest(CHECK.UMBRELLA)
+                            self.assertIs(raised.exception, parse_error)
+                            self.assertNotIn(CHECK.UMBRELLA, workspace._manifests)
+                        else:
+                            manifest = workspace.manifest(CHECK.UMBRELLA)
+                            self.assertIs(workspace.manifest(CHECK.UMBRELLA), manifest)
+                            self.assertIn("features", manifest)
+                        opener.assert_called_once_with(
+                            CHECK.REPO_ROOT / CHECK.UMBRELLA / "Cargo.toml", "rb"
+                        )
+                    self.assertEqual(len(opened), 1)
+                    self.assertTrue(opened[0].closed, "the manifest file must close deterministically")
+                finally:
+                    for handle in opened:
+                        handle.close()
 
     def test_local_feature_edge_is_followed(self) -> None:
         # graph-sqlite names the local `graph` feature, which pulls adk-graph.

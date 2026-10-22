@@ -166,9 +166,11 @@ class Workspace:
     def manifest(self, crate: str) -> dict:
         if crate not in self._manifests:
             path = self.root / crate / "Cargo.toml"
-            self._manifests[crate] = (
-                tomllib.load(open(path, "rb")) if path.exists() else {}
-            )
+            if path.exists():
+                with open(path, "rb") as manifest:
+                    self._manifests[crate] = tomllib.load(manifest)
+            else:
+                self._manifests[crate] = {}
         return self._manifests[crate]
 
     def features(self, crate: str) -> dict:

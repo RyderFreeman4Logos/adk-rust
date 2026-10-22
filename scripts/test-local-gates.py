@@ -239,8 +239,10 @@ if "examples/a_failure/Cargo.toml" in sys.argv:
         self.assertEqual(records, (self.repo / "calls.jsonl").read_bytes())
 
     def test_real_template_entry_uses_same_canonical_target(self) -> None:
+        self.repo = self.repo / (self.repo.name + "__Probe")
+        self.repo.mkdir()
         manifest = self.repo / "Cargo.toml"
-        package = "adk_gate_target_probe_" + self.repo.name.replace("-", "_")
+        package = "adk_gate_target_probe_" + self.repo.name.encode().hex()
         manifest.write_text(f'[package]\nname = "{package}"\nversion = "0.1.0"\nedition = "2024"\n')
         (self.repo / "src").mkdir()
         (self.repo / "src/lib.rs").write_text("pub fn target_probe() -> bool { true }\n")

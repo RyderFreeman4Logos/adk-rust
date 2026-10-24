@@ -696,6 +696,15 @@ pub(crate) fn build_request_json(
         if let Some(top_p) = config.top_p {
             request_builder.top_p(top_p);
         }
+        if let Some(frequency_penalty) = config.frequency_penalty {
+            request_builder.frequency_penalty(frequency_penalty);
+        }
+        if let Some(presence_penalty) = config.presence_penalty {
+            request_builder.presence_penalty(presence_penalty);
+        }
+        if let Some(seed) = config.seed {
+            request_builder.seed(seed);
+        }
         if let Some(max_tokens) = config.max_output_tokens {
             request_builder.max_completion_tokens(max_tokens as u32);
         }
@@ -1818,6 +1827,58 @@ mod tests {
         .expect("request should build");
 
         assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn compatible_request_preserves_penalties_and_seed() {
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        for (frequency_penalty, presence_penalty, seed, sampling) in [
+            (None, None, None, serde_json::json!({})),
+            (
+                Some(0.25),
+                Some(0.5),
+                Some(7),
+                serde_json::json!({"frequency_penalty": 0.25, "presence_penalty": 0.5, "seed": 7}),
+            ),
+            (
+                Some(-2.0),
+                Some(2.0),
+                Some(i64::MIN),
+                serde_json::json!({"frequency_penalty": -2.0, "presence_penalty": 2.0, "seed": i64::MIN}),
+            ),
+            (Some(0.0), None, Some(0), serde_json::json!({"frequency_penalty": 0.0, "seed": 0})),
+            (
+                None,
+                Some(0.0),
+                Some(i64::MAX),
+                serde_json::json!({"presence_penalty": 0.0, "seed": i64::MAX}),
+            ),
+        ] {
+            let mut request = LlmRequest::new("sampling-model", Vec::new());
+            request.config = Some(adk_core::GenerateContentConfig {
+                frequency_penalty,
+                presence_penalty,
+                seed,
+                ..Default::default()
+            });
+            let body = build_request_json(
+                "sampling-model",
+                &request,
+                &None,
+                ChatCapabilities {
+                    parallel_tool_calls: true,
+                    native_pdf: false,
+                    response_schema_strict: true,
+                },
+                None,
+                &GenericSchemaAdapter,
+                &cache,
+            )
+            .expect("request should build");
+            let mut expected = serde_json::json!({"model": "sampling-model", "messages": []});
+            expected.as_object_mut().unwrap().extend(sampling.as_object().unwrap().clone());
+            assert_eq!(body, expected);
+        }
     }
 
     #[test]

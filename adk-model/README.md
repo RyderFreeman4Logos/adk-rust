@@ -755,6 +755,11 @@ are unaffected. With a response schema, extensions cannot supply `response_forma
 and request adapters cannot change it (`model.openai_compat.response_schema_conflict`,
 `InvalidInput`, zero HTTP requests). Other customizations remain available.
 
+`OpenAICompatible::with_max_response_bytes` opts into a non-streaming HTTP body
+length limit before JSON parsing. The default remains unlimited; streaming is
+unchanged. See [response body limits](../docs/official_docs/models/providers.md#non-streaming-response-body-limit)
+for the byte and error contract.
+
 ## Environment Variables
 
 ```bash

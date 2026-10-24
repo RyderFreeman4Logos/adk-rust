@@ -1,3 +1,4 @@
-- **OpenAI-compatible sampling parameters** (`adk-model`): requests include configured
-  frequency and presence penalties and the random seed, preserving zero values and
-  omitting unset fields.
+- **OpenAI-compatible generation parameters** (`adk-model`): requests include configured
+  frequency and presence penalties, random seeds, top log probabilities (with log
+  probabilities enabled), and stop sequences. Zero values are preserved and unset
+  options remain omitted.

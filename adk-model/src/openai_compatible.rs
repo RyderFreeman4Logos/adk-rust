@@ -9,7 +9,7 @@ use adk_core::{
 };
 use async_openai::types::chat::{
     CreateChatCompletionRequestArgs, ReasoningEffort as OaiReasoningEffort, ResponseFormat,
-    ResponseFormatJsonSchema,
+    ResponseFormatJsonSchema, StopConfiguration,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -704,6 +704,12 @@ pub(crate) fn build_request_json(
         }
         if let Some(seed) = config.seed {
             request_builder.seed(seed);
+        }
+        if let Some(top_logprobs) = config.top_logprobs {
+            request_builder.logprobs(true).top_logprobs(top_logprobs);
+        }
+        if !config.stop_sequences.is_empty() {
+            request_builder.stop(StopConfiguration::StringArray(config.stop_sequences.clone()));
         }
         if let Some(max_tokens) = config.max_output_tokens {
             request_builder.max_completion_tokens(max_tokens as u32);
@@ -1877,6 +1883,45 @@ mod tests {
             .expect("request should build");
             let mut expected = serde_json::json!({"model": "sampling-model", "messages": []});
             expected.as_object_mut().unwrap().extend(sampling.as_object().unwrap().clone());
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[test]
+    fn compatible_request_preserves_logprobs_and_stop_sequences() {
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        for (top_logprobs, stop_sequences, options) in [
+            (None, Vec::new(), serde_json::json!({})),
+            (
+                Some(0),
+                vec!["END".to_string(), "停止".to_string()],
+                serde_json::json!({"top_logprobs": 0, "logprobs": true, "stop": ["END", "停止"]}),
+            ),
+            (None, vec!["END".to_string()], serde_json::json!({"stop": ["END"]})),
+            (Some(20), Vec::new(), serde_json::json!({"top_logprobs": 20, "logprobs": true})),
+        ] {
+            let mut request = LlmRequest::new("options-model", Vec::new());
+            request.config = Some(adk_core::GenerateContentConfig {
+                top_logprobs,
+                stop_sequences,
+                ..Default::default()
+            });
+            let body = build_request_json(
+                "options-model",
+                &request,
+                &None,
+                ChatCapabilities {
+                    parallel_tool_calls: true,
+                    native_pdf: false,
+                    response_schema_strict: true,
+                },
+                None,
+                &GenericSchemaAdapter,
+                &cache,
+            )
+            .expect("request should build");
+            let mut expected = serde_json::json!({"model": "options-model", "messages": []});
+            expected.as_object_mut().unwrap().extend(options.as_object().unwrap().clone());
             assert_eq!(body, expected);
         }
     }

@@ -178,6 +178,124 @@ async fn terminal_native_tools_preserve_text_and_reasoning_fallback() {
     assert_terminal_reasoning("reasoning", true, true).await;
 }
 
+async fn assert_terminal_buffer(last_text: &str, mut expected: Vec<Part>, native_tool: bool) {
+    if native_tool {
+        expected.push(Part::FunctionCall {
+            name: "synthetic_tool".into(),
+            args: json!({"value": 7}),
+            id: Some("synthetic-call".into()),
+            thought_signature: None,
+        });
+    }
+    let has_tool = expected.iter().any(|part| matches!(part, Part::FunctionCall { .. }));
+    for usage_mode in ["inline", "trailer", "absent"] {
+        let server = MockServer::start().await;
+        let mut first = json!({"content": "before <tool"});
+        let mut last = json!({"content": last_text});
+        if native_tool {
+            first["tool_calls"] = json!([{"index": 0, "id": "synthetic-call", "type": "function",
+                "function": {"name": "synthetic_tool", "arguments": "{\"value\":"}}]);
+            last["tool_calls"] = json!([{"index": 0, "function": {"arguments": "7}"}}]);
+        }
+        let usage = json!({"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5});
+        let finish = if native_tool { "tool_calls" } else { "stop" };
+        let mut terminal =
+            json!({"choices": [{"index": 0, "delta": last, "finish_reason": finish}]});
+        if usage_mode == "inline" {
+            terminal["usage"] = usage.clone();
+        }
+        let mut sse = format!(
+            "data: {}\n\ndata: {terminal}\n\n",
+            json!({"choices": [{"index": 0, "delta": first, "finish_reason": null}]})
+        );
+        if usage_mode == "trailer" {
+            sse.push_str(&format!("data: {}\n\n", json!({"choices": [], "usage": usage})));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenAICompatible::new_no_auth(
+            OpenAICompatibleConfig::new("", "synthetic-model").with_base_url(server.uri()),
+        )
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled());
+        let mut request =
+            LlmRequest::new("synthetic-model", vec![Content::new("user").with_text("hello")]);
+        for name in ["lookup", "synthetic_tool"] {
+            request
+                .tools
+                .insert(name.into(), json!({"name": name, "parameters": {"type": "object"}}));
+        }
+        let responses = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = client.generate_content(request, true).await.unwrap();
+            let mut responses = Vec::new();
+            while let Some(response) = stream.try_next().await.unwrap() {
+                let turn_complete = response.turn_complete;
+                responses.push(response);
+                // LlmAgent stops consuming as soon as a response completes the turn.
+                if turn_complete {
+                    break;
+                }
+            }
+            responses
+        })
+        .await
+        .expect("local stream must finish");
+        assert_eq!(responses.len(), 1, "native={native_tool}, usage={usage_mode}");
+        let response = &responses[0];
+        assert_eq!(response.content.as_ref().unwrap().parts, expected, "usage={usage_mode}");
+        assert!(!response.partial);
+        assert_eq!(response.turn_complete, !has_tool);
+        assert_eq!(response.finish_reason, Some(FinishReason::Stop));
+        if usage_mode == "absent" {
+            assert!(response.usage_metadata.is_none());
+        } else {
+            let usage = response.usage_metadata.as_ref().unwrap();
+            assert_eq!(
+                (usage.prompt_token_count, usage.candidates_token_count, usage.total_token_count),
+                (2, 3, 5)
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn terminal_content_completes_split_text_tool() {
+    let last = "_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call> after";
+    let expected = vec![
+        Part::Text { text: "before ".into() },
+        Part::FunctionCall {
+            name: "lookup".into(),
+            args: json!({}),
+            id: None,
+            thought_signature: None,
+        },
+        Part::Text { text: " after".into() },
+    ];
+    assert_terminal_buffer(last, expected, false).await;
+}
+
+#[tokio::test]
+async fn terminal_native_tool_preserves_buffered_literal() {
+    assert_terminal_buffer("box", vec![Part::Text { text: "before <toolbox".into() }], true).await;
+}
+
+#[tokio::test]
+async fn terminal_content_preserves_split_literal_and_unfinished_prefix() {
+    for last in ["box", "", "_call>{\"name\":\"undeclared\",\"arguments\":{}}</tool_call>"] {
+        let expected = vec![Part::Text { text: format!("before <tool{last}") }];
+        assert_terminal_buffer(last, expected, false).await;
+    }
+}
+
 #[tokio::test]
 async fn ordinary_native_tools_preserve_mixed_parts() {
     let server = MockServer::start().await;

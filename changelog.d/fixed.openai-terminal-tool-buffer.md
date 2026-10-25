@@ -1,0 +1,1 @@
+- **Terminal content preserves buffered text and tool calls** (`adk-model`): OpenAI-compatible streams finish split text-tool markers and emit retained literal prefixes before the terminal response, including turns with native tool calls.

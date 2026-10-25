@@ -45,6 +45,9 @@ pub mod sandbox;
 pub mod tool;
 pub mod types;
 
+#[cfg(any(feature = "process", feature = "workspace"))]
+pub mod process_custody;
+
 // Feature-gated modules
 #[cfg(any(feature = "process", feature = "workspace"))]
 mod child_io;

@@ -1389,6 +1389,14 @@ impl Llm for OpenAICompatible {
                             // Check for finish_reason → emit final response.
                             if let Some(ref fr) = finish_reason_str {
                                 let finish_reason = Some(parse_finish_reason(fr));
+                                let mut parts = Vec::new();
+                                if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                                    && !text.is_empty()
+                                    && let crate::tool_call_parser::BufferAction::Emit(emitted) = text_tool_buffer.push(text) {
+                                        parts = emitted;
+                                    }
+                                // Consumers can stop at this response, before the EOF flush.
+                                parts.extend(text_tool_buffer.flush());
 
                                 // Emit accumulated tool calls if any.
                                 if !tool_call_accumulators.is_empty() {
@@ -1396,7 +1404,7 @@ impl Llm for OpenAICompatible {
                                         tool_call_accumulators.drain().collect();
                                     sorted_calls.sort_by_key(|(idx, _)| *idx);
 
-                                    let mut parts: Vec<Part> = sorted_calls
+                                    parts.extend(sorted_calls
                                         .into_iter()
                                         .map(|(_, (id, name, args_str))| {
                                             let args = parse_tool_call_arguments(
@@ -1412,46 +1420,11 @@ impl Llm for OpenAICompatible {
                                                 thought_signature: None,
                                             })
                                         })
-                                        .collect::<Result<Vec<_>, AdkError>>()?;
-                                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
-                                        && !text.is_empty() {
-                                            parts.insert(0, Part::Text { text: text.to_string() });
-                                        }
-
-                                    let mut response = LlmResponse {
-                                        content: Some(Content {
-                                            role: "model".to_string(),
-                                            parts,
-                                        }),
-                                        usage_metadata,
-                                        finish_reason,
-                                        citation_metadata: None,
-                                        partial: false,
-                                        // Tool-call turns are not complete — tool
-                                        // results must still be processed (issue #401).
-                                        turn_complete: false,
-                                        interrupted: false,
-                                        error_code: None,
-                                        error_message: None,
-                                        provider_metadata: None,
-                                        interaction_id: None,
-                                    };
-                                    if response.usage_metadata.is_some() {
-                                        response.provider_metadata = std::mem::take(&mut observations).into_metadata();
-                                        yield response;
-                                    } else {
-                                        pending_final_response = Some(response);
-                                    }
-                                    continue;
+                                        .collect::<Result<Vec<_>, AdkError>>()?);
                                 }
 
-                                // Final response without tool calls.
-                                let mut parts = Vec::new();
-                                if let Some(text) = delta.get("content").and_then(|v| v.as_str())
-                                    && !text.is_empty() {
-                                        parts.push(Part::Text { text: text.to_string() });
-                                    }
-
+                                // Tool results must still be processed (issue #401).
+                                let turn_complete = !parts.iter().any(|part| matches!(part, Part::FunctionCall { .. }));
                                 let mut response = LlmResponse {
                                     content: if parts.is_empty() { None } else {
                                         Some(Content {
@@ -1463,7 +1436,7 @@ impl Llm for OpenAICompatible {
                                     finish_reason,
                                     citation_metadata: None,
                                     partial: false,
-                                    turn_complete: true,
+                                    turn_complete,
                                     interrupted: false,
                                     error_code: None,
                                     error_message: None,

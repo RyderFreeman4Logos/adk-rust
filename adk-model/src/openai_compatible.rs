@@ -1293,7 +1293,10 @@ impl Llm for OpenAICompatible {
                                 Ok(v) => v,
                                 Err(e) => {
                                     tracing::warn!(
-                                        "failed to parse SSE chunk: {e} - {data}"
+                                        error.category = ?e.classify(),
+                                        error.line = e.line(),
+                                        error.column = e.column(),
+                                        "failed to parse SSE chunk"
                                     );
                                     continue;
                                 }
@@ -1355,6 +1358,34 @@ impl Llm for OpenAICompatible {
                                 }
                             }
 
+                            // Emit partial reasoning_content as Part::Thinking.
+                            // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
+                            let reasoning = delta.get("reasoning_content")
+                                .or_else(|| delta.get("reasoning"))
+                                .and_then(|v| v.as_str());
+                            if let Some(reasoning) = reasoning
+                                && !reasoning.is_empty() {
+                                    yield LlmResponse {
+                                        content: Some(Content {
+                                            role: "model".to_string(),
+                                            parts: vec![Part::Thinking {
+                                                thinking: reasoning.to_string(),
+                                                signature: None,
+                                            }],
+                                        }),
+                                        usage_metadata: None,
+                                        finish_reason: None,
+                                        citation_metadata: None,
+                                        partial: true,
+                                        turn_complete: false,
+                                        interrupted: false,
+                                        error_code: None,
+                                        error_message: None,
+                                        provider_metadata: None,
+                                        interaction_id: None,
+                                    };
+                                }
+
                             // Check for finish_reason → emit final response.
                             if let Some(ref fr) = finish_reason_str {
                                 let finish_reason = Some(parse_finish_reason(fr));
@@ -1365,7 +1396,7 @@ impl Llm for OpenAICompatible {
                                         tool_call_accumulators.drain().collect();
                                     sorted_calls.sort_by_key(|(idx, _)| *idx);
 
-                                    let parts: Vec<Part> = sorted_calls
+                                    let mut parts: Vec<Part> = sorted_calls
                                         .into_iter()
                                         .map(|(_, (id, name, args_str))| {
                                             let args = parse_tool_call_arguments(
@@ -1382,6 +1413,10 @@ impl Llm for OpenAICompatible {
                                             })
                                         })
                                         .collect::<Result<Vec<_>, AdkError>>()?;
+                                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                                        && !text.is_empty() {
+                                            parts.insert(0, Part::Text { text: text.to_string() });
+                                        }
 
                                     let mut response = LlmResponse {
                                         content: Some(Content {
@@ -1443,34 +1478,6 @@ impl Llm for OpenAICompatible {
                                 }
                                 continue;
                             }
-
-                            // Emit partial reasoning_content as Part::Thinking.
-                            // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
-                            let reasoning = delta.get("reasoning_content")
-                                .or_else(|| delta.get("reasoning"))
-                                .and_then(|v| v.as_str());
-                            if let Some(reasoning) = reasoning
-                                && !reasoning.is_empty() {
-                                    yield LlmResponse {
-                                        content: Some(Content {
-                                            role: "model".to_string(),
-                                            parts: vec![Part::Thinking {
-                                                thinking: reasoning.to_string(),
-                                                signature: None,
-                                            }],
-                                        }),
-                                        usage_metadata: None,
-                                        finish_reason: None,
-                                        citation_metadata: None,
-                                        partial: true,
-                                        turn_complete: false,
-                                        interrupted: false,
-                                        error_code: None,
-                                        error_message: None,
-                                        provider_metadata: None,
-                                        interaction_id: None,
-                                    };
-                                }
 
                             // Emit partial text content via tool call buffer.
                             // The buffer detects <tool_call> tags split across chunks

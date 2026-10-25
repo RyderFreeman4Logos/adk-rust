@@ -1396,7 +1396,7 @@ impl Llm for OpenAICompatible {
                                         tool_call_accumulators.drain().collect();
                                     sorted_calls.sort_by_key(|(idx, _)| *idx);
 
-                                    let parts: Vec<Part> = sorted_calls
+                                    let mut parts: Vec<Part> = sorted_calls
                                         .into_iter()
                                         .map(|(_, (id, name, args_str))| {
                                             let args = parse_tool_call_arguments(
@@ -1413,6 +1413,10 @@ impl Llm for OpenAICompatible {
                                             })
                                         })
                                         .collect::<Result<Vec<_>, AdkError>>()?;
+                                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                                        && !text.is_empty() {
+                                            parts.insert(0, Part::Text { text: text.to_string() });
+                                        }
 
                                     let mut response = LlmResponse {
                                         content: Some(Content {

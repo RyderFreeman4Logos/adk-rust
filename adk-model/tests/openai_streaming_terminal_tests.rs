@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-async fn assert_terminal_reasoning(field: &str, tool: bool) {
+async fn assert_terminal_reasoning(field: &str, tool: bool, mixed_tool: bool) {
     for usage_mode in ["inline", "trailer", "absent"] {
         let server = MockServer::start().await;
         let mut first = json!({field: "first synthetic thought"});
@@ -19,7 +19,8 @@ async fn assert_terminal_reasoning(field: &str, tool: bool) {
             first["tool_calls"] = json!([{"index": 0, "id": "synthetic-call", "type": "function",
                 "function": {"name": "synthetic_tool", "arguments": "{\"value\":"}}]);
             last["tool_calls"] = json!([{"index": 0, "function": {"arguments": "7}"}}]);
-        } else {
+        }
+        if !tool || mixed_tool {
             first["content"] = json!("visible-");
             last["content"] = json!("answer");
         }
@@ -79,11 +80,14 @@ async fn assert_terminal_reasoning(field: &str, tool: bool) {
 
         let mut expected =
             vec![Part::Thinking { thinking: "first synthetic thought".into(), signature: None }];
-        if !tool {
+        if !tool || mixed_tool {
             expected.push(Part::Text { text: "visible-".into() });
         }
         expected
             .push(Part::Thinking { thinking: "last synthetic thought".into(), signature: None });
+        if mixed_tool {
+            expected.push(Part::Text { text: "answer".into() });
+        }
         expected.push(if tool {
             Part::FunctionCall {
                 name: "synthetic_tool".into(),
@@ -100,7 +104,7 @@ async fn assert_terminal_reasoning(field: &str, tool: bool) {
             .flat_map(|c| c.parts.clone())
             .collect();
         assert_eq!(parts, expected, "field={field}, tool={tool}, usage={usage_mode}");
-        assert_eq!(responses.len(), expected.len());
+        assert_eq!(responses.len(), expected.len() - usize::from(mixed_tool));
         for response in &responses[..responses.len() - 1] {
             assert!(response.partial);
             assert!(!response.turn_complete);
@@ -108,6 +112,11 @@ async fn assert_terminal_reasoning(field: &str, tool: bool) {
             assert!(response.usage_metadata.is_none());
         }
         let final_response = responses.last().unwrap();
+        let final_parts = 1 + usize::from(mixed_tool);
+        assert_eq!(
+            final_response.content.as_ref().unwrap().parts.as_slice(),
+            &expected[expected.len() - final_parts..]
+        );
         assert!(!final_response.partial);
         assert_eq!(final_response.turn_complete, !tool);
         assert_eq!(final_response.finish_reason, Some(FinishReason::Stop));
@@ -141,22 +150,86 @@ async fn assert_terminal_reasoning(field: &str, tool: bool) {
 
 #[tokio::test]
 async fn terminal_text_preserves_reasoning_content() {
-    assert_terminal_reasoning("reasoning_content", false).await;
+    assert_terminal_reasoning("reasoning_content", false, false).await;
 }
 
 #[tokio::test]
 async fn terminal_text_preserves_reasoning_fallback() {
-    assert_terminal_reasoning("reasoning", false).await;
+    assert_terminal_reasoning("reasoning", false, false).await;
 }
 
 #[tokio::test]
 async fn terminal_tool_preserves_reasoning_content() {
-    assert_terminal_reasoning("reasoning_content", true).await;
+    assert_terminal_reasoning("reasoning_content", true, false).await;
 }
 
 #[tokio::test]
 async fn terminal_tool_preserves_reasoning_fallback() {
-    assert_terminal_reasoning("reasoning", true).await;
+    assert_terminal_reasoning("reasoning", true, false).await;
+}
+
+#[tokio::test]
+async fn terminal_native_tools_preserve_text_and_reasoning_content() {
+    assert_terminal_reasoning("reasoning_content", true, true).await;
+}
+
+#[tokio::test]
+async fn terminal_native_tools_preserve_text_and_reasoning_fallback() {
+    assert_terminal_reasoning("reasoning", true, true).await;
+}
+
+#[tokio::test]
+async fn ordinary_native_tools_preserve_mixed_parts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "answer",
+                "tool_calls": [{"id": "synthetic-call", "type": "function",
+                    "function": {"name": "synthetic_tool", "arguments": "{\"value\":7}"}}]},
+                "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = OpenAICompatible::new_no_auth(
+        OpenAICompatibleConfig::new("", "synthetic-model").with_base_url(server.uri()),
+    )
+    .unwrap()
+    .with_retry_config(RetryConfig::disabled());
+    let responses = tokio::time::timeout(Duration::from_secs(5), async {
+        client
+            .generate_content(
+                LlmRequest::new("synthetic-model", vec![Content::new("user").with_text("hello")]),
+                false,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("local response must finish");
+    assert_eq!(responses.len(), 1);
+    let response = &responses[0];
+    assert_eq!(
+        response.content.as_ref().unwrap().parts,
+        vec![
+            Part::Text { text: "answer".into() },
+            Part::FunctionCall {
+                name: "synthetic_tool".into(),
+                args: json!({"value": 7}),
+                id: Some("synthetic-call".into()),
+                thought_signature: None,
+            },
+        ]
+    );
+    assert!(!response.partial);
+    assert!(!response.turn_complete);
+    assert_eq!(response.finish_reason, Some(FinishReason::Stop));
+    assert_eq!(response.usage_metadata.as_ref().unwrap().total_token_count, 5);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[derive(Clone)]

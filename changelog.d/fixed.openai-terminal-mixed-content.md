@@ -1,0 +1,1 @@
+- Preserve visible text alongside native tool calls in terminal OpenAI-compatible streaming deltas.

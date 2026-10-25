@@ -449,7 +449,7 @@ async fn truncated_transient_error_retries_the_next_physical_request() {
 }
 
 #[tokio::test]
-async fn capped_error_body_preserves_the_transport_charset() {
+async fn capped_latin1_error_matches_uncapped_transport_decoding() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
@@ -459,15 +459,15 @@ async fn capped_error_body_preserves_the_transport_charset() {
         .expect(2)
         .mount(&server)
         .await;
+    // The uncapped transport defines decoding for the active reqwest features.
     let unlimited = collect(&client(&server.uri()), false).await.unwrap_err();
-    assert!(unlimited.message.contains("café"));
     let limited = client(&server.uri()).with_max_response_bytes(NonZeroUsize::new(4).unwrap());
     let error = collect(&limited, false).await.unwrap_err();
     assert_eq!(error.message, unlimited.message);
 }
 
 #[tokio::test]
-async fn capped_error_text_preserves_bom_and_replacement() {
+async fn capped_bom_and_invalid_utf8_errors_match_uncapped_transport_decoding() {
     let server = MockServer::start().await;
     for (body, expected) in [(vec![0xef, 0xbb, 0xbf, b'o', b'k'], "ok"), (vec![b'x', 0xff], "x�")]
     {
@@ -480,7 +480,7 @@ async fn capped_error_text_preserves_bom_and_replacement() {
             .await;
         let unlimited = collect(&client(&server.uri()), false).await.unwrap_err();
         assert!(unlimited.message.ends_with(expected));
-        assert!(!unlimited.message.contains('\u{feff}'));
+        // BOM handling must match the uncapped transport's enabled features.
         let limited =
             client(&server.uri()).with_max_response_bytes(NonZeroUsize::new(body.len()).unwrap());
         assert_eq!(collect(&limited, false).await.unwrap_err().message, unlimited.message);

@@ -1,5 +1,7 @@
 //! Shared OpenAI-compatible provider implementation.
 
+mod response_body;
+
 use crate::openai::{OpenAIReasoningEffort, convert};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use crate::sse::take_line;
@@ -9,13 +11,14 @@ use adk_core::{
 };
 use async_openai::types::chat::{
     CreateChatCompletionRequestArgs, ReasoningEffort as OaiReasoningEffort, ResponseFormat,
-    ResponseFormatJsonSchema,
+    ResponseFormatJsonSchema, StopConfiguration,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 /// Assistant-message field accepted by an OpenAI-compatible provider for reasoning replay.
 ///
@@ -340,6 +343,7 @@ pub struct OpenAICompatible {
     model: String,
     provider_name: String,
     retry_config: RetryConfig,
+    max_response_bytes: Option<NonZeroUsize>,
     reasoning_effort: Option<OpenAIReasoningEffort>,
     organization_id: Option<String>,
     parallel_tool_calls: bool,
@@ -431,6 +435,7 @@ impl OpenAICompatible {
             model: config.model,
             provider_name: config.provider_name,
             retry_config: RetryConfig::default(),
+            max_response_bytes: None,
             reasoning_effort,
             organization_id: config.organization_id,
             parallel_tool_calls: config.parallel_tool_calls,
@@ -491,6 +496,32 @@ impl OpenAICompatible {
     #[must_use]
     pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
+        self
+    }
+
+    /// Limit retained decoded HTTP body bytes before parsing non-streaming responses.
+    ///
+    /// Applies to successful and error responses when `stream` is `false`. The
+    /// default is unlimited; streaming is unchanged. Transport chunks, allocation
+    /// capacity, decoders and JSON parsing can consume memory beyond this length.
+    /// Bytes are counted before text charset conversion.
+    /// Overflow returns non-retryable `model.openai_compat.response_body_too_large`
+    /// without response body fragments.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+    /// use std::num::NonZeroUsize;
+    /// let client = OpenAICompatible::new_no_auth(
+    ///     OpenAICompatibleConfig::new("", "local-model"),
+    /// )?.with_max_response_bytes(NonZeroUsize::new(32_768).unwrap());
+    /// # let _ = client;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, limit: NonZeroUsize) -> Self {
+        self.max_response_bytes = Some(limit);
         self
     }
 
@@ -695,6 +726,21 @@ pub(crate) fn build_request_json(
         }
         if let Some(top_p) = config.top_p {
             request_builder.top_p(top_p);
+        }
+        if let Some(frequency_penalty) = config.frequency_penalty {
+            request_builder.frequency_penalty(frequency_penalty);
+        }
+        if let Some(presence_penalty) = config.presence_penalty {
+            request_builder.presence_penalty(presence_penalty);
+        }
+        if let Some(seed) = config.seed {
+            request_builder.seed(seed);
+        }
+        if let Some(top_logprobs) = config.top_logprobs {
+            request_builder.logprobs(true).top_logprobs(top_logprobs);
+        }
+        if !config.stop_sequences.is_empty() {
+            request_builder.stop(StopConfiguration::StringArray(config.stop_sequences.clone()));
         }
         if let Some(max_tokens) = config.max_output_tokens {
             request_builder.max_completion_tokens(max_tokens as u32);
@@ -980,6 +1026,7 @@ async fn send_request(
     http: &reqwest::Client,
     target: &RequestTarget,
     body: &serde_json::Value,
+    max_response_bytes: Option<NonZeroUsize>,
 ) -> Result<reqwest::Response, AdkError> {
     let RequestTarget {
         url,
@@ -1042,6 +1089,11 @@ async fn send_request(
         return Err(authorization_forbidden(provider_name));
     }
     let http_resp = http.execute(request).await.map_err(request_error)?;
+    let http_resp = if let Some(limit) = max_response_bytes {
+        response_body::bounded(http_resp, limit, provider_name, error_codes.parse).await?
+    } else {
+        http_resp
+    };
 
     if !http_resp.status().is_success() {
         let status = http_resp.status();
@@ -1138,6 +1190,7 @@ impl Llm for OpenAICompatible {
         let provider_name = self.provider_name.clone();
         let http = self.http.clone();
         let retry_config = self.retry_config.clone();
+        let max_response_bytes = self.max_response_bytes;
         let reasoning_effort = self.reasoning_effort;
         let reasoning_replay_field = self.reasoning_replay_field;
         let error_codes = self.error_codes;
@@ -1199,7 +1252,7 @@ impl Llm for OpenAICompatible {
                     let http = http.clone();
                     let target = target.clone();
                     let body = body.clone();
-                    async move { send_request(&http, &target, &body).await }
+                    async move { send_request(&http, &target, &body, None).await }
                 })
                 .await?;
 
@@ -1484,7 +1537,7 @@ impl Llm for OpenAICompatible {
 
             Ok(crate::usage_tracking::with_usage_tracking(Box::pin(response_stream), usage_span))
         } else {
-            // ── Non-streaming path (preserved identically) ──────────
+            // ── Non-streaming path ─────────────────────────────────
             let response_stream = try_stream! {
                 let response = execute_with_retry(&retry_config, is_retryable_model_error, || {
                     let model = model.clone();
@@ -1493,7 +1546,7 @@ impl Llm for OpenAICompatible {
                     let target = target.clone();
                     let body = request_body.clone();
                     async move {
-                        let http_resp = send_request(&http, &target, &body).await?;
+                        let http_resp = send_request(&http, &target, &body, max_response_bytes).await?;
 
                         let raw_json: serde_json::Value = http_resp.json().await.map_err(|e| {
                             AdkError::new(
@@ -1818,6 +1871,97 @@ mod tests {
         .expect("request should build");
 
         assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn compatible_request_preserves_penalties_and_seed() {
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        for (frequency_penalty, presence_penalty, seed, sampling) in [
+            (None, None, None, serde_json::json!({})),
+            (
+                Some(0.25),
+                Some(0.5),
+                Some(7),
+                serde_json::json!({"frequency_penalty": 0.25, "presence_penalty": 0.5, "seed": 7}),
+            ),
+            (
+                Some(-2.0),
+                Some(2.0),
+                Some(i64::MIN),
+                serde_json::json!({"frequency_penalty": -2.0, "presence_penalty": 2.0, "seed": i64::MIN}),
+            ),
+            (Some(0.0), None, Some(0), serde_json::json!({"frequency_penalty": 0.0, "seed": 0})),
+            (
+                None,
+                Some(0.0),
+                Some(i64::MAX),
+                serde_json::json!({"presence_penalty": 0.0, "seed": i64::MAX}),
+            ),
+        ] {
+            let mut request = LlmRequest::new("sampling-model", Vec::new());
+            request.config = Some(adk_core::GenerateContentConfig {
+                frequency_penalty,
+                presence_penalty,
+                seed,
+                ..Default::default()
+            });
+            let body = build_request_json(
+                "sampling-model",
+                &request,
+                &None,
+                ChatCapabilities {
+                    parallel_tool_calls: true,
+                    native_pdf: false,
+                    response_schema_strict: true,
+                },
+                None,
+                &GenericSchemaAdapter,
+                &cache,
+            )
+            .expect("request should build");
+            let mut expected = serde_json::json!({"model": "sampling-model", "messages": []});
+            expected.as_object_mut().unwrap().extend(sampling.as_object().unwrap().clone());
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[test]
+    fn compatible_request_preserves_logprobs_and_stop_sequences() {
+        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        for (top_logprobs, stop_sequences, options) in [
+            (None, Vec::new(), serde_json::json!({})),
+            (
+                Some(0),
+                vec!["END".to_string(), "停止".to_string()],
+                serde_json::json!({"top_logprobs": 0, "logprobs": true, "stop": ["END", "停止"]}),
+            ),
+            (None, vec!["END".to_string()], serde_json::json!({"stop": ["END"]})),
+            (Some(20), Vec::new(), serde_json::json!({"top_logprobs": 20, "logprobs": true})),
+        ] {
+            let mut request = LlmRequest::new("options-model", Vec::new());
+            request.config = Some(adk_core::GenerateContentConfig {
+                top_logprobs,
+                stop_sequences,
+                ..Default::default()
+            });
+            let body = build_request_json(
+                "options-model",
+                &request,
+                &None,
+                ChatCapabilities {
+                    parallel_tool_calls: true,
+                    native_pdf: false,
+                    response_schema_strict: true,
+                },
+                None,
+                &GenericSchemaAdapter,
+                &cache,
+            )
+            .expect("request should build");
+            let mut expected = serde_json::json!({"model": "options-model", "messages": []});
+            expected.as_object_mut().unwrap().extend(options.as_object().unwrap().clone());
+            assert_eq!(body, expected);
+        }
     }
 
     #[test]

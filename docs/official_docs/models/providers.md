@@ -355,6 +355,21 @@ acceptance remain the caller's responsibility.
 Normalized counters retain compatibility defaults: zero alone does not establish observed usage. Validate each raw field's presence and nonnegative integer type; do not infer missing totals.
 For SSE, consume the complete stream: a supplied usage-only trailer attaches one final snapshot, without adding cumulative counts. A missing or incomplete trailer does not supply final usage.
 
+### Non-streaming response body limit
+
+`OpenAICompatible::with_max_response_bytes(NonZeroUsize)` limits retained decoded
+HTTP body bytes before parsing both successful and error responses when
+`generate_content` uses `stream: false`. The default remains unlimited; streaming
+is unchanged. An exact-limit body is accepted. An oversized known body length is
+refused early, and delivered chunks are counted even without Content-Length.
+The byte count precedes text charset conversion. Overflow stops reading and
+returns non-retryable `Internal` error
+`model.openai_compat.response_body_too_large` without body fragments.
+
+This bounds retained body length, not transport chunks, allocation capacity,
+decoder/JSON parser memory or process RSS. Limits on selected model text apply
+later and do not substitute for this HTTP body limit.
+
 ### OpenAI-compatible response observations
 
 The raw Chat Completions path (`OpenAICompatible`, including `OpenAIClient`,

@@ -931,6 +931,11 @@ impl Default for ContainerConfig {
 /// This is simpler but less efficient than `DockerExecutor` which reuses a
 /// persistent container.
 ///
+/// On Linux the local CLI and its owned process group settle after timeout or
+/// cancellation, with up to five seconds of additional cleanup return latency.
+/// Incomplete cleanup returns an error while ownership remains in the active
+/// Tokio runtime. Daemon-owned container termination remains the runtime's job.
+///
 /// For production use, prefer `DockerExecutor` (behind the `docker` feature).
 ///
 /// # Example
@@ -1107,26 +1112,22 @@ impl CodeExecutor for ContainerCommandExecutor {
         cmd.args(&run_args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let child = cmd.spawn().map_err(|e| {
-            ExecutionError::ExecutionFailed(format!(
-                "failed to spawn container runtime '{}': {e}",
-                self.config.runtime
-            ))
-        })?;
+            .stderr(Stdio::piped());
 
         let completed = host_process::run_to_completion(
-            child,
+            cmd,
             stdin,
             request.sandbox.timeout,
             request.sandbox.max_stdout_bytes,
             request.sandbox.max_stderr_bytes,
+            (),
         )
         .await
         .map_err(|e| {
-            ExecutionError::ExecutionFailed(format!("failed to wait for container: {e}"))
+            ExecutionError::ExecutionFailed(e.context(
+                &format!("failed to spawn container runtime '{}'", self.config.runtime),
+                "failed to wait for container",
+            ))
         })?;
 
         let Some(output) = completed else {

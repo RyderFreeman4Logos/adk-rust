@@ -47,10 +47,11 @@ use tokio::process::Command;
 use tracing::{Span, instrument};
 
 use crate::backend::{BackendCapabilities, EnforcedLimits, SandboxBackend};
-use crate::child_io::{collect_output, note_truncation, truncate_utf8};
+use crate::child_io::{collect_command, note_truncation, truncate_utf8};
 use crate::error::SandboxError;
 use crate::sandbox::{AccessMode, AllowedPath, SandboxEnforcer, SandboxPolicy};
 use crate::types::{ExecRequest, ExecResult, Language};
+use std::sync::Arc;
 
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_024 * 1_024;
@@ -308,6 +309,24 @@ impl SandboxBackend for ProcessBackend {
         )
     )]
     async fn execute(&self, request: ExecRequest) -> Result<ExecResult, SandboxError> {
+        self.execute_with_resources(request, Arc::new(())).await
+    }
+
+    async fn execute_with_keepalive(
+        self: Arc<Self>,
+        request: ExecRequest,
+        keepalive: Arc<dyn Send + Sync>,
+    ) -> Result<ExecResult, SandboxError> {
+        self.execute_with_resources(request, keepalive).await
+    }
+}
+
+impl ProcessBackend {
+    async fn execute_with_resources(
+        &self,
+        request: ExecRequest,
+        keepalive: Arc<dyn Send + Sync>,
+    ) -> Result<ExecResult, SandboxError> {
         if let Some(limit) = request.memory_limit_mb {
             tracing::debug!(
                 memory_limit_mb = limit,
@@ -316,22 +335,26 @@ impl SandboxBackend for ProcessBackend {
         }
 
         match request.language {
-            Language::Rust => self.execute_rust(&request).await,
-            Language::Python => self.execute_python(&request).await,
-            Language::JavaScript | Language::TypeScript => self.execute_javascript(&request).await,
-            Language::Command => self.execute_command(&request).await,
+            Language::Rust => self.execute_rust(&request, keepalive).await,
+            Language::Python => self.execute_python(&request, keepalive).await,
+            Language::JavaScript | Language::TypeScript => {
+                self.execute_javascript(&request, keepalive).await
+            }
+            Language::Command => self.execute_command(&request, keepalive).await,
             Language::Wasm => Err(SandboxError::InvalidRequest(
                 "Wasm execution is not supported by ProcessBackend. Use WasmBackend instead."
                     .to_string(),
             )),
         }
     }
-}
 
-impl ProcessBackend {
     /// Executes Rust code: write to temp file → compile with rustc → run binary.
-    async fn execute_rust(&self, request: &ExecRequest) -> Result<ExecResult, SandboxError> {
-        let dir = tempfile::tempdir()?;
+    async fn execute_rust(
+        &self,
+        request: &ExecRequest,
+        keepalive: Arc<dyn Send + Sync>,
+    ) -> Result<ExecResult, SandboxError> {
+        let dir = Arc::new(tempfile::tempdir()?);
         let src_path = dir.path().join("main.rs");
         let bin_path = dir.path().join("main");
 
@@ -356,7 +379,14 @@ impl ProcessBackend {
             #[cfg(windows)]
             cmd.arg("-Clinker=rust-lld");
             cmd.arg(&src_path).arg("-o").arg(&bin_path);
-            self.run_command_with_env(cmd, request, &toolchain_env, Some(dir.path())).await?
+            self.run_command_with_env(
+                cmd,
+                request,
+                &toolchain_env,
+                Some(dir.path()),
+                Arc::new((keepalive.clone(), dir.clone())),
+            )
+            .await?
         };
 
         #[cfg(windows)]
@@ -379,33 +409,51 @@ impl ProcessBackend {
         }
 
         // Run the compiled binary
-        self.run_command(Command::new(&bin_path), request, Some(dir.path())).await
+        self.run_command(
+            Command::new(&bin_path),
+            request,
+            Some(dir.path()),
+            Arc::new((keepalive, dir.clone())),
+        )
+        .await
     }
 
     /// Executes Python code: write to temp file → run with python3.
-    async fn execute_python(&self, request: &ExecRequest) -> Result<ExecResult, SandboxError> {
-        let dir = tempfile::tempdir()?;
+    async fn execute_python(
+        &self,
+        request: &ExecRequest,
+        keepalive: Arc<dyn Send + Sync>,
+    ) -> Result<ExecResult, SandboxError> {
+        let dir = Arc::new(tempfile::tempdir()?);
         let src_path = dir.path().join("script.py");
         std::fs::write(&src_path, &request.code)?;
 
         let mut cmd = Command::new(&self.config.python_path);
         cmd.arg(&src_path);
-        self.run_command(cmd, request, Some(dir.path())).await
+        self.run_command(cmd, request, Some(dir.path()), Arc::new((keepalive, dir.clone()))).await
     }
 
     /// Executes JavaScript code: write to temp file → run with node.
-    async fn execute_javascript(&self, request: &ExecRequest) -> Result<ExecResult, SandboxError> {
-        let dir = tempfile::tempdir()?;
+    async fn execute_javascript(
+        &self,
+        request: &ExecRequest,
+        keepalive: Arc<dyn Send + Sync>,
+    ) -> Result<ExecResult, SandboxError> {
+        let dir = Arc::new(tempfile::tempdir()?);
         let src_path = dir.path().join("script.js");
         std::fs::write(&src_path, &request.code)?;
 
         let mut cmd = Command::new(&self.config.node_path);
         cmd.arg(&src_path);
-        self.run_command(cmd, request, Some(dir.path())).await
+        self.run_command(cmd, request, Some(dir.path()), Arc::new((keepalive, dir.clone()))).await
     }
 
     /// Executes a raw shell command via the platform shell.
-    async fn execute_command(&self, request: &ExecRequest) -> Result<ExecResult, SandboxError> {
+    async fn execute_command(
+        &self,
+        request: &ExecRequest,
+        keepalive: Arc<dyn Send + Sync>,
+    ) -> Result<ExecResult, SandboxError> {
         #[cfg(windows)]
         let cmd = {
             use std::os::windows::process::CommandExt;
@@ -425,7 +473,7 @@ impl ProcessBackend {
             c.arg("-c").arg(&request.code);
             c
         };
-        self.run_command(cmd, request, None).await
+        self.run_command(cmd, request, None, keepalive).await
     }
 
     /// Shared execution logic: env isolation, stdin piping, timeout, output capture.
@@ -437,8 +485,9 @@ impl ProcessBackend {
         cmd: Command,
         request: &ExecRequest,
         scratch_dir: Option<&Path>,
+        keepalive: Arc<dyn Send + Sync>,
     ) -> Result<ExecResult, SandboxError> {
-        self.run_command_with_env(cmd, request, &[], scratch_dir).await
+        self.run_command_with_env(cmd, request, &[], scratch_dir, keepalive).await
     }
 
     /// Variables a compiler needs to find its own tools.
@@ -518,6 +567,7 @@ impl ProcessBackend {
         request: &ExecRequest,
         extra_env: &[(String, OsString)],
         scratch_dir: Option<&Path>,
+        keepalive: Arc<dyn Send + Sync>,
     ) -> Result<ExecResult, SandboxError> {
         // Keeps a scratch directory created here alive until the execution ends.
         let mut owned_scratch: Option<tempfile::TempDir> = None;
@@ -580,19 +630,6 @@ impl ProcessBackend {
         for (k, v) in &request.env {
             cmd.env(k, v);
         }
-        cmd.kill_on_drop(true);
-
-        // Give each execution its own process group. `kill_on_drop` only
-        // targets the immediate child, which is not enough for shell tools:
-        // compilers, scripts, and background jobs can otherwise survive a
-        // timeout. Descendants inherit this group unless they deliberately
-        // detach, so the group is killed on timeout and again on exit.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.as_std_mut().process_group(0);
-        }
-
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -603,13 +640,13 @@ impl ProcessBackend {
         }
 
         let start = Instant::now();
-        let child = cmd.spawn()?;
 
         // Both pipes are read concurrently with the cap applied as the bytes arrive, and stdin
         // is written alongside them inside the timeout.
         let cap = self.config.max_output_bytes;
         let stdin = request.stdin.as_ref().map(|input| input.as_bytes().to_vec());
-        let output = collect_output(child, stdin, request.timeout, cap).await;
+        let output =
+            collect_command(cmd, stdin, request.timeout, cap, (keepalive, owned_scratch)).await;
         let duration = start.elapsed();
 
         match output {

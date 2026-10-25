@@ -10,9 +10,10 @@
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin};
-use tokio::task::JoinHandle;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::process::Command;
+
+use crate::process_custody::{CompletionBoundary, ProcessIo, run_owned_command};
 
 /// Output of a child that exited before its timeout.
 #[derive(Debug)]
@@ -29,111 +30,111 @@ pub(crate) struct CapturedOutput {
     pub(crate) stderr_truncated: bool,
 }
 
-/// Drives a spawned child to completion: feeds `stdin`, reads both output pipes under `cap`,
-/// and enforces `timeout`.
-///
-/// The child must have been spawned with piped stdout and stderr, a piped stdin when `stdin`
-/// is `Some`, and — on Unix — in its own process group (`process_group(0)`), which this
-/// function kills on timeout and again once the child exits.
-///
-/// Returns `Ok(None)` when the timeout elapsed.
-///
-/// # Errors
-///
-/// Returns an I/O error when waiting on the child or reading its output fails.
-pub(crate) async fn collect_output(
-    mut child: Child,
+/// Collects sandbox I/O while the shared owner holds the command and artifacts.
+pub(crate) async fn collect_command<K: Send + 'static>(
+    command: Command,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    cap: usize,
+    keepalive: K,
+) -> std::io::Result<Option<CapturedOutput>> {
+    run_owned_command(command, timeout, keepalive, CompletionBoundary::LeaderExit, move |pipes| {
+        capture_pipes(pipes, stdin, cap)
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn collect_output(
+    child: tokio::process::Child,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
     cap: usize,
 ) -> std::io::Result<Option<CapturedOutput>> {
-    // Captured before `wait`, which clears the id once the child is reaped.
-    #[cfg(unix)]
-    let process_group = child.id().and_then(|id| i32::try_from(id).ok());
-
-    let mut stdout_reader = spawn_capped_reader(child.stdout.take(), cap);
-    let mut stderr_reader = spawn_capped_reader(child.stderr.take(), cap);
-    // Written concurrently with the reads: a child that fills its output pipe before it drains
-    // stdin would otherwise deadlock against a blocking write that no timeout covers.
-    let stdin_writer = tokio::spawn(write_stdin(child.stdin.take(), stdin));
-
-    let outcome = tokio::time::timeout(timeout, async {
-        let status = child.wait().await?;
-        // Background descendants (`cmd &`, `nohup cmd &`) stay in the group after the leader
-        // exits. Killing the group ends them with the execution and closes the pipe ends they
-        // inherited, which would otherwise keep the reads below open until the timeout.
-        #[cfg(unix)]
-        kill_process_group(process_group);
-        let (stdout, stdout_truncated) =
-            (&mut stdout_reader).await.map_err(std::io::Error::other)??;
-        let (stderr, stderr_truncated) =
-            (&mut stderr_reader).await.map_err(std::io::Error::other)??;
-        Ok::<_, std::io::Error>(CapturedOutput {
-            status,
-            stdout,
-            stdout_truncated,
-            stderr,
-            stderr_truncated,
-        })
-    })
-    .await;
-
-    // Any stdin still unwritten has no reader once the child is gone.
-    stdin_writer.abort();
-
-    match outcome {
-        Ok(captured) => captured.map(Some),
-        Err(_elapsed) => {
-            #[cfg(unix)]
-            kill_process_group(process_group);
-            // Covers platforms without process groups; `kill_on_drop` reaps it afterwards.
-            if let Err(error) = child.start_kill() {
-                tracing::debug!(error = %error, "child already exited at timeout");
-            }
-            stdout_reader.abort();
-            stderr_reader.abort();
-            Ok(None)
-        }
-    }
+    crate::process_custody::collect_owned_child(
+        child,
+        timeout,
+        CompletionBoundary::LeaderExit,
+        move |pipes| capture_pipes(pipes, stdin, cap),
+    )
+    .await
 }
 
-/// Sends `SIGKILL` to every process in `group`.
-///
-/// Called after the group leader may already have been reaped. The group id cannot be reused
-/// while any member survives, so the signal reaches either the execution's own descendants or
-/// no process at all (`ESRCH`, ignored).
-#[cfg(unix)]
-pub(crate) fn kill_process_group(group: Option<i32>) {
-    if let Some(group) = group.filter(|group| *group > 0) {
-        // SAFETY: kill(2) has no memory-safety preconditions. A negative pid addresses the
-        // process group whose id is `group`, which the caller created for this execution.
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
-        }
-    }
-}
-
-/// Reads `pipe` on a background task under `cap`; a missing pipe yields no output.
-fn spawn_capped_reader<R>(
-    pipe: Option<R>,
+async fn capture_pipes(
+    pipes: ProcessIo,
+    stdin: Option<Vec<u8>>,
     cap: usize,
-) -> JoinHandle<std::io::Result<(Vec<u8>, bool)>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        match pipe {
+) -> std::io::Result<CapturedOutput> {
+    let writer = write_stdin(pipes.stdin, stdin);
+    let status = async { pipes.status.await.map_err(std::io::Error::other)? };
+    let stdout = async {
+        match pipes.stdout {
             Some(pipe) => read_capped(pipe, cap).await,
             None => Ok((Vec::new(), false)),
         }
-    })
+    };
+    let stderr = async {
+        match pipes.stderr {
+            Some(pipe) => read_capped(pipe, cap).await,
+            None => Ok((Vec::new(), false)),
+        }
+    };
+    capture_ordered(status, writer, stdout, stderr).await
+}
+
+// All I/O is pumped concurrently, but errors are OBSERVED in the original
+// wait -> stdout -> stderr order. A completed writer never initiates shutdown.
+async fn capture_ordered<S, W, O, E>(
+    status: S,
+    writer: W,
+    stdout: O,
+    stderr: E,
+) -> std::io::Result<CapturedOutput>
+where
+    S: std::future::Future<Output = std::io::Result<ExitStatus>>,
+    W: std::future::Future<Output = ()>,
+    O: std::future::Future<Output = std::io::Result<(Vec<u8>, bool)>>,
+    E: std::future::Future<Output = std::io::Result<(Vec<u8>, bool)>>,
+{
+    tokio::pin!(status, writer, stdout, stderr);
+    let mut exit = None;
+    let mut out = None;
+    let mut err = None;
+    let mut writer_done = false;
+    loop {
+        if let Some(status) = exit.take() {
+            let status = status?;
+            if let Some(stdout) = out.take() {
+                let (stdout, stdout_truncated) = stdout?;
+                if let Some(stderr) = err.take() {
+                    let (stderr, stderr_truncated) = stderr?;
+                    // The old writer was aborted at this collection boundary.
+                    return Ok(CapturedOutput {
+                        status,
+                        stdout,
+                        stdout_truncated,
+                        stderr,
+                        stderr_truncated,
+                    });
+                }
+                out = Some(Ok((stdout, stdout_truncated)));
+            }
+            exit = Some(Ok(status));
+        }
+        tokio::select! {
+            value = &mut status, if exit.is_none() => exit = Some(value),
+            value = &mut stdout, if out.is_none() => out = Some(value),
+            value = &mut stderr, if err.is_none() => err = Some(value),
+            _ = &mut writer, if !writer_done => writer_done = true,
+        }
+    }
 }
 
 /// Writes `input` to the child's stdin and closes it.
 ///
 /// A child that exits or closes stdin without consuming it all makes the write fail with
 /// `BrokenPipe`; that is the child's choice, not an execution failure.
-async fn write_stdin(pipe: Option<ChildStdin>, input: Option<Vec<u8>>) {
+async fn write_stdin<W: AsyncWrite + Unpin>(pipe: Option<W>, input: Option<Vec<u8>>) {
     let (Some(mut pipe), Some(input)) = (pipe, input) else {
         return;
     };
@@ -213,6 +214,80 @@ pub(crate) fn note_truncation(mut text: String, discarded: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::process::Child;
+
+    struct FailingWriter(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if let Some(failed) = self.0.take() {
+                let _ = failed.send(());
+            }
+            std::task::Poll::Ready(Err(std::io::Error::other("controlled stdin failure")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_failure_keeps_sandbox_result_barrier_pending() {
+        use std::os::unix::process::ExitStatusExt;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (failed, failure_observed) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(capture_ordered(
+            async { released.await.map_err(std::io::Error::other) },
+            write_stdin(Some(FailingWriter(Some(failed))), Some(vec![1])),
+            std::future::ready(Ok((b"ordinary output".to_vec(), false))),
+            std::future::ready(Ok((Vec::new(), false))),
+        ));
+        failure_observed.await.expect("actual failing AsyncWrite polled");
+        assert!(!operation.is_finished(), "stdin failure must not end sandbox collection");
+        release.send(ExitStatus::from_raw(7 << 8)).expect("result barrier retained");
+        let result =
+            operation.await.expect("collector actual join").expect("ordinary process result");
+        assert_eq!(result.status.code(), Some(7));
+        assert_eq!(result.stdout, b"ordinary output");
+    }
+
+    #[tokio::test]
+    async fn early_stdout_error_waits_for_leader_and_preserves_wait_error_priority() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (observed, ready) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(capture_ordered(
+            async {
+                released.await.map_err(std::io::Error::other)?;
+                Err(std::io::Error::other("wait error wins"))
+            },
+            std::future::ready(()),
+            async {
+                let _ = observed.send(());
+                Err(std::io::Error::other("early stdout error"))
+            },
+            std::future::pending(),
+        ));
+        ready.await.expect("stdout error ready");
+        assert!(!operation.is_finished(), "reader error must wait its original observation point");
+        release.send(()).expect("leader observation barrier retained");
+        let error = operation.await.expect("collector actual join").expect_err("wait failure");
+        assert_eq!(error.to_string(), "wait error wins");
+    }
 
     /// `read_capped` must retain at most `cap` bytes regardless of how much arrives.
     ///

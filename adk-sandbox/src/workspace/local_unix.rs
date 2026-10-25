@@ -14,7 +14,7 @@
 //! | Environment | Cleared, then only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, and `TERM` are passed through, so host credentials in other variables never reach the command |
 //! | Output | stdout and stderr are read while the command runs and capped at 1 MiB each; the excess is drained and a truncation notice appended |
 //! | Stdin | Connected to `/dev/null` |
-//! | Lifetime | Each command runs in its own process group, which is killed on timeout and again when the command exits, so background jobs do not outlive it |
+//! | Lifetime | Each command has a private group. The owner kills residual members on timeout, caller cancellation or leader exit and retains custody through actual wait |
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ use super::path_safety::validate_relative_path;
 use super::session::SandboxSession;
 use super::types::{DirEntry, EntryType, ExecOutput, SessionHandle, SnapshotId};
 use crate::SandboxError;
-use crate::child_io::{collect_output, note_truncation, truncate_utf8};
+use crate::child_io::{collect_command, note_truncation, truncate_utf8};
 
 /// SandboxClient implementation using local filesystem directories.
 ///
@@ -155,24 +155,12 @@ impl SandboxSession for LocalUnixSession {
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        // Killing `sh` alone on timeout left its children running; the group takes them too.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.as_std_mut().process_group(0);
-        }
+            .stderr(std::process::Stdio::piped());
 
         let start = std::time::Instant::now();
-        let child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::ExecutionFailed(format!("failed to spawn command: {e}")))?;
-
-        // The pipes are drained while the command runs. Reading them only after `wait`
-        // deadlocked any command that wrote more than a pipe buffer, which then surfaced as a
-        // timeout.
-        let captured = collect_output(child, None, self.command_timeout, MAX_OUTPUT_BYTES)
+        // The owner takes the fully configured command before spawning, so
+        // cancellation cannot release it between spawn and cleanup custody.
+        let captured = collect_command(cmd, None, self.command_timeout, MAX_OUTPUT_BYTES, ())
             .await
             .map_err(|e| SandboxError::ExecutionFailed(format!("command execution failed: {e}")))?;
         let duration = start.elapsed();

@@ -112,30 +112,32 @@ fn code_error_to_json(err: &CodeError) -> Value {
                     "status": "memory_exceeded",
                     "stderr": format!("memory limit exceeded: {limit_mb} MB"),
                 }),
-                SandboxError::ExecutionFailed(msg) => json!({
-                    "status": "error",
-                    "stderr": msg,
-                }),
-                SandboxError::InvalidRequest(msg) => json!({
-                    "status": "error",
-                    "stderr": msg,
-                }),
-                SandboxError::BackendUnavailable(msg) => json!({
-                    "status": "error",
-                    "stderr": msg,
-                }),
-                SandboxError::EnforcerFailed { enforcer, message } => json!({
-                    "status": "error",
-                    "stderr": format!("sandbox enforcer '{enforcer}' failed: {message}"),
-                }),
-                SandboxError::EnforcerUnavailable { enforcer, message } => json!({
-                    "status": "error",
-                    "stderr": format!("sandbox enforcer '{enforcer}' unavailable: {message}"),
-                }),
-                SandboxError::PolicyViolation(msg) => json!({
-                    "status": "error",
-                    "stderr": msg,
-                }),
+                other => {
+                    // Dependency features can add variants without a matching
+                    // local feature. Reuse the sandbox's own classification.
+                    let classified: adk_core::AdkError = other.clone().into();
+                    let stderr = match other {
+                        SandboxError::ExecutionFailed(message)
+                        | SandboxError::InvalidRequest(message)
+                        | SandboxError::BackendUnavailable(message)
+                        | SandboxError::PolicyViolation(message) => message.clone(),
+                        SandboxError::EnforcerFailed { enforcer, message } => {
+                            format!("sandbox enforcer '{enforcer}' failed: {message}")
+                        }
+                        SandboxError::EnforcerUnavailable { enforcer, message } => {
+                            format!("sandbox enforcer '{enforcer}' unavailable: {message}")
+                        }
+                        _ => other.to_string(),
+                    };
+                    json!({
+                        "status": if classified.category == adk_core::ErrorCategory::Timeout {
+                            "timeout"
+                        } else {
+                            "error"
+                        },
+                        "stderr": stderr,
+                    })
+                }
             }
         }
         CodeError::InvalidCode(msg) => json!({
@@ -500,6 +502,37 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_error_fallback_preserves_existing_diagnostic_contracts() {
+        let cases = [
+            (SandboxError::InvalidRequest("invalid fixture".to_string()), "invalid fixture"),
+            (
+                SandboxError::BackendUnavailable("unavailable fixture".to_string()),
+                "unavailable fixture",
+            ),
+            (SandboxError::PolicyViolation("policy fixture".to_string()), "policy fixture"),
+            (
+                SandboxError::EnforcerFailed {
+                    enforcer: "fixture".to_string(),
+                    message: "failure".to_string(),
+                },
+                "sandbox enforcer 'fixture' failed: failure",
+            ),
+            (
+                SandboxError::EnforcerUnavailable {
+                    enforcer: "fixture".to_string(),
+                    message: "missing".to_string(),
+                },
+                "sandbox enforcer 'fixture' unavailable: missing",
+            ),
+        ];
+        for (error, expected) in cases {
+            let rendered = code_error_to_json(&CodeError::Sandbox(error));
+            assert_eq!(rendered["status"], "error");
+            assert_eq!(rendered["stderr"], expected);
+        }
+    }
+
+    #[test]
     fn test_code_error_to_json_sandbox_timeout() {
         let err = CodeError::Sandbox(SandboxError::Timeout { timeout: Duration::from_secs(5) });
         let json = code_error_to_json(&err);
@@ -530,3 +563,7 @@ mod tests {
         assert_eq!(json["stderr"], "boom");
     }
 }
+
+#[cfg(test)]
+#[path = "code_tool_properties.rs"]
+mod property_tests;

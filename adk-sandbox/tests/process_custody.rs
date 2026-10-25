@@ -898,7 +898,19 @@ async fn backend_normal_leader_exit_ends_inherited_descendant() {
     if supervised("backend_normal_leader_exit_ends_inherited_descendant").await {
         return;
     }
-    let mut fixture = Fixture::new("normal", false).await;
+    normal_leader_exit(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn backend_normal_leader_exit_ends_closed_stdio_descendant() {
+    if supervised("backend_normal_leader_exit_ends_closed_stdio_descendant").await {
+        return;
+    }
+    normal_leader_exit(true).await;
+}
+
+async fn normal_leader_exit(closed: bool) {
+    let mut fixture = Fixture::new("normal", closed).await;
     let backend = backend(&fixture);
     let mut operation = Box::pin(backend.execute(request()));
     let ready = tokio::select! {

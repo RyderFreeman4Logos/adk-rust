@@ -93,6 +93,11 @@ pub struct CodeResult {
 /// Rust-specific executor that compiles code through a check → build → execute pipeline
 /// and delegates execution to a [`SandboxBackend`].
 ///
+/// Host compilation and ProcessBackend execution retain artifacts through owned
+/// group settlement. Each phase keeps its original work allowance; shutdown may
+/// add up to five seconds to return. An incomplete-cleanup error retains ownership
+/// in the active Tokio runtime. Other backends keep their own settlement contract.
+///
 /// # Isolation
 ///
 /// | Step | Where it runs | Environment |
@@ -152,8 +157,9 @@ impl RustExecutor {
         validate_rust_source(code).map_err(|e| CodeError::InvalidCode(e.to_string()))?;
 
         // Create temp directory for compilation artifacts.
-        let tmp_dir = tempfile::tempdir()
-            .map_err(|e| CodeError::InvalidCode(format!("failed to create temp directory: {e}")))?;
+        let tmp_dir = Arc::new(tempfile::tempdir().map_err(|e| {
+            CodeError::InvalidCode(format!("failed to create temp directory: {e}"))
+        })?);
 
         let source_path = tmp_dir.path().join("main.rs");
         // The backend runs the binary as a shell command, and `cmd.exe` does not
@@ -173,10 +179,11 @@ impl RustExecutor {
         let serde_json_path = self.find_serde_json_dep().await?;
 
         // Step 1: Check — compile with --error-format=json, parse diagnostics.
-        let diagnostics = self.check(&source_path, &serde_json_path, timeout).await?;
+        let diagnostics =
+            self.check(&source_path, &serde_json_path, timeout, tmp_dir.clone()).await?;
 
         // Step 2: Build — compile to binary.
-        self.build(&source_path, &binary_path, &serde_json_path, timeout).await?;
+        self.build(&source_path, &binary_path, &serde_json_path, timeout, tmp_dir.clone()).await?;
 
         info!("compilation succeeded, delegating execution to sandbox backend");
 
@@ -191,7 +198,8 @@ impl RustExecutor {
             env: HashMap::new(),
         };
 
-        let exec_result = self.backend.execute(exec_request).await?;
+        let exec_result =
+            self.backend.clone().execute_with_keepalive(exec_request, tmp_dir).await?;
 
         // Extract structured output from stdout.
         let (output, display_stdout) = extract_structured_output(&exec_result.stdout);
@@ -215,11 +223,12 @@ impl RustExecutor {
         source_path: &Path,
         serde_json_path: &Option<PathBuf>,
         timeout: Duration,
+        keepalive: Arc<tempfile::TempDir>,
     ) -> Result<Vec<RustDiagnostic>, CodeError> {
         // Use a temp directory for metadata output to avoid /dev/null issues on macOS.
-        let check_dir = tempfile::tempdir().map_err(|e| {
+        let check_dir = Arc::new(tempfile::tempdir().map_err(|e| {
             CodeError::InvalidCode(format!("failed to create check temp directory: {e}"))
-        })?;
+        })?);
         let metadata_out = check_dir.path().join("check_output");
 
         let mut args: Vec<OsString> = vec![
@@ -235,7 +244,8 @@ impl RustExecutor {
         ];
         args.extend(self.dependency_args(serde_json_path));
 
-        let RustcOutput { stderr, .. } = self.run_rustc(args, timeout, "check").await?;
+        let RustcOutput { stderr, .. } =
+            self.run_rustc(args, timeout, "check", Arc::new((keepalive, check_dir))).await?;
         let diagnostics = parse_diagnostics(&stderr);
 
         let has_errors = diagnostics.iter().any(|d| d.level == "error");
@@ -262,6 +272,7 @@ impl RustExecutor {
         binary_path: &Path,
         serde_json_path: &Option<PathBuf>,
         timeout: Duration,
+        keepalive: Arc<tempfile::TempDir>,
     ) -> Result<(), CodeError> {
         let mut args: Vec<OsString> = vec![
             source_path.into(),
@@ -272,7 +283,7 @@ impl RustExecutor {
         ];
         args.extend(self.dependency_args(serde_json_path));
 
-        let output = self.run_rustc(args, timeout, "build").await?;
+        let output = self.run_rustc(args, timeout, "build", keepalive).await?;
         if !output.success {
             let diagnostics = parse_diagnostics(&output.stderr);
             return Err(CodeError::CompileError { diagnostics, stderr: output.stderr });
@@ -310,6 +321,7 @@ impl RustExecutor {
         args: Vec<OsString>,
         timeout: Duration,
         step: &str,
+        keepalive: Arc<dyn Send + Sync>,
     ) -> Result<RustcOutput, CodeError> {
         let capabilities = self.backend.capabilities();
         // The command is quoted for a POSIX shell, so only Unix backends receive it.
@@ -337,7 +349,7 @@ impl RustExecutor {
                 memory_limit_mb: None,
                 env,
             };
-            return match self.backend.execute(request).await {
+            return match self.backend.clone().execute_with_keepalive(request, keepalive).await {
                 Ok(result) => {
                     Ok(RustcOutput { success: result.exit_code == 0, stderr: result.stderr })
                 }
@@ -351,16 +363,15 @@ impl RustExecutor {
         let mut cmd = host_process::rustc_command(&self.config.rustc_path);
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => Ok(RustcOutput {
+        match host_process::run_compiler(cmd, timeout, keepalive).await {
+            Ok(Some(output)) => Ok(RustcOutput {
                 success: output.status.success(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             }),
-            Ok(Err(e)) => {
+            Err(e) => {
                 Err(CodeError::InvalidCode(format!("failed to invoke rustc for {step}: {e}")))
             }
-            // `kill_on_drop` terminated rustc when the timed-out future was dropped.
-            Err(_) => Err(CodeError::InvalidCode(format!("{step} step timed out"))),
+            Ok(None) => Err(CodeError::InvalidCode(format!("{step} step timed out"))),
         }
     }
 
@@ -580,7 +591,7 @@ mod tests {
         let backend = Arc::new(MockBackend::success(r#"{"result":42}"#));
         let executor = RustExecutor::new(backend, RustExecutorConfig::default());
 
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = Arc::new(tempfile::tempdir().unwrap());
         let source_path = tmp_dir.path().join("valid.rs");
         let code = r#"
 fn run(input: serde_json::Value) -> serde_json::Value {
@@ -592,7 +603,7 @@ fn run(input: serde_json::Value) -> serde_json::Value {
 
         // The check step may fail if serde_json is not available, but it should
         // NOT fail with CodeError::InvalidCode for valid source.
-        let result = executor.check(&source_path, &None, Duration::from_secs(30)).await;
+        let result = executor.check(&source_path, &None, Duration::from_secs(30), tmp_dir).await;
 
         // If serde_json is not found, rustc will produce an error about the
         // missing extern crate — that's a compile error, not invalid code.
@@ -620,13 +631,13 @@ fn run(input: serde_json::Value) -> serde_json::Value {
         let backend = Arc::new(MockBackend::success(""));
         let executor = RustExecutor::new(backend, RustExecutorConfig::default());
 
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = Arc::new(tempfile::tempdir().unwrap());
         let source_path = tmp_dir.path().join("invalid.rs");
         // Deliberately broken Rust code.
         let code = "fn broken( { }";
         tokio::fs::write(&source_path, code).await.unwrap();
 
-        let result = executor.check(&source_path, &None, Duration::from_secs(30)).await;
+        let result = executor.check(&source_path, &None, Duration::from_secs(30), tmp_dir).await;
 
         match result {
             Err(CodeError::CompileError { diagnostics, stderr }) => {
@@ -645,13 +656,13 @@ fn run(input: serde_json::Value) -> serde_json::Value {
         let backend = Arc::new(MockBackend::success(""));
         let executor = RustExecutor::new(backend, RustExecutorConfig::default());
 
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = Arc::new(tempfile::tempdir().unwrap());
         let source_path = tmp_dir.path().join("warnings.rs");
         // Code with an unused variable warning.
         let code = "fn main() { let x = 42; }";
         tokio::fs::write(&source_path, code).await.unwrap();
 
-        let result = executor.check(&source_path, &None, Duration::from_secs(30)).await;
+        let result = executor.check(&source_path, &None, Duration::from_secs(30), tmp_dir).await;
 
         match result {
             Ok(diagnostics) => {

@@ -107,6 +107,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -154,6 +155,11 @@ impl Default for RustSandboxConfig {
 /// Phase 1 is honest about isolation: it can enforce timeouts and output
 /// truncation, but cannot enforce network or filesystem restrictions.
 ///
+/// On Linux, each phase keeps its original post-spawn work allowance. Shutdown
+/// may add up to five seconds to return while the owned process group settles.
+/// Incomplete cleanup returns an error and retains artifacts in the active Tokio
+/// runtime until actual settlement, including after caller cancellation.
+///
 /// # Backend Capability Reporting
 ///
 /// `RustSandboxExecutor` reports its capabilities truthfully through
@@ -168,7 +174,7 @@ impl Default for RustSandboxConfig {
 /// | Environment policy | Yes | `rustc` sees only the toolchain allowlist; the binary sees only the policy's allowlist |
 /// | Timeout | Yes | Enforced via `tokio::time::timeout`, including stdin delivery |
 /// | Structured output | Yes | Harness extracts JSON from last stdout line |
-/// | Process execution | No | User code cannot spawn child processes through the harness |
+/// | Process execution | No | Does not accept command payloads; authored Rust retains host permissions |
 /// | Persistent workspace | No | Each execution uses a fresh temp directory |
 /// | Interactive sessions | No | Single-shot execution only |
 ///
@@ -251,9 +257,9 @@ impl CodeExecutor for RustSandboxExecutor {
         let start = Instant::now();
 
         // Create a temp directory for compilation artifacts.
-        let tmp_dir = tempfile::tempdir().map_err(|e| {
+        let tmp_dir = Arc::new(tempfile::tempdir().map_err(|e| {
             ExecutionError::ExecutionFailed(format!("failed to create temp directory: {e}"))
-        })?;
+        })?);
 
         let source_path = tmp_dir.path().join("main.rs");
         let binary_path = tmp_dir.path().join("main");
@@ -267,7 +273,8 @@ impl CodeExecutor for RustSandboxExecutor {
         debug!(source_path = %source_path.display(), "wrote harnessed source");
 
         // ── Compilation ────────────────────────────────────────────────
-        let compile_result = self.compile(&source_path, &binary_path, &request).await?;
+        let compile_result =
+            self.compile(&source_path, &binary_path, &request, tmp_dir.clone()).await?;
         if let Some(result) = compile_result {
             // Compilation failed — return the compile failure result.
             return Ok(result);
@@ -276,12 +283,7 @@ impl CodeExecutor for RustSandboxExecutor {
         info!("compilation succeeded, executing binary");
 
         // ── Execution ──────────────────────────────────────────────────
-        let result = self.run_binary(&binary_path, &request, start).await;
-
-        // Clean up temp dir (best-effort, tempfile handles this on drop too).
-        drop(tmp_dir);
-
-        result
+        self.run_binary(&binary_path, &request, start, tmp_dir).await
     }
 }
 
@@ -294,6 +296,7 @@ impl RustSandboxExecutor {
         source_path: &std::path::Path,
         binary_path: &std::path::Path,
         request: &ExecutionRequest,
+        keepalive: Arc<tempfile::TempDir>,
     ) -> Result<Option<ExecutionResult>, ExecutionError> {
         let serde_json_dep = self.find_serde_json_dep().await?;
 
@@ -321,12 +324,13 @@ impl RustSandboxExecutor {
         cmd.stderr(std::process::Stdio::piped());
 
         let compile_timeout = request.sandbox.timeout;
-        let compile_output = match tokio::time::timeout(compile_timeout, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
+        let compile_output = match host_process::run_compiler(cmd, compile_timeout, keepalive).await
+        {
+            Ok(Some(output)) => output,
+            Err(e) => {
                 return Err(ExecutionError::CompileFailed(format!("failed to invoke rustc: {e}")));
             }
-            Err(_) => {
+            Ok(None) => {
                 return Ok(Some(ExecutionResult {
                     status: ExecutionStatus::Timeout,
                     stdout: String::new(),
@@ -373,6 +377,7 @@ impl RustSandboxExecutor {
         binary_path: &std::path::Path,
         request: &ExecutionRequest,
         start: Instant,
+        keepalive: Arc<tempfile::TempDir>,
     ) -> Result<ExecutionResult, ExecutionError> {
         // Structured input takes precedence over raw stdin.
         let stdin = match (&request.input, &request.stdin) {
@@ -387,22 +392,22 @@ impl RustSandboxExecutor {
             .envs(host_process::binary_env(&request.sandbox.environment))
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| ExecutionError::ExecutionFailed(format!("failed to spawn binary: {e}")))?;
+            .stderr(Stdio::piped());
 
         let completed = host_process::run_to_completion(
-            child,
+            cmd,
             stdin,
             request.sandbox.timeout,
             request.sandbox.max_stdout_bytes,
             request.sandbox.max_stderr_bytes,
+            keepalive,
         )
         .await
-        .map_err(|e| ExecutionError::ExecutionFailed(format!("failed to run binary: {e}")))?;
+        .map_err(|e| {
+            ExecutionError::ExecutionFailed(
+                e.context("failed to spawn binary", "failed to run binary"),
+            )
+        })?;
 
         let Some(output) = completed else {
             warn!("execution timed out");
